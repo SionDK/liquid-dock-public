@@ -37,7 +37,7 @@ C++20 Win32 독(Explorer 작업 표시줄 대체), sous1345/liquid-dock의 개�
 ## 로그와 문서
 - dock.log: 설치본의 data\ 아래(app click:, start:, preview:, taskbar:, tray:, magnify: 줄). 독을 켤 때마다 새로 쓰니,
   끄거나 설치하기 전에 필요하면 복사해 둔다.
-- 사용자에게 보이는 동작이 바뀌면 README.md도 고친다.
+- 사용자에게 보이는 동작이 바뀌면 docs/modifications.md(자세한 안내)를 고치고, 요약이 달라지면 README.md(간단한 소개)도 고친다.
 
 ## 소스 구조 (src\ 한 폴더, 기능 접두어)
 - 나뉜 기능은 부분끼리 쓰는 선언과 파일 지도가 X_internal.h에 있다(Dock은 dock.h, AppModel은 apps.h).
