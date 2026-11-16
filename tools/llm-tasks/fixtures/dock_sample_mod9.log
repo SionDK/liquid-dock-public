@@ -1,0 +1,44 @@
+﻿09:12:03.120 GPU: NVIDIA GeForce RTX 4080 SUPER
+09:12:03.205 borderless capture access: 4
+09:12:03.251 docks: 2
+09:12:03.640 tray host: up (explorer 00000000000100D4, 40 settings entries)
+09:12:03.702 tray host: + hwinfo64.exe uid=4294967294 picture=32x32 shown (entry 2001972136577579180)
+09:12:03.705 tray host: + kakaotalk.exe uid=222 picture=16x16 shown (entry 17300437206130026798)
+09:12:03.709 tray host: + steam.exe uid=0 guid picture=16x16 not shown (entry 17705150768171550502)
+09:12:03.711 tray host: + (by a modify) securityhealthsystray.exe uid=100 guid no-callback picture=16x16 hidden by the program (entry 17222071392488800985)
+09:12:03.790 capture mode: Windows.Graphics.Capture
+09:12:03.801 fluentflyout: running (process 7020)
+09:12:03.802 fluentflyout: settings C:\Users\USER\AppData\Local\Packages\unchihugo.FluentFlyout_69b7b6qge1ahj\LocalCache\Roaming\FluentFlyout\settings.xml - widget 1, hide when nothing plays 1, monitor 1, visualizer 1, app filter 0 (block), animation 2
+09:12:03.803 fluentflyout: its widget goes to the dock on the other monitor at -1440,0 (FluentFlyout's "2") - from its settings, its setting "2"
+09:12:03.803 fluentflyout: widget window is in a secondary Explorer taskbar (hidden by the dock)
+09:12:03.804 fluentflyout: FluentFlyout took that taskbar: its widget belongs on the other monitor at -1440,0 (FluentFlyout's "2")
+09:12:05.910 fluentflyout: widget window is in the dock's window
+09:12:05.911 fluentflyout: widget slot open (showing)
+09:12:06.220 tray host: widget seen - window -1135,1986 480x58, its window -66,0 480x58 drawn as a layered window, widget -46,8-347,49, cut to -46,8-347,49, above the dock
+09:12:08.330 tray host: 9 icons from 8 programs so far, 2 shown on the dock
+09:14:50.002 tray host: kakaotalk.exe is running and shown on the taskbar, but its icon has not come; if it is missing on the dock, restart that program
+09:20:40.118 fluentflyout: asked FluentFlyout to open its settings
+09:21:02.415 fluentflyout: settings C:\Users\USER\AppData\Local\Packages\unchihugo.FluentFlyout_69b7b6qge1ahj\LocalCache\Roaming\FluentFlyout\settings.xml - widget 1, hide when nothing plays 1, monitor 0, visualizer 1, app filter 0 (block), animation 2
+09:21:02.416 fluentflyout: its widget goes to the dock on the main monitor at 0,0 (FluentFlyout's "1") - from its settings, its setting "1"
+09:21:02.830 fluentflyout: widget slot closed (widget hidden or not in the dock's window)
+09:21:03.512 fluentflyout: widget slot open (showing)
+10:02:11.533 docks: 2
+10:02:11.540 fluentflyout: its widget window closed - keeping its place for the new one
+10:02:11.910 fluentflyout: its new widget window is here after 0.4 s
+10:02:11.911 fluentflyout: widget window is in the dock's window
+10:15:02.004 fluentflyout: nothing playing
+10:15:02.010 fluentflyout: widget slot closed (nothing playing, hide completely)
+10:16:40.775 fluentflyout: media playing
+10:16:40.790 fluentflyout: widget slot open (showing)
+10:40:00.002 oled: on (all, 2 monitor(s), wallpaper 1, icons 1)
+10:40:00.011 oled: 2 cover(s)
+10:52:13.450 oled: off
+11:05:13.002 fluentflyout: its widget window closed - keeping its place for the new one
+11:05:16.010 fluentflyout: its widget window did not come back
+11:05:18.020 fluentflyout: running (process 9112)
+11:05:18.021 fluentflyout: its widget goes to the dock on the main monitor at 0,0 (FluentFlyout's "1") - from its settings, its setting "1"
+11:05:18.120 fluentflyout: widget window is in the dock's window
+11:05:18.121 fluentflyout: widget slot open (showing)
+11:30:44.700 tray host: the dock had come over the widget - back on top
+11:42:09.315 fluentflyout: no longer running
+11:42:09.316 tray host: down

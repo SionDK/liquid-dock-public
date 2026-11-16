@@ -1,0 +1,103 @@
+{
+  "dock_sample.log": {
+    "kind": "dock",
+    "lines": 54,
+    "first_time": "11:00:40.463",
+    "last_time": "14:05:29.577",
+    "elevated_start": true,
+    "dock_counts": [
+      2,
+      1,
+      2
+    ],
+    "oled_on": 2,
+    "oled_off": 2,
+    "tray_icons_added": 7,
+    "tray_icons_shown": 2,
+    "ff_starts": 4,
+    "ff_stops": 4,
+    "ff_settings_reads": 2,
+    "ff_widget_moves": 4,
+    "ff_last_widget_monitor": "other",
+    "ff_widget_in_explorer": 1,
+    "ff_widget_closed": 0,
+    "ff_widget_back": 0,
+    "ff_slot_open": 3,
+    "ff_slot_closed": 1,
+    "ff_media_changes": 6,
+    "problems": []
+  },
+  "dock_sample_mod9.log": {
+    "kind": "dock",
+    "lines": 44,
+    "first_time": "09:12:03.120",
+    "last_time": "11:42:09.316",
+    "elevated_start": false,
+    "dock_counts": [
+      2,
+      2
+    ],
+    "oled_on": 1,
+    "oled_off": 1,
+    "tray_icons_added": 4,
+    "tray_icons_shown": 2,
+    "ff_starts": 2,
+    "ff_stops": 1,
+    "ff_settings_reads": 2,
+    "ff_widget_moves": 3,
+    "ff_last_widget_monitor": "main",
+    "ff_widget_in_explorer": 1,
+    "ff_widget_closed": 2,
+    "ff_widget_back": 1,
+    "ff_slot_open": 4,
+    "ff_slot_closed": 2,
+    "ff_media_changes": 2,
+    "problems": [
+      "tray host: kakaotalk.exe is running and shown on the taskbar, but its icon has not come; if it is missing on the dock, restart that program",
+      "fluentflyout: its widget window did not come back"
+    ]
+  },
+  "fluentflyout_sample_1.txt": {
+    "kind": "fluentflyout",
+    "lines": 16,
+    "first_time": "2026-10-23 10:26:56",
+    "last_time": "2026-10-23 11:01:56",
+    "starts": 1,
+    "versions": [
+      "v2.15.0"
+    ],
+    "newest_version": "v2.16.0",
+    "saves": 2,
+    "widget_recreated": 2,
+    "display_refreshes": 2,
+    "display_change_reasons": {
+      "WM_SETTINGCHANGE/SPI_SETWORKAREA": 2
+    },
+    "last_monitor_count": 2,
+    "explorer_restarts": 1,
+    "warnings": 2,
+    "errors": 0
+  },
+  "fluentflyout_sample_2.txt": {
+    "kind": "fluentflyout",
+    "lines": 11,
+    "first_time": "2026-10-23 11:01:59",
+    "last_time": "2026-10-23 13:51:45",
+    "starts": 1,
+    "versions": [
+      "v2.15.0"
+    ],
+    "newest_version": null,
+    "saves": 2,
+    "widget_recreated": 1,
+    "display_refreshes": 3,
+    "display_change_reasons": {
+      "WM_DISPLAYCHANGE": 2,
+      "WM_SETTINGCHANGE/SPI_SETWORKAREA": 1
+    },
+    "last_monitor_count": 2,
+    "explorer_restarts": 0,
+    "warnings": 0,
+    "errors": 0
+  }
+}

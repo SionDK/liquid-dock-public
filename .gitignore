@@ -1,0 +1,8 @@
+build/
+demo/
+*.obj
+*.res
+*.pdb
+*.manifest
+third_party/pawnio/*.zip
+userResult/

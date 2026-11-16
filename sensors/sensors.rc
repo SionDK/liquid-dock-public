@@ -1,0 +1,33 @@
+#include <winver.h>
+#include "resource.h"
+#include "../src/version.h"
+// PawnIO modules (LGPL-2.1, https://github.com/namazso/PawnIO.Modules release 0.2.11)
+IDR_AMD17    RCDATA "..\\third_party\\pawnio\\modules\\AMDFamily17.bin"
+IDR_INTELMSR RCDATA "..\\third_party\\pawnio\\modules\\IntelMSR.bin"
+
+// The dock reads the installed copy's version: a helper older than the window service is updated
+// (admin_protocol.h kFirstServiceVersion).
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION LD_VERSION_BIN
+ PRODUCTVERSION LD_VERSION_BIN
+ FILEFLAGSMASK 0x3fL
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041204B0"
+        BEGIN
+            VALUE "FileDescription", "Liquid Dock helper (CPU temperature, windows of programs run as administrator)"
+            VALUE "FileVersion", LD_VERSION_STR
+            VALUE "ProductName", "Liquid Dock"
+            VALUE "ProductVersion", LD_VERSION_STR
+            VALUE "OriginalFilename", "LiquidDockSensors.exe"
+            VALUE "LegalCopyright", "MIT License"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0412, 1200
+    END
+END

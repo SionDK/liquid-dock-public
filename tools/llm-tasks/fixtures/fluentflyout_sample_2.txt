@@ -1,0 +1,11 @@
+2026-10-23 11:01:59.2258|INFO|FluentFlyoutWPF.MainWindow|Starting FluentFlyout MainWindow
+2026-10-23 11:01:59.2496|INFO|FluentFlyout.Classes.Settings.SettingsManager|Settings successfully restored
+2026-10-23 11:01:59.3059|INFO|FluentFlyoutWPF.MainWindow|Current version: v2.15.0
+2026-10-23 11:01:59.5232|INFO|FluentFlyoutWPF.MainWindow|License synced on startup - Store: False, Premium: True
+2026-10-23 11:01:59.5232|INFO|FluentFlyout.Classes.Settings.SettingsManager|Settings successfully saved to C:\Users\USER\AppData\Roaming\FluentFlyout\settings.xml
+2026-10-23 11:02:33.4174|INFO|FluentFlyout.Classes.Settings.SettingsManager|Settings successfully saved to C:\Users\USER\AppData\Roaming\FluentFlyout\settings.xml
+2026-10-23 13:51:37.3456|INFO|FluentFlyoutWPF.MainWindow|Refreshing window DPI and placement after display change (WM_DISPLAYCHANGE); monitors=1
+2026-10-23 13:51:37.3494|INFO|FluentFlyoutWPF.MainWindow|Recreating Taskbar Widget window
+2026-10-23 13:51:37.3950|INFO|FluentFlyoutWPF.MainWindow|Taskbar Widget window recreated successfully
+2026-10-23 13:51:39.5876|INFO|FluentFlyoutWPF.MainWindow|Refreshing window DPI and placement after display change (WM_DISPLAYCHANGE); monitors=2
+2026-10-23 13:51:45.9299|INFO|FluentFlyoutWPF.MainWindow|Refreshing window DPI and placement after display change (WM_SETTINGCHANGE/SPI_SETWORKAREA); monitors=2

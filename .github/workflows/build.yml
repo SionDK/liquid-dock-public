@@ -1,0 +1,31 @@
+# Builds LiquidDock-Setup.exe on a GitHub-hosted Windows runner (Visual Studio + Windows SDK preinstalled).
+# Actions tab -> "Build installer" -> Run workflow, then download the artifact.
+name: Build installer
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (MSVC, build.bat)
+        shell: cmd
+        run: call build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiquidDock-Setup
+          path: build/LiquidDock-Setup.exe
+      # The regression tests make their own hidden windows; a hosted runner has no user desktop, so a
+      # failure here is a hint to run tests\run_regressions.bat locally, not a broken build.
+      - name: Regression tests (informational)
+        shell: cmd
+        continue-on-error: true
+        run: call tests\run_regressions.bat
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Portable tests (g++)
+        run: sh tests/run_portable.sh
+      - name: Local-LLM task pack self-check
+        run: python3 tools/llm-tasks/run_tasks.py --self-check

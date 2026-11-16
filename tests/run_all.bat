@@ -1,0 +1,13 @@
+@echo off
+if /i not "%~1"=="--logged" (call "%~dp0logged.bat" "%~f0" & exit /b)
+rem Builds the dock (build.bat) and runs every test: regressions (the window preview's among them), the dock's
+rem interaction matrix and the settings options. Exit code 0 = all passed. About 6-7 minutes.
+rem The running dock is not touched (the build goes to build\, the tests use their own windows).
+setlocal
+cd /d "%~dp0.."
+call build.bat || (echo BUILD FAILED & exit /b 1)
+call tests\run_regressions.bat || (echo REGRESSION TESTS FAILED & exit /b 1)
+call tests\run_dock_interactions.bat || (echo DOCK INTERACTION TESTS FAILED & exit /b 1)
+call tests\run_settings_options.bat || (echo SETTINGS OPTIONS TEST FAILED & exit /b 1)
+echo ALL TESTS PASSED
+exit /b 0

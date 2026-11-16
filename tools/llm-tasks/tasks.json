@@ -1,0 +1,226 @@
+{
+  "about": "Local-LLM task pack for Liquid Dock. run_tasks.py sends each task's prompt (prompts/common_rules.md + the task prompt + its context) to the model, saves the answer under out/<id>/ and verifies it. C++ test tasks are built and run, then run against deliberately broken copies of the code under test ('mutants'): a good test notices most of them. Keep the 'find' strings in sync with src/ (run_tasks.py --self-check tells when one no longer applies).",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "fluent_logic 추가 테스트",
+      "size": "14B 이상 권장",
+      "prompt": "prompts/T1_fluent_logic_tests.md",
+      "target": "tests/llm/fluent_logic_more_test.cpp",
+      "lang": "cpp",
+      "context": [
+        { "file": "src/fluent_logic.h" },
+        { "file": "tests/portable_check.h" },
+        { "file": "tests/fluent_logic_test.cpp", "title": "tests/fluent_logic_test.cpp (the existing test: do not repeat it, add to it)", "max_lines": 120 }
+      ],
+      "verify": {
+        "kind": "cpp-test",
+        "min_checks": 30,
+        "min_kill_ratio": 0.75,
+        "mutants": [
+          { "id": "M01", "file": "src/fluent_logic.h", "find": "return monitors[a].primary;", "replace": "return monitors[b].primary;",
+            "desc": "FluentOrder puts the primary monitor last instead of first" },
+          { "id": "M02", "file": "src/fluent_logic.h", "find": "return monitors[a].left < monitors[b].left;", "replace": "return monitors[a].left > monitors[b].left;",
+            "desc": "FluentOrder orders the other monitors from right to left" },
+          { "id": "M03", "file": "src/fluent_logic.h", "find": "std::clamp(setting, 0,", "replace": "std::clamp(setting - 1, 0,",
+            "desc": "MonitorForSetting treats the setting as 1-based (setting 1 gives the first monitor instead of the second)" },
+          { "id": "M04", "file": "src/fluent_logic.h", "find": "if (order[i] == monitor) return (int)i + 1;", "replace": "if (order[i] == monitor) return (int)i;",
+            "desc": "SettingNumber returns 0-based numbers (the primary monitor gets 0 instead of 1)" },
+          { "id": "M05", "file": "src/fluent_logic.h", "find": "return monitors.empty() ? -1 : 0;", "replace": "return -1;",
+            "desc": "PrimaryOf returns -1 for a non-empty list without a primary monitor (should be 0, the first monitor)" },
+          { "id": "M06", "file": "src/fluent_logic.h", "find": "c.shownAt >= c.fileAt", "replace": "c.shownAt > c.fileAt",
+            "desc": "WantedMonitor lets the settings file win when shownAt == fileAt (the shown monitor should win a tie)" },
+          { "id": "M07", "file": "src/fluent_logic.h", "find": "else if (c.fileMonitor >= 0)", "replace": "else if (c.fileMonitor > 0)",
+            "desc": "WantedMonitor ignores fileMonitor 0 from the settings file (falls back to the primary monitor and Reason::Default)" },
+          { "id": "M08", "file": "src/fluent_logic.h", "find": "if (now - offSince < hold) return false;", "replace": "if (now - offSince <= hold) return false;",
+            "desc": "Steady still holds 'nothing playing' back when exactly `hold` seconds have passed (it should switch at now - offSince == hold)" },
+          { "id": "M09", "file": "src/fluent_logic.h", "find": "offSince = -1;\n            if (value) return false;", "replace": "if (value) return false;",
+            "desc": "Steady does not restart the hold when 'playing' comes back for a moment (off at 0, on at 1.0, off at 1.2: at 1.6 it already switches to not playing)" },
+          { "id": "M10", "file": "src/fluent_logic.h", "find": "now - lostAt < kRehomeSeconds", "replace": "now - lostAt <= kRehomeSeconds",
+            "desc": "StillWaiting is still true at exactly kRehomeSeconds (3.0 s) after the loss" },
+          { "id": "M11", "file": "src/fluent_logic.h", "find": "lostAt >= 0 && now - lostAt", "replace": "now - lostAt",
+            "desc": "StillWaiting is true for lostAt = -1 (nothing lost) when now is small" },
+          { "id": "M12", "file": "src/fluent_logic.h", "find": "return value && offSince >= 0;", "replace": "return offSince >= 0;",
+            "desc": "Steady::Waiting() stays true after the hold has passed and value became false" }
+        ]
+      }
+    },
+    {
+      "id": "T2",
+      "title": "fluent_settings 경계 테스트",
+      "size": "14B 이상 권장",
+      "prompt": "prompts/T2_fluent_settings_tests.md",
+      "target": "tests/llm/fluent_settings_more_test.cpp",
+      "lang": "cpp",
+      "context": [
+        { "file": "src/fluent_settings.h" },
+        { "file": "tests/portable_check.h" },
+        { "file": "tests/fluent_settings_test.cpp", "title": "tests/fluent_settings_test.cpp (the existing test: do not repeat it, add to it)" }
+      ],
+      "verify": {
+        "kind": "cpp-test",
+        "min_checks": 25,
+        "min_kill_ratio": 0.75,
+        "mutants": [
+          { "id": "M01", "file": "src/fluent_settings.h", "find": "b = s.find_last_not_of(L\" \\t\\r\\n\");", "replace": "b = s.find_last_not_of(L\" \");",
+            "desc": "Trimmed keeps trailing tabs, \\r and \\n (only spaces are trimmed at the end)" },
+          { "id": "M02", "file": "src/fluent_settings.h", "find": "{ L\"&lt;\", L\"<\" }, { L\"&gt;\", L\">\" },", "replace": "{ L\"&amp;\", L\"&\" }, { L\"&lt;\", L\"<\" }, { L\"&gt;\", L\">\" },",
+            "desc": "XmlText decodes &amp; first, so \"&amp;lt;\" becomes \"<\" instead of the text \"&lt;\"" },
+          { "id": "M03", "file": "src/fluent_settings.h", "find": "{ L\"&apos;\", L\"'\" }, ", "replace": "",
+            "desc": "XmlText no longer decodes &apos;" },
+          { "id": "M04", "file": "src/fluent_settings.h", "find": "std::wstring open = L\"<\" + name + L\">\", close", "replace": "std::wstring open = L\"<\" + name, close",
+            "desc": "Element matches the opening tag without its '>' (so <NameX> counts as <Name> and the text gets a stray '>')" },
+          { "id": "M05", "file": "src/fluent_settings.h", "find": "Trimmed(v) == L\"true\"", "replace": "Trimmed(v) != L\"false\"",
+            "desc": "ReadBool takes anything but \"false\" as true (\"True\", \"1\", \"yes\" become true)" },
+          { "id": "M06", "file": "src/fluent_settings.h", "find": "catch (...) { return fallback; }", "replace": "catch (...) { return 0; }",
+            "desc": "ReadInt returns 0 instead of the fallback for a value that is not a number" },
+          { "id": "M07", "file": "src/fluent_settings.h", "find": "out.push_back(XmlText(section.substr(a, b - a)));", "replace": "out.push_back(section.substr(a, b - a));",
+            "desc": "ReadList does not decode entities in list entries" },
+          { "id": "M08", "file": "src/fluent_settings.h", "find": "xml.find(L\"<UserSettings\")", "replace": "xml.find(L\"<\")",
+            "desc": "Parse takes any XML-looking text for FluentFlyout's settings (loaded becomes true without <UserSettings>)" },
+          { "id": "M09", "file": "src/fluent_settings.h", "find": "ReadInt(xml, L\"FlyoutAnimationSpeed\", 2)", "replace": "ReadInt(xml, L\"FlyoutAnimationSpeed\", 0)",
+            "desc": "Parse defaults animationSpeed to 0 when FlyoutAnimationSpeed is missing (should be 2)" },
+          { "id": "M10", "file": "src/fluent_settings.h", "find": "ReadInt(xml, L\"AppFilteringMode\", 0)", "replace": "ReadInt(xml, L\"AppFilteringEnabled\", 0)",
+            "desc": "Parse reads filterMode from the wrong element (AppFilteringMode 1 gives filterMode 0)" },
+          { "id": "M11", "file": "src/fluent_settings.h", "find": "ReadBool(xml, L\"TaskbarWidgetHideCompletely\", false)", "replace": "ReadBool(xml, L\"TaskbarWidgetHideCompletely\", true)",
+            "desc": "Parse defaults hideCompletely to true when TaskbarWidgetHideCompletely is missing" }
+        ]
+      }
+    },
+    {
+      "id": "T3",
+      "title": "icon_pixels 테스트 (가장 작음: 처음 시험용)",
+      "size": "7B 이상",
+      "prompt": "prompts/T3_icon_pixels_tests.md",
+      "target": "tests/llm/icon_pixels_more_test.cpp",
+      "lang": "cpp",
+      "context": [
+        { "file": "src/icon_pixels.h" },
+        { "file": "tests/portable_check.h" },
+        { "file": "tests/icon_pixels_test.cpp", "title": "tests/icon_pixels_test.cpp (the existing test: do not repeat it, add to it)" }
+      ],
+      "verify": {
+        "kind": "cpp-test",
+        "min_checks": 20,
+        "min_kill_ratio": 0.75,
+        "mutants": [
+          { "id": "M01", "file": "src/icon_pixels.h", "find": "if ((p >> 24) < 48) continue;", "replace": "if ((p >> 24) < 47) continue;",
+            "desc": "IsGlyph counts pixels with alpha 47 (only alpha 48 and up should count)" },
+          { "id": "M02", "file": "src/icon_pixels.h", "find": "std::abs(r - r0) > 24", "replace": "std::abs(r - r0) > 25",
+            "desc": "IsGlyph allows a red difference of 25 from the first counted pixel (24 is the most allowed)" },
+          { "id": "M03", "file": "src/icon_pixels.h", "find": "if (count < 8) return false;", "replace": "if (count < 7) return false;",
+            "desc": "IsGlyph accepts 7 counted pixels (at least 8 are needed)" },
+          { "id": "M04", "file": "src/icon_pixels.h", "find": "(lum > 0.82f || lum < 0.18f)", "replace": "(lum > 0.82f)",
+            "desc": "IsGlyph no longer accepts dark (black) glyphs" },
+          { "id": "M05", "file": "src/icon_pixels.h", "find": "std::min({ r0, g0, b0 }) < 24", "replace": "std::min({ r0, g0, b0 }) < 64",
+            "desc": "IsGlyph accepts a light but tinted colour whose channels are up to 63 apart, e.g. (255, 230, 200) (fewer than 24 apart is required)" },
+          { "id": "M06", "file": "src/icon_pixels.h", "find": "if (a == 255) continue;", "replace": "if (a >= 254) continue;",
+            "desc": "Premultiply leaves pixels with alpha 254 unchanged" },
+          { "id": "M07", "file": "src/icon_pixels.h", "find": "uint32_t r = ((p >> 16) & 255) * a / 255,", "replace": "uint32_t r = (((p >> 16) & 255) * a + 127) / 255,",
+            "desc": "Premultiply rounds the red channel to nearest instead of down (red 1 at alpha 128 gives 1 instead of 0)" },
+          { "id": "M08", "file": "src/icon_pixels.h", "find": "int f = (std::max(p.w, p.h) + maxSide - 1) / maxSide;", "replace": "int f = std::max(p.w, p.h) / maxSide;",
+            "desc": "Shrink rounds the factor down (130 px wide with maxSide 64 gives factor 2 and 65 px instead of factor 3 and 44 px)" },
+          { "id": "M09", "file": "src/icon_pixels.h", "find": "(n ? sum[c] / n : 0)", "replace": "(n ? sum[c] / (uint32_t)(f * f) : 0)",
+            "desc": "Shrink divides partial edge blocks by the full block size (f * f) instead of the pixels they have" }
+        ]
+      }
+    },
+    {
+      "id": "T4",
+      "title": "hwinfo 경계 테스트",
+      "size": "14B 이상 권장",
+      "prompt": "prompts/T4_hwinfo_tests.md",
+      "target": "tests/llm/hwinfo_more_test.cpp",
+      "lang": "cpp",
+      "context": [
+        { "file": "src/hwinfo.h" },
+        { "file": "src/hwinfo.cpp", "title": "src/hwinfo.cpp (the part without registry access)", "to": "#ifdef _WIN32", "to_occurrence": 2 },
+        { "file": "tests/portable_check.h" },
+        { "file": "tests/hwinfo_test.cpp", "title": "tests/hwinfo_test.cpp (the existing test: do not repeat it, add to it)" }
+      ],
+      "verify": {
+        "kind": "cpp-test",
+        "extra_sources": ["src/hwinfo.cpp"],
+        "copy": ["src/hwinfo.h"],
+        "win_libs": ["advapi32"],
+        "min_checks": 25,
+        "min_kill_ratio": 0.75,
+        "mutants": [
+          { "id": "M01", "file": "src/hwinfo.cpp", "find": "if (!(v > -40.0 && v < 150.0)) return false;", "replace": "if (!(v >= -40.0 && v < 150.0)) return false;",
+            "desc": "ParseTemperature accepts exactly -40 degrees C (more than -40 is required)" },
+          { "id": "M02", "file": "src/hwinfo.cpp", "find": "if (!(v > -40.0 && v < 150.0)) return false;", "replace": "if (!(v > -40.0 && v <= 150.0)) return false;",
+            "desc": "ParseTemperature accepts exactly 150 degrees C (less than 150 is required)" },
+          { "id": "M03", "file": "src/hwinfo.cpp", "find": "v = (v - 32.0) * 5.0 / 9.0;", "replace": "v = (v - 32.0) * 9.0 / 5.0;",
+            "desc": "ParseTemperature converts Fahrenheit with 9/5 instead of 5/9" },
+          { "id": "M04", "file": "src/hwinfo.cpp", "find": "if (value[i] == 0x2103) unit = L'C';", "replace": "if (value[i] == 0x2103) unit = L'F';",
+            "desc": "ParseTemperature reads the single character U+2103 (degree Celsius sign) as Fahrenheit" },
+          { "id": "M05", "file": "src/hwinfo.cpp", "find": "else if (c == L'.' || c == L',') t += '.';", "replace": "else if (c == L'.') t += '.';",
+            "desc": "the number reader stops at a decimal comma (\"52,4\" reads as 52)" },
+          { "id": "M06", "file": "src/hwinfo.cpp", "find": "if (!prefer.empty() && l == Lower(prefer)) return 0;", "replace": "if (l == Lower(prefer)) return 0;",
+            "desc": "RankCpu gives rank 0 to an empty label when no preference is set (it should be -1)" },
+          { "id": "M07", "file": "src/hwinfo.cpp", "find": "if (cpuSensor && l == L\"core max\") return 5;", "replace": "if (l == L\"core max\") return 5;",
+            "desc": "RankCpu ranks a \"Core Max\" reading of a sensor that is not \"CPU [...\" as 5 (it should be -1)" },
+          { "id": "M08", "file": "src/hwinfo.cpp", "find": "if (rank < 0 || rank >= bestRank) continue;", "replace": "if (rank < 0 || rank > bestRank) continue;",
+            "desc": "PickCpu lets a later reading of the same rank replace an earlier one (the earlier one should stay)" },
+          { "id": "M09", "file": "src/hwinfo.cpp", "find": "if (!ParseTemperature(e.value, e.raw, c)) continue;", "replace": "ParseTemperature(e.value, e.raw, c);",
+            "desc": "PickCpu picks a well-ranked reading whose value is not a temperature (e.g. \"CPU Package\" = \"65 W\")" },
+          { "id": "M10", "file": "src/hwinfo.h", "find": "ageSeconds < 20.0", "replace": "ageSeconds <= 20.0",
+            "desc": "Judge counts a key exactly 20.0 s old as fresh without asking whether HWiNFO runs" },
+          { "id": "M11", "file": "src/hwinfo.h", "find": "ageSeconds <= 60.0", "replace": "ageSeconds < 60.0",
+            "desc": "Judge rejects values exactly 60.0 s old (60.0 is still usable)" },
+          { "id": "M12", "file": "src/hwinfo.h", "find": "f.running = valueCount > 0 && (", "replace": "f.running = (",
+            "desc": "Judge reports HWiNFO as running when the key holds no values" }
+        ]
+      }
+    },
+    {
+      "id": "T5",
+      "title": "로그 분석 도구 tools/loglens.py",
+      "size": "14B 이상 권장",
+      "prompt": "prompts/T5_loglens.md",
+      "target": "tools/loglens.py",
+      "lang": "python",
+      "context": [
+        { "file": "tools/llm-tasks/fixtures/dock_sample.log", "title": "fixtures/dock_sample.log (a real dock.log, older messages)", "lang": "text" },
+        { "file": "tools/llm-tasks/fixtures/dock_sample_mod9.log", "title": "fixtures/dock_sample_mod9.log (current messages)", "lang": "text" },
+        { "file": "tools/llm-tasks/fixtures/fluentflyout_sample_1.txt", "title": "fixtures/fluentflyout_sample_1.txt (a FluentFlyout log)", "lang": "text" }
+      ],
+      "verify": {
+        "kind": "script",
+        "cmd": ["{python}", "tools/llm-tasks/checks/check_loglens.py", "{candidate}"]
+      }
+    },
+    {
+      "id": "T6",
+      "title": "로그 메시지 안내서 (한국어) docs/log-messages.md",
+      "size": "14B 이상 권장 (한국어를 잘 쓰는 모델)",
+      "prompt": "prompts/T6_log_guide.md",
+      "target": "docs/log-messages.md",
+      "lang": "markdown",
+      "context": [
+        { "cmd": ["{python}", "tools/llm-tasks/checks/check_log_guide.py", "--list"], "title": "the messages to explain (from src/fluent_*.cpp and src/tray_host*.cpp, with the code just before each)", "lang": "text" },
+        { "file": "src/fluent_flyout.cpp", "from": "// Where FluentFlyout's widget window is, for the log.", "to": "// Where its widget window is.", "title": "src/fluent_flyout.cpp (the texts that fill \"widget window is in …\" and the monitor in other messages)" },
+        { "file": "README.md", "from": "## 트레이 아이콘", "to": "## CPU 온도", "title": "README.md (the tray icon and FluentFlyout sections)" }
+      ],
+      "verify": {
+        "kind": "script",
+        "cmd": ["{python}", "tools/llm-tasks/checks/check_log_guide.py", "{candidate}"]
+      }
+    },
+    {
+      "id": "T7",
+      "title": "변경 검토 (참고용, 자동 검사 없음)",
+      "size": "32B 이상이면 더 좋음",
+      "prompt": "prompts/T7_review.md",
+      "target": "review.md",
+      "lang": "markdown",
+      "apply": false,
+      "context": [
+        { "cmd": ["git", "diff", "--stat", "{diff_base}", "--", "src", "tests", "tools"], "title": "git diff --stat {diff_base}", "lang": "text", "skip_if_empty": true,
+          "empty_note": "검토할 변경이 없습니다 ({diff_base} 이후 바뀐 것이 없음). 마지막 커밋을 보려면 --diff-base HEAD~1" },
+        { "cmd": ["git", "diff", "-U4", "{diff_base}", "--", "src", "tests", "tools"], "title": "git diff {diff_base}", "lang": "diff", "max_lines": 700 }
+      ],
+      "verify": { "kind": "none" }
+    }
+  ]
+}

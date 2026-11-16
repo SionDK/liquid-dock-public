@@ -1,0 +1,16 @@
+2026-10-23 10:26:56.2371|INFO|FluentFlyoutWPF.MainWindow|Starting FluentFlyout MainWindow
+2026-10-23 10:26:56.2601|INFO|FluentFlyout.Classes.Settings.SettingsManager|Settings successfully restored
+2026-10-23 10:26:56.3211|INFO|FluentFlyoutWPF.MainWindow|Current version: v2.15.0
+2026-10-23 10:26:56.4553|INFO|FluentFlyoutWPF.Classes.Services.UpdateCheckerService|Update check complete. Current: v2.15.0, Newest: v2.16.0, Update available: True
+2026-10-23 10:26:56.5215|INFO|FluentFlyoutWPF.MainWindow|License synced on startup - Store: False, Premium: True
+2026-10-23 10:26:56.5215|INFO|FluentFlyout.Classes.Settings.SettingsManager|Settings successfully saved to C:\Users\USER\AppData\Roaming\FluentFlyout\settings.xml
+2026-10-23 10:31:41.0635|INFO|FluentFlyoutWPF.MainWindow|Refreshing window DPI and placement after display change (WM_SETTINGCHANGE/SPI_SETWORKAREA); monitors=2
+2026-10-23 10:31:41.0858|INFO|FluentFlyoutWPF.MainWindow|Recreating Taskbar Widget window
+2026-10-23 10:31:41.1300|INFO|FluentFlyoutWPF.MainWindow|Taskbar Widget window recreated successfully
+2026-10-23 11:00:41.1751|WARN|FluentFlyoutWPF.MainWindow|Explorer restart detected (TaskbarCreated)
+2026-10-23 11:00:41.4608|INFO|FluentFlyoutWPF.MainWindow|Refreshing window DPI and placement after display change (WM_SETTINGCHANGE/SPI_SETWORKAREA); monitors=2
+2026-10-23 11:00:41.4792|INFO|FluentFlyoutWPF.MainWindow|Recreating Taskbar Widget window
+2026-10-23 11:00:41.8308|INFO|FluentFlyoutWPF.MainWindow|Taskbar Widget window recreated successfully
+2026-10-23 11:00:41.8349|INFO|FluentFlyoutWPF.MainWindow|Explorer stabilized, resuming taskbar integration
+2026-10-23 11:01:49.5087|INFO|FluentFlyout.Classes.Settings.SettingsManager|Settings successfully saved to C:\Users\USER\AppData\Roaming\FluentFlyout\settings.xml
+2026-10-23 11:01:56.1675|WARN|FluentFlyoutWPF.Windows.VolumeMixerWindow|Did not try to restore OSD because it was either not found or was not hidden.
