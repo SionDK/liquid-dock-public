@@ -116,7 +116,7 @@ int RunWatchdog(DWORD pid, const wchar_t* readyName) {
         if (wait != WAIT_OBJECT_0) return 1;
     }
     DWORD st = 0, sz = sizeof(st);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\LiquidDock", L"TaskbarState", RRF_RT_REG_DWORD, nullptr, &st, &sz) != ERROR_SUCCESS)
+    if (RegGetValueW(HKEY_CURRENT_USER, LD_TASKBAR_STATE_KEY, LD_TASKBAR_STATE_VALUE, RRF_RT_REG_DWORD, nullptr, &st, &sz) != ERROR_SUCCESS)
         return 0;   // clean exit: already restored
     int rc = RestoreTaskbarWhenIdle(30000);
     return rc == ERROR_BUSY ? 0 : rc;   // a new dock owns recovery now

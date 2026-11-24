@@ -6,11 +6,20 @@ namespace fluentflyout {
 // FluentFlyout places its flyouts in the work area (a hidden dock reserves none) and animates them
 // in. Next to a shown dock they move clear of the glass once that animation is over: along the dock
 // to the widget at once (FluentFlyout keeps that while it animates), off the edge after it.
+namespace {
+
+struct Flyout {
+    HWND h = nullptr;
+    enum State { Waiting, Moving, Placed, Left } state = Waiting;
+    double shownAt = 0, movedAt = 0, settledAt = 0;
+    bool aligned = false, raised = false, nearShownDock = false;
+    RECT from{}, to{}, expect{};
+    double moveStart = 0;
+};
+
 std::vector<Flyout> g_flyouts;
 std::unordered_map<HMONITOR, int> g_lift;   // per monitor: the move off the edge given to the flyouts there
 HWINEVENTHOOK g_hooks[2] = {};
-
-namespace {
 
 double AnimSeconds() {
     static const double kSeconds[] = { 0, 0.15, 0.3, 0.45, 0.6, 0.9 };
@@ -75,6 +84,18 @@ void Hook() {
     if (!g_pid) return;
     g_hooks[0] = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, nullptr, OnWinEvent, g_pid, 0, WINEVENT_OUTOFCONTEXT);
     g_hooks[1] = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr, OnWinEvent, g_pid, 0, WINEVENT_OUTOFCONTEXT);
+}
+
+// FluentFlyout gone (or another one found): its flyouts and their stacks forgotten.
+void ForgetFlyouts() {
+    g_flyouts.clear();
+    g_lift.clear();
+}
+
+// Every Tick: the flyouts closed or hidden meanwhile are dropped.
+void PruneFlyouts() {
+    for (size_t i = g_flyouts.size(); i-- > 0;)
+        if (!IsWindow(g_flyouts[i].h) || !IsWindowVisible(g_flyouts[i].h)) g_flyouts.erase(g_flyouts.begin() + i);
 }
 
 namespace {

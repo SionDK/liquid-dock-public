@@ -5,10 +5,10 @@
 // it only reads.
 //   cl /std:c++20 /EHsc /utf-8 /DUNICODE /D_UNICODE tests\sys_poller_test.cpp /link user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib iphlpapi.lib advapi32.lib
 #include "../src/system.cpp"
+#include "../src/shell_front.cpp"   // the shell input helpers system.cpp calls
 #include <cstdarg>
 #include <cstdio>
 
-HWND g_mainWnd = nullptr;
 static std::atomic<int> g_logs{ 0 };
 void Log(const wchar_t* fmt, ...) {
     wchar_t buf[1024];
@@ -20,20 +20,11 @@ void Log(const wchar_t* fmt, ...) {
     WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8, sizeof(utf8), nullptr, nullptr);
     printf("  log: %s\n", utf8);
 }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
-}
-namespace nativetray { void CacheTrayButtons(HWND) {} }
-namespace taskbarstart { void Remember(HWND) {} }
+#define TEST_SUPPORT_QPC_NOW
+#include "test_support.h"
 
-static int checks = 0, failures = 0;
-static void Check(bool ok, const char* what) {
-    ++checks; if (!ok) ++failures;
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
-    fflush(stdout);
-}
+#include "portable_check.h"
+static const bool kFlushEachCheck = (portable_check::FlushEach() = true);
 static double ProcessCpu() {
     FILETIME a, b, k, u;
     GetProcessTimes(GetCurrentProcess(), &a, &b, &k, &u);
@@ -104,6 +95,5 @@ int main() {
     printf("  read %.2f s after a reported address change\n", NowSeconds() - t0);
     Check(ok, "a reported address change (DHCP done) is read at once too");
 
-    printf("sys_poller_test: %s (%d checks, %d failure%s)\n", failures ? "FAILED" : "ALL PASSED", checks, failures, failures == 1 ? "" : "s");
-    return failures;
+    return Summary("sys_poller_test");
 }

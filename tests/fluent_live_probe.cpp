@@ -43,13 +43,8 @@ std::string Utf8(const std::wstring& s) {
     return b;
 }
 
-std::wstring FromUtf8(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-    return w;
-}
+#define TEST_SUPPORT_FROM_UTF8
+#include "test_support.h"
 
 void Verdict(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what);

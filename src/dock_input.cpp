@@ -3,18 +3,15 @@
 #include "sensors.h"
 #include "native_tray.h"
 #include "start_menu.h"
-#include <shellscalingapi.h>
-#include <thread>
 #include <shellapi.h>
-#include <d2d1effects.h>
-#include <dwmapi.h>
-#include "oled.h"
-#include "theme.h"
-#include "explorer_taskbar.h"
-
-UINT TaskbarCreatedMessage();   // dock_window.cpp
 
 // ---------------------------------------------------------------- input
+
+// what is under a mouse message's point (client coordinates in lp)
+Dock::Hit Dock::HitAtClient(LPARAM lp) {
+    float u, v; ClientToUV(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), u, v);
+    return HitTestUV(u, v);
+}
 
 void Dock::Click(const Hit& h) {
     switch (h.kind) {
@@ -29,7 +26,7 @@ void Dock::Click(const Hit& h) {
     }
     // Windows' own tray windows rather than re-implementations
     case HitTray: {
-        float u = (cells[HitTray].u0 + cells[HitTray].u1) * 0.5f;
+        float u = cells[HitTray].Mid();
         nativetray::OverflowFailure why = nativetray::OverflowFailure::None;
         if (nativetray::OpenOverflow(ScreenPointUV(u, margin + barThick * 0.5f), g_settings.edge, BarScreenRect(), &why)) break;
         if (why == nativetray::OverflowFailure::NoButton) {
@@ -45,11 +42,13 @@ void Dock::Click(const Hit& h) {
     case HitClock: nativetray::OpenCalendar(); break;
     case HitBattery: nativetray::OpenQuickSettings(); break;   // as the battery icon of the taskbar
     case HitSensor: case HitPanel: {
-        // the source HWiNFO, its CPU temperature wanted, HWiNFO up without one: only its Gadget setting is
-        // missing ("HWiNFO 설정: 클릭" on the card). Anything else: Task Manager (the source is chosen in the
-        // settings or the cell's menu, never by a click here).
+        // the source HWiNFO, its CPU temperature wanted (or, a click on the panel, in the power view 그래프 its package
+        // power: the cell shows no power), HWiNFO up without it: only its Gadget setting is missing ("HWiNFO 설정: 클릭" /
+        // "HWiNFO 전력: 클릭" on the card). Anything else: Task Manager (the source is chosen in the settings or the
+        // cell's menu, never by a click here).
         const sensorlogic::ShowItems show = g_sensors.Items();
-        if (show.ReadsHWiNFO() && show.CpuTempShown() && !g_sensors.CpuTempAvailable() && g_sensors.HWiNFORunning()) g_sensors.ShowHWiNFOGuide();
+        if (sensorlogic::HWiNFOGuideWanted(show, g_sensors.CpuTempAvailable(), g_sensors.HWiNFORunning(), g_sensors.Power(), h.kind == HitPanel))
+            g_sensors.ShowHWiNFOGuide();
         else OpenTaskManager();
         break;
     }
@@ -88,29 +87,14 @@ void Dock::ClearPress() {
 }
 
 LRESULT Dock::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == TaskbarCreatedMessage() && msg) {
-        // A new Explorer knows no app bars: an always-shown dock registers its strip again on the next
-        // frame (or else maximised windows go under it). The tray host's own broadcast comes with the same
-        // Explorer, which still holds the strip: nothing to ask then. ABM_REMOVE first, so a registration
-        // the shell still has never turns the new ABM_NEW into a failure.
-        const HWND shell = appBar ? ExplorerTaskbar() : nullptr;
-        if (appBar && shell != appBarShell) {
-            Log(L"appbar: dock %d - Explorer's taskbar is new (%p, was %p): registering the strip again", index, (void*)shell, (void*)appBarShell);
-            APPBARDATA abd = { sizeof(abd) };
-            abd.hWnd = hwnd;
-            SHAppBarMessage(ABM_REMOVE, &abd);
-            appBar = false; appBarRect = {};
-        }
-        nextAppBarTry = 0;   // a failed registration is tried again at once
-        return 0;
-    }
+    // (&& msg: 0 when the registration failed - WM_NULL, which PopupMenu sends after a menu)
+    if (msg == TaskbarCreatedMessage() && msg) { OnTaskbarCreated(); return 0; }
     switch (msg) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_NCHITTEST: return HTCLIENT;
     case WM_LBUTTONDOWN: {
         windowPreview.Dismiss();
-        float u, v; ClientToUV(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), u, v);
-        Hit h = HitTestUV(u, v);
+        Hit h = HitAtClient(lp);
         pressKind = h.kind; pressSlot = h.kind == HitSlot ? h.slot : -1; pressButton = h.button;
         pressNotifyKey = h.kind == HitNotify ? NotifyKey(h.notify) : 0;
         // before the click can change what is in front: is it Start (the click then closes it)?
@@ -131,8 +115,7 @@ LRESULT Dock::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         if (dragging) EndDrag(true);   // the dock did not hold the capture: no WM_CAPTURECHANGED ended the drag
         ClearPress();
         if (wasDragging) return 0;
-        float u, v; ClientToUV(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), u, v);
-        Hit h = HitTestUV(u, v);
+        Hit h = HitAtClient(lp);
         if (h.kind == pk && (h.kind != HitSlot || h.slot == ps) && (h.kind != HitButton || h.button == pb) &&
             (h.kind != HitNotify || NotifyKey(h.notify) == pn)) Click(h);
         return 0;
@@ -149,8 +132,7 @@ LRESULT Dock::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_RBUTTONUP: {
         windowPreview.Dismiss();
-        float u, v; ClientToUV(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), u, v);
-        Hit h = HitTestUV(u, v);
+        Hit h = HitAtClient(lp);
         if (h.kind == HitNotify) NotifyClick(h.notify, trayhost::Mouse::RightClick);   // the program's own menu
         else if (h.kind == HitSlot && slots[h.slot].app) ShowAppMenu(slots[h.slot]);
         else if (h.kind == HitSlot && g_settings.startMenuExtras) ShowStartMenu();
@@ -161,8 +143,7 @@ LRESULT Dock::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MBUTTONUP: {
         windowPreview.Dismiss();
-        float u, v; ClientToUV(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), u, v);
-        Hit h = HitTestUV(u, v);
+        Hit h = HitAtClient(lp);
         if (h.kind == HitSlot && slots[h.slot].app) { auto app = slots[h.slot].app; g_apps.Launch(*app, index); }
         else if (h.Is(ButtonId::Volume)) g_sys.ToggleMute();
         else if (h.kind == HitNotify) NotifyClick(h.notify, trayhost::Mouse::MiddleClick);
@@ -194,6 +175,9 @@ LRESULT Dock::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_APPBAR:   // another app bar or the taskbar moved: claim the strip again
         if (wp == ABN_POSCHANGED) appBarRect = {};
         return 0;
+    case WM_SETTINGCHANGE:   // the work area changed: does it still leave the strip out (CheckAppBar)
+        if (wp == SPI_SETWORKAREA) workAreaChanged = true;
+        break;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); EndPaint(hwnd, &ps); dirty = true; return 0; }
     }

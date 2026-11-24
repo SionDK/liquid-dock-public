@@ -26,11 +26,12 @@ static bool g_testElevated = false;
 #define LD_TRAY_ELEVATED g_testElevated
 static HWND g_fakeExplorer = nullptr;
 static HWND TestExplorerTaskbar() { return g_fakeExplorer; }
+// Explorer's process, for the shared block of an app bar message (ForwardAppBar): a stand-in process of the test's own,
+// so the block really is made for another process (the fake Explorer reads it from there)
+static DWORD g_explorerPid = 0;
+#define LD_TRAY_EXPLORER_PROCESS(wnd) g_explorerPid
 #define ExplorerTaskbar TestExplorerTaskbar
-#include "../src/tray_host.cpp"
-#include "../src/tray_host_icons.cpp"
-#include "../src/tray_host_settings.cpp"
-#include "../src/tray_host_widget.cpp"
+#include "parts_tray_host.inc"
 #undef ExplorerTaskbar
 
 static std::mutex g_logMu;
@@ -51,16 +52,20 @@ static bool Logged(const wchar_t* part) {
     for (auto& l : g_logs) if (l.find(part) != std::wstring::npos) return true;
     return false;
 }
-static void ClearLog() { std::lock_guard<std::mutex> lk(g_logMu); g_logs.clear(); }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
+static size_t LoggedCount(const wchar_t* part) {
+    std::lock_guard<std::mutex> lk(g_logMu);
+    size_t n = 0;
+    for (auto& l : g_logs) if (l.find(part) != std::wstring::npos) ++n;
+    return n;
 }
+static void ClearLog() { std::lock_guard<std::mutex> lk(g_logMu); g_logs.clear(); }
+#define TEST_SUPPORT_QPC_NOW
+#include "test_support.h"
 
-static int g_failures = 0;
+static int g_failures = 0, g_checks = 0;   // g_checks: Check()s run (the last line's count)
 static void Check(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
+    ++g_checks;
     if (!ok) ++g_failures;
 }
 
@@ -70,10 +75,25 @@ static std::mutex g_recMu;
 static std::vector<Received> g_explorerGot;
 static std::map<ULONG_PTR, LRESULT> g_explorerReply;   // per WM_COPYDATA dwData
 
+// an app bar message's block, as Explorer reads it (SHLockShared with the process the message names) and answers in it
+static bool g_answerAppBar = false;
+static std::atomic<bool> g_appBarRead{ false };
+static trayhost::AppBarData32 g_appBarSeen{};
 static LRESULT CALLBACK FakeExplorerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_COPYDATA) {
         auto* cds = (COPYDATASTRUCT*)l;
         Received r{ m, w, l, cds->dwData, std::vector<BYTE>((BYTE*)cds->lpData, (BYTE*)cds->lpData + cds->cbData), h };
+        if (g_answerAppBar && cds->dwData == 0 && cds->cbData == sizeof(trayhost::AppBarMessage)) {
+            trayhost::AppBarMessage msg{};
+            memcpy(&msg, cds->lpData, sizeof(msg));
+            if (auto* abd = (trayhost::AppBarData32*)SHLockShared((HANDLE)(ULONG_PTR)msg.hSharedMemory, msg.dwProcessId)) {
+                g_appBarSeen = *abd;
+                g_appBarRead = true;
+                abd->rc.top -= 48;   // the answer: the strip moved up (another bar below it)
+                abd->rc.bottom -= 48;
+                SHUnlockShared(abd);
+            }
+        }
         std::lock_guard<std::mutex> lk(g_recMu);
         g_explorerGot.push_back(r);
         return g_explorerReply.count(cds->dwData) ? g_explorerReply[cds->dwData] : 0;
@@ -110,106 +130,10 @@ static LRESULT CALLBACK OwnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-// a window on its own thread with a message loop
-struct WindowThread {
-    HWND hwnd = nullptr;
-    std::thread t;
-    DWORD tid = 0;
-    void Run(const wchar_t* cls, WNDPROC proc, bool messageOnly = false) {
-        HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        t = std::thread([this, cls, proc, ready, messageOnly] {
-            tid = GetCurrentThreadId();
-            WNDCLASSEXW wc = { sizeof(wc) }; wc.lpfnWndProc = proc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = cls;
-            RegisterClassExW(&wc);
-            hwnd = CreateWindowExW(0, cls, L"", messageOnly ? 0 : WS_POPUP, 0, 0, 10, 10, messageOnly ? HWND_MESSAGE : nullptr, nullptr, wc.hInstance, nullptr);
-            SetEvent(ready);
-            MSG m;
-            while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
-        });
-        WaitForSingleObject(ready, 5000);
-        CloseHandle(ready);
-    }
-    void Quit() {
-        if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);   // DefWindowProc destroys it
-        PostThreadMessageW(tid, WM_QUIT, 0, 0);
-        if (t.joinable()) t.join();
-        hwnd = nullptr;
-    }
-};
-
-static HICON MakeIcon(int w, int h, const std::function<uint32_t(int, int)>& px) {
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC dc = GetDC(nullptr);
-    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    ReleaseDC(nullptr, dc);
-    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) ((uint32_t*)bits)[y * w + x] = px(x, y);
-    std::vector<BYTE> zeros((size_t)((w + 15) / 16 * 2) * h, 0);
-    HBITMAP mask = CreateBitmap(w, h, 1, 1, zeros.data());
-    ICONINFO ii{ TRUE, 0, 0, mask, color };
-    HICON icon = CreateIconIndirect(&ii);
-    DeleteObject(color); DeleteObject(mask);
-    return icon;
-}
-
-static LRESULT SendTray(ULONG_PTR dwData, const void* data, DWORD size, HWND from) {
-    COPYDATASTRUCT cds{ dwData, size, (void*)data };
-    DWORD_PTR r = 0;
-    SendMessageTimeoutW(trayhost::g_wnd, WM_COPYDATA, (WPARAM)from, (LPARAM)&cds, SMTO_NORMAL, 5000, &r);
-    return (LRESULT)r;
-}
-
-static trayhost::TrayNotifyData Notify(DWORD message, HWND app, UINT uid, UINT flags) {
-    trayhost::TrayNotifyData d{};
-    d.signature = 0x34753423; d.message = message;
-    d.nid.cbSize = sizeof(d.nid);
-    d.nid.hWnd = (DWORD)(ULONG_PTR)app; d.nid.uID = uid; d.nid.uFlags = flags;
-    d.nid.uCallbackMessage = kCallback;
-    return d;
-}
-
-static LRESULT SendNotify(const trayhost::TrayNotifyData& d, HWND from) { return SendTray(1, &d, sizeof(d), from); }
+#include "tray_host_harness.h"
 
 static size_t ExplorerCount() { std::lock_guard<std::mutex> lk(g_recMu); return g_explorerGot.size(); }
 static Received LastExplorer() { std::lock_guard<std::mutex> lk(g_recMu); return g_explorerGot.empty() ? Received{} : g_explorerGot.back(); }
-
-static std::vector<std::pair<WPARAM, LPARAM>> AppMessages(size_t want) {
-    for (int i = 0; i < 200; ++i) {
-        { std::lock_guard<std::mutex> lk(g_recMu); if (g_appGot.size() >= want) break; }
-        Sleep(10);
-    }
-    std::lock_guard<std::mutex> lk(g_recMu);
-    auto out = g_appGot;
-    g_appGot.clear();
-    return out;
-}
-
-static const trayhost::IconView* FindShown(const std::vector<trayhost::IconView>& v, uint64_t key) {
-    for (auto& i : v) if (i.key == key) return &i;
-    return nullptr;
-}
-
-static uint64_t KeyOf(HWND app, UINT uid) {
-    std::lock_guard<std::mutex> lk(trayhost::g_mu);
-    for (auto& ic : trayhost::g_icons) if (ic.hwnd == app && ic.uid == uid) return ic.key;
-    return 0;
-}
-
-static bool WaitFor(const std::function<bool()>& cond, int ms) {
-    for (int i = 0; i < ms / 20; ++i) { if (cond()) return true; Sleep(20); }
-    return cond();
-}
-
-static void SetEntry(HKEY root, const wchar_t* name, const std::wstring& exe, DWORD uid, DWORD promoted) {
-    HKEY k = nullptr;
-    RegCreateKeyExW(root, name, 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr);
-    RegSetValueExW(k, L"ExecutablePath", 0, REG_SZ, (const BYTE*)exe.c_str(), DWORD((exe.size() + 1) * 2));
-    RegSetValueExW(k, L"UID", 0, REG_DWORD, (const BYTE*)&uid, 4);
-    RegSetValueExW(k, L"IsPromoted", 0, REG_DWORD, (const BYTE*)&promoted, 4);
-    RegCloseKey(k);
-}
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -218,6 +142,14 @@ int main() {
     HKEY parent = nullptr;
     RegCreateKeyExW(HKEY_CURRENT_USER, LD_TRAY_SETTINGS_PARENT, 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &parent, nullptr);
     RegCloseKey(parent);
+
+    // the stand-in for Explorer's process (suspended, ended at the end): app bar blocks are made for it
+    STARTUPINFOW standInSi{ sizeof(standInSi) };
+    PROCESS_INFORMATION standIn{};
+    wchar_t standInCmd[] = L"cmd.exe /c exit";
+    if (CreateProcessW(nullptr, standInCmd, nullptr, nullptr, FALSE, CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &standInSi, &standIn))
+        g_explorerPid = standIn.dwProcessId;
+    Check(g_explorerPid != 0, "a stand-in for Explorer's process");
 
     WindowThread explorer, app, app2, messageOnly;
     explorer.Run(L"FakeExplorerTray", FakeExplorerProc);
@@ -276,22 +208,22 @@ int main() {
     // ---- clicks, version 4: wParam = pointer, lParam = event | id << 16
     RECT anchor{ 10, 20, 30, 40 };
     trayhost::Send(k1, trayhost::Mouse::LeftClick, POINT{ 100, 200 }, anchor);
-    auto msgs = AppMessages(3);
+    auto msgs = AppMessages(3, 0);
     Check(msgs.size() == 3 && msgs[0].first == (WPARAM)MAKELONG(100, 200) &&
           msgs[0].second == (LPARAM)MAKELONG(WM_LBUTTONDOWN, 1) && msgs[1].second == (LPARAM)MAKELONG(WM_LBUTTONUP, 1) &&
           msgs[2].second == (LPARAM)MAKELONG(NIN_SELECT, 1), "v4 left click: down, up, NIN_SELECT");
     trayhost::Send(k1, trayhost::Mouse::RightClick, POINT{ 100, 200 }, anchor);
-    msgs = AppMessages(3);
+    msgs = AppMessages(3, 0);
     Check(msgs.size() == 3 && msgs[0].second == (LPARAM)MAKELONG(WM_RBUTTONDOWN, 1) && msgs[1].second == (LPARAM)MAKELONG(WM_RBUTTONUP, 1) &&
           msgs[2].second == (LPARAM)MAKELONG(WM_CONTEXTMENU, 1), "v4 right click: down, up, WM_CONTEXTMENU");
     trayhost::Send(k1, trayhost::Mouse::LeftDoubleClick, POINT{ 100, 200 }, anchor);
-    msgs = AppMessages(2);
+    msgs = AppMessages(2, 0);
     Check(msgs.size() == 2 && msgs[0].second == (LPARAM)MAKELONG(WM_LBUTTONDBLCLK, 1) && msgs[1].second == (LPARAM)MAKELONG(WM_LBUTTONUP, 1), "v4 double click");
     trayhost::Send(k1, trayhost::Mouse::Enter, POINT{ 100, 200 }, anchor);
-    msgs = AppMessages(2);
+    msgs = AppMessages(2, 0);
     Check(msgs.size() == 2 && msgs[1].second == (LPARAM)MAKELONG(NIN_POPUPOPEN, 1), "v4 hover opens the program's pop-up");
     trayhost::Send(k1, trayhost::Mouse::Leave, POINT{ 100, 200 }, anchor);
-    msgs = AppMessages(2);
+    msgs = AppMessages(2, 0);
     Check(msgs.size() == 2 && msgs[1].second == (LPARAM)MAKELONG(NIN_POPUPCLOSE, 1), "v4 leave closes it");
 
     // ---- Shell_NotifyIconGetRect: the dock's anchor of the icon
@@ -314,7 +246,7 @@ int main() {
     Check(FindShown(trayhost::Shown(), k2) && FindShown(trayhost::Shown(), k2)->glyph, "a white shape is a glyph (tinted by the dock)");
     trayhost::Send(k2, trayhost::Mouse::LeftClick, POINT{ 5, 6 }, anchor);
     Sleep(150);   // anything extra (a NIN_SELECT) would have arrived by now
-    msgs = AppMessages(2);
+    msgs = AppMessages(2, 0);
     Check(msgs.size() == 2 && msgs[0].first == 2 && msgs[0].second == WM_LBUTTONDOWN && msgs[1].second == WM_LBUTTONUP, "v0 left click: id in wParam, no NIN_SELECT");
 
     // ---- an icon known by its GUID, added again under a new id (Electron numbers every tray icon it
@@ -331,7 +263,7 @@ int main() {
         SendNotify(g2, app.hwnd);
         Check(kg && KeyOf(app.hwnd, 4) == kg && !KeyOf(app.hwnd, 3), "added again under its GUID with id 4: the same icon, now id 4");
         trayhost::Send(kg, trayhost::Mouse::LeftClick, POINT{ 5, 6 }, anchor);
-        msgs = AppMessages(2);
+        msgs = AppMessages(2, 0);
         Check(msgs.size() == 2 && msgs[0].first == 4 && msgs[0].second == WM_LBUTTONDOWN, "its clicks carry the new id");
         auto g3 = Notify(NIM_MODIFY, app.hwnd, 0, NIF_TIP | NIF_GUID);   // a modify naming the icon by GUID alone
         g3.nid.guidItem = kIconGuid;
@@ -363,6 +295,57 @@ int main() {
     Check(cr == 4242 && LastExplorer().msg == WM_COMMAND && LastExplorer().wp == 419, "WM_COMMAND forwarded");
     SendMessageTimeoutW(host, WM_USER + 13, 7, 8, SMTO_NORMAL, 3000, &cr);
     Check(cr == 4242 && LastExplorer().msg == WM_USER + 13 && LastExplorer().wp == 7, "private WM_USER message forwarded");
+    {   // The dock's own app bar: SHAppBarMessage found the host first, in the dock's process, and made the block for that
+        // process - which is no handle but a block in its own memory (as SHAllocShared does for the calling process).
+        // Explorer cannot read that: the host makes one for Explorer's process, passes that on, and copies the answer back.
+        trayhost::AppBarData32 abd{ sizeof(abd), (DWORD)(ULONG_PTR)app.hwnd, WM_APP + 40, ABE_BOTTOM, { -1440, 1936, 0, 2000 }, 0 };
+        const DWORD self = GetCurrentProcessId();
+        HANDLE block = SHAllocShared(&abd, sizeof(abd), self);
+        trayhost::AppBarMessage msg{ abd, ABM_SETPOS, 0, (UINT64)(ULONG_PTR)block, self, 0 };
+        g_answerAppBar = true; g_appBarRead = false; g_explorerReply[0] = 1;
+        LRESULT r = 0;
+        {
+            trayhost::OwnAppBar own(app.hwnd);   // as the dock names its window around its own QUERYPOS / SETPOS
+            r = SendTray(0, &msg, sizeof(msg), app.hwnd);
+        }
+        trayhost::AppBarMessage got{};
+        const Received last = LastExplorer();
+        if (last.bytes.size() == sizeof(got)) memcpy(&got, last.bytes.data(), sizeof(got));
+        Check(block && r == 1 && last.dwData == 0 && last.wp == (WPARAM)app.hwnd && got.dwMessage == ABM_SETPOS &&
+              got.dwProcessId == g_explorerPid && got.hSharedMemory && got.hSharedMemory != msg.hSharedMemory &&
+              !memcmp(&got.abd, &abd, sizeof(abd)),
+              "the dock's own app bar block: passed on as one made for Explorer's process, the rest as it came");
+        Check(g_appBarRead && EqualRect(&g_appBarSeen.rc, &abd.rc) && g_appBarSeen.uEdge == ABE_BOTTOM,
+              "...Explorer reads the strip from it");
+        auto* answer = (trayhost::AppBarData32*)SHLockShared(block, self);
+        Check(answer && answer->rc.top == 1936 - 48 && answer->rc.bottom == 2000 - 48, "...and its answer is back in the sender's block");
+        if (answer) SHUnlockShared(answer);
+        SHFreeShared(block, self);
+
+        // another program's message with a block (the host's process named, as SHAppBarMessage does): passed on as it
+        // came - the host opens no other program's block (an elevated dock would do it with rights the program lacks)
+        HANDLE other = SHAllocShared(&abd, sizeof(abd), g_explorerPid);   // a real handle, as a program's would be
+        trayhost::AppBarMessage foreign{ abd, ABM_SETPOS, 0, (UINT64)(ULONG_PTR)other, self, 0 };
+        g_appBarRead = false;
+        SendTray(0, &foreign, sizeof(foreign), app.hwnd);
+        Check(other && LastExplorer().bytes.size() == sizeof(foreign) && !memcmp(LastExplorer().bytes.data(), &foreign, sizeof(foreign)),
+              "another program's app bar block is passed on as it came, unopened");
+        {   // ...also while the dock names its window, when the message is for another window
+            trayhost::OwnAppBar own(messageOnly.hwnd);
+            SendTray(0, &foreign, sizeof(foreign), app.hwnd);
+        }
+        Check(LastExplorer().bytes.size() == sizeof(foreign) && !memcmp(LastExplorer().bytes.data(), &foreign, sizeof(foreign)),
+              "...also while the dock sends its own, for another window");
+        if (other) SHFreeShared(other, g_explorerPid);
+
+        // a message with no block (ABM_NEW, ABM_REMOVE, ABM_GETSTATE) is passed on as it came
+        trayhost::AppBarMessage plain{ abd, ABM_NEW, 0, 0, self, 0 };
+        g_appBarRead = false;
+        SendTray(0, &plain, sizeof(plain), app.hwnd);
+        Check(!g_appBarRead && LastExplorer().bytes.size() == sizeof(plain) && !memcmp(LastExplorer().bytes.data(), &plain, sizeof(plain)),
+              "an app bar message with no block is passed on as it came");
+        g_answerAppBar = false; g_explorerReply.erase(0);
+    }
     BYTE tiny[8] = {};
     before = ExplorerCount();
     SendTray(1, tiny, sizeof(tiny), app.hwnd);
@@ -597,12 +580,34 @@ int main() {
     trayhost::SetHosting(true);
     trayhost::Stop();
     Check(IsWindow(widget.hwnd) && GetParent(widget.hwnd) == explorer2.hwnd, "on stop the widget goes back to Explorer's taskbar, not destroyed");
+    {   // the host starts again and hosts the same widget window: the log described it once, a stopped host does
+        // not make it describe it again (only a new widget window is described)
+        const size_t seenBefore = LoggedCount(L"tray host: widget seen");
+        Check(seenBefore >= 1 && trayhost::Start(false) && trayhost::Running(), "the host starts again, still hosting");
+        HWND again = trayhost::Window();
+        Check(SetParent(widget.hwnd, again) != nullptr, "the same widget window becomes its child again");
+        trayhost::Place(true, place, true);
+        Check(WaitFor([&] {
+                  RECT r; GetWindowRect(again, &r);
+                  HRGN hr = CreateRectRgn(0, 0, 0, 0);
+                  const int type = GetWindowRgn(again, hr);   // the new window's own region, not the old one's
+                  DeleteObject(hr);
+                  return trayhost::HostedState().window == widget.hwnd && EqualRect(&r, &place) && type != ERROR && type != NULLREGION;
+              }, 2000), "it is hosted and seen again");
+        Sleep(300);   // the host thread's checks (every 100 ms) would have described it by now
+        Check(LoggedCount(L"tray host: widget seen") == seenBefore, "the same widget window is not described in the log again");
+        trayhost::Stop();
+        Check(IsWindow(widget.hwnd) && GetParent(widget.hwnd) == explorer2.hwnd, "and on stop it goes back to Explorer's taskbar again");
+    }
     trayhost::SetHosting(false);
     widget.Quit();
 
     RegDeleteTreeW(HKEY_CURRENT_USER, LD_TRAY_SETTINGS_PARENT);
     DestroyIcon(colorful); DestroyIcon(glyph);
     app.Quit(); explorer2.Quit(); messageOnly.Quit();
+    if (standIn.hProcess) { TerminateProcess(standIn.hProcess, 0); CloseHandle(standIn.hProcess); CloseHandle(standIn.hThread); }
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
+    std::printf("tray_host_test: %s (%d checks, %d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_checks, g_failures,
+                g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -34,8 +34,6 @@ static INT_PTR nextThumbnail = 0x700000;
 static int registrations = 0, strayUnregisters = 0, strayUpdates = 0, activations = 0, sourceTouched = 0;
 static bool failRegister = false;
 static HWND front = (HWND)0x9090;
-static WindowPreview* current = nullptr;
-static HWND captured = nullptr;
 static std::vector<HWND> asked;                  // the windows the preview asked the AppModel to close
 static bool dismissWhileAsking = false;          // the AppModel's close waits on a question meanwhile the popup goes
 // what the preview asks of the window manager and DWM, counted (tests/preview_rules_test.cpp's cost checks)
@@ -56,7 +54,6 @@ static BOOL WINAPI FakeAffinity(HWND h, DWORD* value) {
     ++affinityAsks;
     auto it = sources.find(h); *value = it != sources.end() && it->second.protectedContent ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE; return TRUE;
 }
-static HRESULT WINAPI FakeAttribute(HWND, DWORD, PVOID value, DWORD) { *static_cast<DWORD*>(value) = 0; return S_OK; }
 static HRESULT WINAPI FakeRegister(HWND destination, HWND source, HTHUMBNAIL* out) {
     if (failRegister || !FakeIsWindow(source)) return E_FAIL;
     ++registrations; *out = (HTHUMBNAIL)(nextThumbnail++); live[*out] = source; liveDest[*out] = destination; return S_OK;
@@ -86,7 +83,6 @@ static BOOL WINAPI FakeWindowRect(HWND h, LPRECT r) {
     if (it == sources.end()) return FALSE;
     *r = it->second.minimized ? it->second.minimizedRect : it->second.normalRect; return TRUE;
 }
-static int WINAPI FakeClassName(HWND, LPWSTR name, int count) { wcscpy_s(name, count, L"FixtureClass"); return 12; }
 static BOOL WINAPI FakePos(HWND h, HWND, int x, int y, int cx, int cy, UINT) {
     if (Known(h)) ++sourceTouched;
     if (popups.count(h)) { ++popupMoves; popupAt[h] = {x, y, x + cx, y + cy}; }
@@ -94,40 +90,11 @@ static BOOL WINAPI FakePos(HWND h, HWND, int x, int y, int cx, int cy, UINT) {
 }
 static int WINAPI FakeRegion(HWND, HRGN r, BOOL) { ++regions; DeleteObject(r); return 1; }
 static BOOL WINAPI FakeInvalidate(HWND, const RECT*, BOOL) { ++invalidates; return TRUE; }
-static int WINAPI FakeText(HWND, LPWSTR text, int count) { wcscpy_s(text, count, L"Fixture window"); return 14; }
 static HWND WINAPI FakeForeground() { return front; }
 static SHORT WINAPI FakeKey(int) { return 0; }
-static BOOL WINAPI FakeDestroy(HWND) { return TRUE; }
-static LONG_PTR WINAPI FakeUserData(HWND, int) { return reinterpret_cast<LONG_PTR>(current); }
-static HWND WINAPI FakeCapture(HWND h) { HWND old = captured; captured = h; return old; }
-static HWND WINAPI FakeCaptured() { return captured; }
-static BOOL WINAPI FakeRelease() { captured = nullptr; return TRUE; }
 static void FakeLog(const wchar_t*, ...) {}
 
-#define IsWindow FakeIsWindow
-#define IsWindowVisible FakeVisible
-#define ShowWindow FakeShow
-#define GetWindowThreadProcessId FakePid
-#define IsIconic FakeIconic
-#define GetWindowDisplayAffinity FakeAffinity
-#define DwmGetWindowAttribute FakeAttribute
-#define DwmRegisterThumbnail FakeRegister
-#define DwmUnregisterThumbnail FakeUnregister
-#define DwmQueryThumbnailSourceSize FakeSize
-#define DwmUpdateThumbnailProperties FakeUpdate
-#define GetWindowRect FakeWindowRect
-#define GetClassNameW FakeClassName
-#define SetWindowPos FakePos
-#define SetWindowRgn FakeRegion
-#define InvalidateRect FakeInvalidate
-#define GetWindowTextW FakeText
-#define GetForegroundWindow FakeForeground
-#define GetAsyncKeyState FakeKey
-#define DestroyWindow FakeDestroy
-#define GetWindowLongPtrW FakeUserData
-#define SetCapture FakeCapture
-#define GetCapture FakeCaptured
-#define ReleaseCapture FakeRelease
+#include "preview_fakes.h"
 #define Log FakeLog
 #include "../src/window_preview.cpp"
 #undef Log
@@ -354,6 +321,64 @@ int main() {
         }
     }
 
+    // ---- the arrangement pixel for pixel at 1.0 and 1.5 (Arrange's parts): every rectangle of the popup
+    // and of its cards on each page, where it was put and the pictures' places, next to icons at either end and in the
+    // middle of every edge, then the icon moved under it (Arrange's follow path) - folded into one number (FNV-1a) that
+    // mod.35's code makes. A rounding moved or a term left out changes it; the rules above stay as they are.
+    {
+        struct Pinned { RECT mon; float scale; unsigned long long want; const char* name; };
+        const Pinned pinned[] = {
+            {{0, 0, 2560, 1440}, 1.0f, 0xe0daffc49fced925ull, "2560x1440 at 1.0"},
+            {{-1440, -560, 0, 2000}, 1.0f, 0xdb4fbd7f5dd5cef5ull, "portrait 1440x2560 at negative coordinates, 1.0"},
+            {{0, 0, 2880, 1800}, 1.5f, 0xd9a489d66b170fdbull, "2880x1800 at 1.5 (a laptop)"},
+        };
+        for (const Pinned& s : pinned) {
+            unsigned long long digest = 1469598103934665603ull;
+            auto fold = [&](long v) { digest = (digest ^ (unsigned long)v) * 1099511628211ull; };
+            auto rect = [&](RECT r) { fold(r.left); fold(r.top); fold(r.right); fold(r.bottom); };
+            const RECT& m = s.mon;
+            const int icon = (int)std::lround(48 * s.scale), depth = (int)std::lround(100 * s.scale);
+            for (Edge edge : {Edge::Bottom, Edge::Top, Edge::Left, Edge::Right})
+            for (int place = 0; place < 3; ++place)
+            for (int count : {1, 2, 5, 13, 40}) {
+                auto app = MakeApp(count, 0x3800);
+                WindowPreview p; p.hwnd = Popup(0x80A0); popups[p.hwnd] = true;
+                p.app = app; p.monitor = m; p.edge = edge; p.scale = s.scale;
+                const bool vertical = IsVertical(edge);
+                const int along0 = vertical ? m.top : m.left, along1 = vertical ? m.bottom : m.right;
+                const int at = place == 0 ? along0 + 2 : place == 1 ? (along0 + along1) / 2 - icon / 2 : along1 - 2 - icon;
+                switch (edge) {
+                case Edge::Bottom: p.anchor = {at, m.bottom - depth, at + icon, m.bottom}; break;
+                case Edge::Top: p.anchor = {at, m.top, at + icon, m.top + depth}; break;
+                case Edge::Left: p.anchor = {m.left, at, m.left + depth, at + icon}; break;
+                case Edge::Right: p.anchor = {m.right - depth, at, m.right, at + icon}; break;
+                }
+                p.Refresh();
+                for (int page = 0; page < count; ++page) {
+                    fold(p.first); fold(p.capacity);
+                    rect(p.bounds); rect(p.bridge); rect(p.previous); rect(p.next); rect(popupAt[p.hwnd]);
+                    for (int i = p.first; i < std::min(p.first + p.capacity, count); ++i) {
+                        const auto& e = p.entries[i];
+                        fold(i); rect(e.card); rect(e.image); rect(p.CloseRect(e));
+                        auto props = lastProps.find(e.thumbnail);
+                        rect(props != lastProps.end() ? props->second.rcDestination : RECT{-1, -1, -1, -1});
+                    }
+                    int before = p.first; p.ChangePage(1); if (before == p.first) break;
+                }
+                // the icon grows and slides under the open popup: Arrange(true) moves it along
+                for (int step : {3, 7, -11}) {
+                    OffsetRect(&p.anchor, vertical ? 0 : step, vertical ? step : 0);
+                    p.Arrange(true);
+                    rect(p.bounds); rect(p.bridge); rect(popupAt[p.hwnd]);
+                }
+                p.Dismiss();
+            }
+            char what[200];
+            std::snprintf(what, sizeof(what), "%s: the popup, its cards, close buttons and pictures where mod.35 put them, to the pixel", s.name);
+            if (!Check(digest == s.want, what)) std::printf("    digest 0x%016llxull, expected 0x%016llxull\n", digest, s.want);
+        }
+    }
+
     // ---- a card that is closing: its close button rests (a second press, a double click, asks nothing more)
     {
         auto app = MakeApp(2, 0x4000);
@@ -518,6 +543,64 @@ int main() {
             inside &= Inside(p.entries[i].image, p.entries[i].card) && p.entries[i].card.bottom <= p.bounds.bottom - p.bounds.top;
         Check(p.bounds.bottom - p.bounds.top != tall && regions == regions0 + 1 && inside && popupAt[p.hwnd].bottom == p.bounds.bottom,
               "an icon move that resizes the popup: cards, pictures and region made anew, all inside it");
+        p.Dismiss();
+        Check(live.empty(), "dismissed: nothing held");
+    }
+
+    // ---- no room next to the icon (Arrange's early return): the monitor beside an open popup's dock
+    // shrinks below the smallest preview - the popup goes, held off, and nothing of it is placed, moved or drawn again
+    {
+        struct Shrink { RECT mon, anchor, shrunk; Edge edge; const char* name; };
+        const Shrink shrinks[] = {
+            {{0, 0, 1280, 720}, {616, 620, 664, 720}, {0, 520, 1280, 720}, Edge::Bottom, "too short above a bottom dock"},
+            {{0, 0, 1280, 720}, {0, 336, 100, 384}, {0, 0, 180, 720}, Edge::Left, "too narrow beside a left dock"},
+        };
+        for (const Shrink& s : shrinks) {
+            auto app = MakeApp(3, 0x7400);
+            WindowPreview p; p.hwnd = Popup(0x80A1); popups[p.hwnd] = true;
+            p.app = app; p.monitor = s.mon; p.anchor = s.anchor; p.edge = s.edge; p.scale = 1;
+            p.Refresh();
+            const bool opened = !p.suppressed && p.entries.size() == 3 && !live.empty() && SameRect(popupAt[p.hwnd], p.bounds);
+            const RECT bounds0 = p.bounds, bridge0 = p.bridge, next0 = p.next, previous0 = p.previous, at0 = popupAt[p.hwnd];
+            const int moves0 = popupMoves, regions0 = regions, inval0 = invalidates;
+            p.monitor = s.shrunk;
+            p.Refresh();
+            char what[200];
+            std::snprintf(what, sizeof(what), "no room, %s: the popup hidden and held off, holding nothing, placed, moved and drawn no more", s.name);
+            Check(opened && !p.app && p.entries.empty() && p.suppressed && live.empty() && !popups[p.hwnd] &&
+                  popupMoves == moves0 && regions == regions0 && invalidates == inval0 && SameRect(popupAt[p.hwnd], at0) &&
+                  SameRect(p.bounds, bounds0) && SameRect(p.bridge, bridge0) && SameRect(p.next, next0) && SameRect(p.previous, previous0), what);
+            p.Dismiss();
+        }
+    }
+
+    // ---- a popup in place whose card changes (the cards' `moved` back to Arrange): the same place,
+    // and the window's region and picture made anew, once; a protected window, then a minimized one with no image kept
+    {
+        auto app = MakeApp(3, 0x7500);
+        WindowPreview p; p.hwnd = Popup(0x80A2); popups[p.hwnd] = true;
+        p.app = app; p.monitor = mon; p.anchor = anchor; p.edge = Edge::Bottom; p.scale = 1;
+        p.Refresh();
+        int moves0 = popupMoves, regions0 = regions, inval0 = invalidates;
+        const RECT bounds0 = p.bounds;
+        p.Refresh();
+        Check(p.entries.size() == 3 && popupMoves == moves0 && regions == regions0 && invalidates == inval0 && SameRect(p.bounds, bounds0),
+              "fixture: a popup of three cards in place, a Refresh at rest moves and draws nothing");
+        sources[app->windows[1]].protectedContent = true;
+        p.Refresh();
+        Check(SameRect(p.bounds, bounds0) && SameRect(popupAt[p.hwnd], bounds0) && popupMoves == moves0 + 1 && regions == regions0 + 1 &&
+              invalidates == inval0 + 1 && p.entries[1].fallback == L"미리보기가 제한된 창" && !p.entries[1].thumbnail,
+              "a window protected under the popup in place: the same place, its region and picture made anew once, the card says so");
+        moves0 = popupMoves; regions0 = regions; inval0 = invalidates;
+        sources[app->windows[2]].minimized = true; sources[app->windows[2]].dwm = {160, 28};   // DWM kept only its caption
+        p.Refresh();
+        Check(SameRect(p.bounds, bounds0) && popupMoves == moves0 + 1 && regions == regions0 + 1 && invalidates == inval0 + 1 &&
+              p.entries[2].fallback == L"최소화된 창 · 클릭하여 복원" && p.entries[2].noImage && !p.entries[2].thumbnail,
+              "...a window minimized with no image kept: the same place, made anew once, the card's words in its picture's place");
+        moves0 = popupMoves; regions0 = regions; inval0 = invalidates;
+        p.Refresh();
+        Check(SameRect(p.bounds, bounds0) && popupMoves == moves0 && regions == regions0 && invalidates == inval0 && Balanced(p),
+              "...and the next Refresh, nothing new: nothing moved or drawn again");
         p.Dismiss();
         Check(live.empty(), "dismissed: nothing held");
     }

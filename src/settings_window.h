@@ -1,7 +1,7 @@
 #pragma once
 #include "common.h"
 
-// The settings window: every option on four tabs (shape, behaviour, buttons, system), drawn with
+// The settings window: every option on five tabs (shape, behaviour, buttons, system, sensors), drawn with
 // Direct2D over the Windows 11 acrylic backdrop (the taskbar's translucent look; a solid colour on
 // Windows 10). Changes reach the docks while sliders move. One instance at a time.
 // Its .cpp files and what each holds: settings_window_internal.h.

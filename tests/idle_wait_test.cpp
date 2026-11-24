@@ -54,18 +54,75 @@ int main() {
     Check(DisplayStillOff(true, false), "the display off and the pointer still: still off");
     Check(!DisplayStillOff(true, true), "the display off and the pointer moved: someone is at the screen, taken as on");
     Check(!DisplayStillOff(false, false) && !DisplayStillOff(false, true), "a display that is on stays on, moving or not");
+    // main.cpp's loop: LookAtPointer every pass, IdleWaitMs on a pass with nothing busy. An always-shown dock at rest at the
+    // bottom of a desktop's 2560x1440 monitor, the pointer in the middle of it (looked at before: where it was last read).
+    auto restingLook = [](bool displayOff) {
+        PointerLook look; look.Start(0); look.lastX = 1280; look.lastY = 700; look.displayOff = displayOff;
+        return look;
+    };
     {
-        // main.cpp's loop, an always-shown dock at rest: "off" comes, the pointer rests, then the user moves it and no
-        // "on" notification ever comes (a reconnected session) - the glass's ~30 fps comes back at that first move
-        bool displayOff = true, slowWhileOff = true, quickAfter = true;
+        // "off" comes, the pointer rests, then the user moves it and no "on" notification ever comes (a reconnected
+        // session) - the glass's ~30 fps comes back at that first move
+        PointerLook look = restingLook(true);
+        bool slowWhileOff = true, quickAfter = true, takenOnAtTheMove = true;
+        double now = 30;
         for (int frame = 0; frame < 20; ++frame) {
-            const bool moved = frame == 10, cursorRead = true;
-            displayOff = DisplayStillOff(displayOff, moved);
-            const unsigned wait = WaitMs(false, false, true, moved ? 0.0 : 30.0, !cursorRead || displayOff);
+            const long x = frame >= 10 ? 1300 : 1280;   // moved at frame 10, resting there after
+            const Look l = LookAtPointer(look, true, x, 700, now);
+            takenOnAtTheMove &= l.displayTakenOn == (frame == 10) && l.moved == (frame == 10) && !l.readChanged;
+            const unsigned wait = IdleWaitMs(look, l, 0, 0, 0, 2560, 1440, x, 700, false, true, now);
             if (frame < 10) slowWhileOff &= wait == kStillWaitMs;
             else quickAfter &= wait == kLiveGlassMs;
+            now += wait / 1000.0;
         }
         Check(slowWhileOff && quickAfter, "...so a missed \"on\" notification leaves the loop slow only until the pointer moves");
+        Check(takenOnAtTheMove && !look.displayOff, "...the display taken as on (main.cpp's 'display: taken as on' line) once, at that move");
+    }
+    {   // an hour of those passes, each wait as long as IdleWaitMs says (the first pass at 0 ms; tests\main_loop_test.cpp
+        // counts the same on main.cpp's own loop: 36,000 locked, 109,091 seen)
+        auto hour = [&](bool read, bool displayOff, int& lines) {
+            PointerLook look = restingLook(displayOff);
+            unsigned passes = 0;
+            lines = 0;
+            for (unsigned ms = 0; ms < 3600u * 1000; ++passes) {
+                const double now = ms / 1000.0;
+                const Look l = LookAtPointer(look, read, 1280, 700, now);
+                lines += l.readChanged + l.displayTakenOn;
+                const long x = read ? 1280 : kNoPointerX, y = read ? 700 : kNoPointerY;   // main.cpp: kNoPointer when unread
+                ms += IdleWaitMs(look, l, 0, 0, 0, 2560, 1440, x, y, false, true, now);
+            }
+            return passes;
+        };
+        int lockedLines = 0, offLines = 0, seenLines = 0;
+        const unsigned locked = hour(false, false, lockedLines), off = hour(true, true, offLines), seen = hour(true, false, seenLines);
+        std::printf("  an hour, an always-shown dock at rest: %u passes locked, %u with the display off, %u seen\n", locked, off, seen);
+        Check(locked == 36000 && off == 36000 && seen == 109091,
+              "an hour of main.cpp's passes, an always-shown dock at rest: 36,000 locked or with the display off, 109,091 seen");
+        Check(lockedLines == 1 && offLines == 0 && seenLines == 0, "...one 'pointer: unreadable' line in the locked hour, no line in the others");
+    }
+    {   // a pass that cannot read the pointer keeps where it was: unlocked where it was is no move, and no wait as if it moved
+        PointerLook look = restingLook(false);
+        const Look a = LookAtPointer(look, false, 0, 0, 10), b = LookAtPointer(look, true, 1280, 700, 11);
+        Check(a.readChanged && a.unseen && !a.moved && b.readChanged && !b.unseen && !b.moved && look.lastX == 1280 && look.movedAt == 0,
+              "the pointer unreadable, then read again where it was: two lines, unseen only while unread, no move");
+        Check(IdleWaitMs(look, a, 0, 0, 0, 2560, 1440, kNoPointerX, kNoPointerY, false, true, 10) == kStillWaitMs &&
+              IdleWaitMs(look, b, 0, 0, 0, 2560, 1440, 1280, 700, false, true, 11) == kLiveGlassMs,
+              "...waits: 100 ms while unread, then as a resting pointer with live glass (33 ms)");
+        const Look e = LookAtPointer(look, true, 1280, 700, 12);
+        Check(!e.moved && IdleWaitMs(look, e, 0, 0, 0, 2560, 1440, 1280, 700, false, false, 12) == kStillWaitMs &&
+              IdleWaitMs(look, e, 0, 0, 0, 0, 0, 1280, 700, false, false, 12) == kEdgeMs,
+              "...a monitor GetMonitorInfoW could not read (all 0) is taken as it is (main.cpp): the bottom-edge rule then finds (1280, 700) near it");
+    }
+    {   // a move stamps movedAt (LookAtPointer): 45 ms for kStill seconds after it, then 100 ms - no live glass to cap the waits
+        PointerLook look = restingLook(false);
+        const Look m = LookAtPointer(look, true, 1300, 700, 30);
+        Check(m.moved && look.movedAt == 30 && IdleWaitMs(look, m, 0, 0, 0, 2560, 1440, 1300, 700, false, false, 30) == kAwayMs,
+              "a pointer moved away from the edge at 30 s: movedAt 30, waits 45 ms");
+        const Look r1 = LookAtPointer(look, true, 1300, 700, 31.9), r2 = LookAtPointer(look, true, 1300, 700, 32.0);
+        Check(!r1.moved && !r2.moved && look.movedAt == 30 &&
+              IdleWaitMs(look, r1, 0, 0, 0, 2560, 1440, 1300, 700, false, false, 31.9) == kAwayMs &&
+              IdleWaitMs(look, r2, 0, 0, 0, 2560, 1440, 1300, 700, false, false, 32.0) == kStillWaitMs,
+              "...resting there: still 45 ms at 31.9 s, 100 ms from 32 s (kStill after the move)");
     }
 
     // near the docks' edge only (main.cpp): edge as Edge in common.h - 0 bottom, 1 left, 2 right, 3 top

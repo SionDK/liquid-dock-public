@@ -1,11 +1,25 @@
 #include "dock.h"
 #include "system.h"
+#include "sensors.h"   // PanelRowsNow's sensorlogic::PanelFit (ComputePanelRect)
 
 // ---------------------------------------------------------------- layout
 
 IDWriteTextFormat* Dock::ClockFont(bool date) const {
     if (date) return g_settings.clockSize == 1 ? g_gfx.fmtDateLarge.Get() : g_gfx.fmtDate.Get();
     return g_settings.clockSize == 1 ? g_gfx.fmtTimeLarge.Get() : g_gfx.fmtTime.Get();
+}
+
+IDWriteTextFormat* Dock::SensorFont(SensorText t) const {
+    const bool lg = g_settings.sensorSize == 1;
+    switch (t) {
+    case SensorText::Value: return (lg ? g_gfx.fmtClockLg : g_gfx.fmtClock).Get();
+    case SensorText::Label: return (lg ? g_gfx.fmtTinyLg : g_gfx.fmtTiny).Get();
+    default:                return (lg ? g_gfx.fmtClockSmallLg : g_gfx.fmtClockSmall).Get();
+    }
+}
+
+const std::wstring& Dock::ClockTime() const {
+    return g_settings.clockFormat == 1 ? g_sys.timeShort : g_sys.timeText;
 }
 
 float Dock::SmallButtonWidth(ButtonId b, const LayoutMetrics& m) const {
@@ -31,16 +45,15 @@ float Dock::ArrangeGroup(int group, const LayoutMetrics& m, float x, bool assign
 
 Dock::LayoutMetrics Dock::MeasureMetrics(float fitFactor, int thicknessPct) {
     LayoutMetrics m{};
-    constexpr float spacing[] = { 0.22f, 0.32f, 0.44f };
     // icons are 60% of the default glass thickness; the thickness setting only changes the padding
-    float pct = (thicknessPct > 0 ? thicknessPct : std::clamp(g_settings.dockThickness, 75, 150)) / 100.0f;
+    float pct = thicknessPct > 0 ? thicknessPct / 100.0f : ThicknessRatio();
     m.icon = std::max(1.0f, std::round(baseNominal * fitFactor * 1.30f * 0.60f));
     float thick = m.icon / 0.60f * pct;
-    float gapRatio = g_settings.iconGap > 0 ? std::clamp(g_settings.iconGap, 10, 60) / 100.0f : spacing[std::clamp(g_settings.iconSpacing, 0, 2)];
+    float gapRatio = IconGapRatio();
     m.gap = std::round(m.icon * gapRatio);
 
     bool vert = IsVertical(g_settings.edge);
-    const auto time = TextSize(ClockFont(), vert ? L"88:88" : g_sys.timeText);
+    const auto time = TextSize(ClockFont(), vert ? L"88:88" : ClockTime());
     const auto date = TextSize(ClockFont(true), g_sys.dateText);
     float clockDepth = vert ? time.width : time.height + date.height;
     // Keep the clock readable even when many apps require smaller icons. The
@@ -50,13 +63,12 @@ Dock::LayoutMetrics Dock::MeasureMetrics(float fitFactor, int thicknessPct) {
     m.thickness = m.icon + 2 * m.padding;
     m.separator = 1 + m.gap;
     m.trayButton = m.icon * 0.45f;
-    // pair the small buttons while half the bar still makes a comfortable target
-    m.stack = m.thickness * 0.5f >= 22 * scale;
+    m.stack = StackButtons(m.thickness, scale);
     m.notify = ArrangeNotify(m, 0, false);
     m.clock = vert ? std::max(m.icon * 0.8f, time.height + 8 * scale)
                    : std::max(time.width, date.width) + 12 * scale;
-    m.sensor = vert ? m.icon * 1.3f
-                    : TextWidth(g_gfx.fmtClockSmall.Get(), L"CPU 100°") + 16 * scale;
+    m.sensor = vert ? m.icon * (g_settings.sensorSize == 1 ? 1.5f : 1.3f)
+                    : TextWidth(SensorFont(SensorText::Line), L"CPU 100°") + 16 * scale;
     // the battery: its icon (larger than the small buttons') over the percentage; none on a desktop
     m.battery = 0;
     if (g_sys.Battery().present) {
@@ -104,7 +116,7 @@ void Dock::ApplyFit(float dt) {
     magRange = base * 2.9f;
 }
 
-void Dock::Layout(double) {
+void Dock::Layout() {
     float unit = base + gap;
     const auto metrics = MeasureMetrics(fit);
     trayW = metrics.TrayWidth();
@@ -247,15 +259,14 @@ POINT Dock::ScreenPointUV(float u, float v) const {
 }
 
 RECT Dock::BarScreenRect() const {
-    auto r = RectUV(barU0, barU1, margin - hideOff, margin + barThick - hideOff);
-    return { winX + (LONG)r.left, winY + (LONG)r.top, winX + (LONG)r.right, winY + (LONG)r.bottom };
+    return ScreenRectTrunc(RectUV(barU0, barU1, BarV0(), BarV1()));
 }
 
 void Dock::ComputePanelRect() {
     bool vert = IsVertical(g_settings.edge);
     const float h = std::min(panelH, std::round(PanelRowsNow().height * scale));   // as high as what it shows
     float across = vert ? h : panelW, depth = vert ? panelW : h;
-    float u = (cells[HitSensor].u0 + cells[HitSensor].u1) * 0.5f;
+    float u = cells[HitSensor].Mid();
     u = clampf(u, across / 2 + 8 * scale, len - across / 2 - 8 * scale);
     // on whole pixels: its cards, bars and dividers are placed from its corner (sharp at 125 and 150 % too)
     const float u0 = std::round(u - across / 2);
@@ -295,14 +306,17 @@ D2D1_RECT_F Dock::ButtonRect(ButtonId b, bool hit) const {
     if (c.u1 <= c.u0) return {};
     float u1 = c.u1;
     if (hit && u1 >= Cell_(ButtonId::Settings).u1 - 0.5f) u1 = std::max(u1, barU1);   // the last cell also takes clicks on the end padding
-    auto r = RectUV(c.u0, u1, margin - hideOff, margin + barThick - hideOff);
-    if (c.half >= 0) {
-        // Split in screen coordinates: the first button is left (side docks) or on top
-        // (top and bottom docks) on every edge.
-        if (IsVertical(g_settings.edge)) { float mid = (r.left + r.right) * 0.5f; (c.half ? r.left : r.right) = mid; }
-        else { float mid = (r.top + r.bottom) * 0.5f; (c.half ? r.top : r.bottom) = mid; }
-    }
+    auto r = RectUV(c.u0, u1, BarV0(), BarV1());
+    SplitHalf(r, c.half);
     return r;
+}
+
+// Split in screen coordinates: the first button (or tray icon) is left (side docks) or on top (top and bottom
+// docks) on every edge.
+void Dock::SplitHalf(D2D1_RECT_F& r, int half) const {
+    if (half < 0) return;
+    if (IsVertical(g_settings.edge)) { float mid = (r.left + r.right) * 0.5f; (half ? r.left : r.right) = mid; }
+    else { float mid = (r.top + r.bottom) * 0.5f; (half ? r.top : r.bottom) = mid; }
 }
 
 Dock::Hit Dock::HitTestUV(float u, float v) {
@@ -311,7 +325,7 @@ Dock::Hit Dock::HitTestUV(float u, float v) {
         auto p = W(u, v);
         if (p.x >= panelRect.left && p.x <= panelRect.right && p.y >= panelRect.top && p.y <= panelRect.bottom) { h.kind = HitPanel; return h; }
     }
-    float vb0 = margin - hideOff, vb1 = margin + barThick - hideOff;
+    float vb0 = BarV0(), vb1 = BarV1();
     if (u < barU0 - 2 || u > barU1 + 2) return h;
     for (size_t i = 0; i < slots.size(); ++i) {
         auto& s = slots[i];

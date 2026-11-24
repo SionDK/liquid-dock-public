@@ -5,8 +5,8 @@
 #include <cmath>
 using namespace hwinfo;
 
-static int fails = 0;
-#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
+static int fails = 0, checks = 0;   // checks: CHECK()s run (the last line's count)
+#define CHECK(c) do { ++checks; if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
 
 static bool approx(float a, float b) { return std::fabs(a - b) < 0.05f; }
 
@@ -317,31 +317,99 @@ int main() {
         CHECK(PickGpuMemory(list).empty() && PickGpuMemory({}).empty());                             // the CPU list above (its "GPU Temperature"): none
     }
 
+    // ParsePower: watts from the shown value, its bare number where it is that value before rounding
+    {
+        float w = 0;
+        CHECK(ParsePower(L"71.234 W", L"71.234", w) && approx(w, 71.234f));
+        CHECK(ParsePower(L"71,2 W", L"71,2", w) && approx(w, 71.2f));                 // decimal comma
+        CHECK(ParsePower(L"71W", L"", w) && approx(w, 71.0f));                        // no space, no raw value
+        CHECK(ParsePower(L"287.0 W ", L"286.96", w) && approx(w, 286.96f));           // the bare number before rounding
+        CHECK(ParsePower(L"287 W", L"0.287", w) && approx(w, 287.0f));                // a bare number in another unit: the shown one
+        CHECK(ParsePower(L"850 mW", L"850", w) && approx(w, 0.85f));
+        CHECK(ParsePower(L"1.2 kW", L"1.2", w) && approx(w, 1200.0f));
+        CHECK(ParsePower(L"0.0 W", L"0.0", w) && approx(w, 0.0f));                    // an idle reading is a reading
+        CHECK(ParsePower(L"1 234 W", L"", w) && approx(w, 1234.0f));                  // a space between digit groups
+        CHECK(!ParsePower(L"52.4 °C", L"52.4", w));                                  // a temperature
+        CHECK(!ParsePower(L"45 %", L"45", w));                                       // CPU PPT Limit, a share
+        CHECK(!ParsePower(L"12.3 Wh", L"12.3", w));                                  // energy
+        CHECK(!ParsePower(L"4,198 MHz", L"4198", w) && !ParsePower(L"1.250 V", L"1.250", w) && !ParsePower(L"98.0 A", L"98", w));
+        CHECK(!ParsePower(L"W", L"", w) && !ParsePower(L"", L"", w) && !ParsePower(L"Yes W", L"", w));
+        CHECK(!ParsePower(L"9000 W", L"9000", w));                                   // implausible
+        CHECK(!ParsePower(L"-5 W", L"-5", w));
+    }
+
+    // RankCpuPower / PickCpuPower: the CPU's package power, English and translated labels
+    {
+        const wchar_t* amd = L"CPU [#0]: AMD Ryzen 7 9800X3D: Enhanced";
+        const wchar_t* intel = L"CPU [#0]: Intel Core i5-12600KF: Enhanced";
+        const wchar_t* laptop = L"CPU [#0]: Intel Core Ultra 7 155H: Enhanced";
+        CHECK(RankCpuPower(amd, L"CPU Package Power") == 0 && RankCpuPower(intel, L"CPU Package Power") == 0);
+        CHECK(RankCpuPower(amd, L"CPU PPT") == 1);
+        CHECK(RankCpuPower(amd, L"CPU 패키지 전력") == 2 && RankCpuPower(laptop, L"CPU 패키지 전원") == 2 && RankCpuPower(intel, L"Package Power") == 2);
+        // the label a test PC's Korean HWiNFO gives (seen 2026-11-22)
+        CHECK(RankCpuPower(amd, L"CPU 패키지 전력 소비") == 2);
+        CHECK(RankCpuPower(amd, L"CPU PPT (W)") == 3);
+        CHECK(RankCpuPower(L"cpu [#0]: amd", L"cpu package power") == 0);           // case-insensitive
+        // limits, currents and parts of the package: never
+        for (const wchar_t* l : { L"CPU PPT Limit", L"CPU 패키지 전력 한계", L"PL1 Power Limit (Static)", L"CPU 패키지 전력 제한", L"CPU TDC", L"CPU EDC",
+                                  L"IA Cores Power", L"GT Cores Power", L"CPU GT Cores Power (Graphics)", L"CPU 그래픽 패키지 전력", L"GPU Package Power",
+                                  L"CPU SoC Power (SVI3 TFN)", L"CPU Core Power (SVI3 TFN)", L"Core 0 Power", L"코어 0 전력", L"CPU 코어 전력",
+                                  L"System Agent Power", L"Rest-of-Chip Power", L"DRAM Power", L"Memory Package Power", L"Uncore Power",
+                                  L"Total System Power", L"CPU Package", L"CPU (Tctl/Tdie)" })
+            CHECK(RankCpuPower(amd, l) < 0);
+        // only HWiNFO's own CPU sensors: not a GPU's, not the board's, not a drive's
+        CHECK(RankCpuPower(L"dGPU [#0]: NVIDIA GeForce RTX 5080", L"CPU Package Power") < 0);
+        CHECK(RankCpuPower(L"ASUS TUF GAMING B650-PLUS (Nuvoton NCT6799D)", L"CPU Package Power") < 0);
+        CHECK(RankCpuPower(L"S.M.A.R.T.: WD_BLACK SN850X", L"CPU Package Power") < 0);
+
+        float w = 0;
+        std::vector<Entry> amdKey = { { 0, amd, L"CPU (Tctl/Tdie)", L"46.0 °C", L"46.0" },
+                                      { 1, amd, L"CPU PPT Limit", L"44.1 %", L"44.1" },
+                                      { 2, amd, L"CPU PPT", L"71.5 W", L"71.512" },
+                                      { 3, amd, L"CPU Core Power (SVI3 TFN)", L"40.1 W", L"40.1" },
+                                      { 4, amd, L"CPU Package Power", L"69.8 W", L"69.81" } };
+        CHECK(PickCpuPower(amdKey, w) == 4 && approx(w, 69.81f));                    // Package Power before PPT, never the cores'
+        amdKey.pop_back();
+        CHECK(PickCpuPower(amdKey, w) == 2 && approx(w, 71.512f));                   // ...PPT without it
+        std::vector<Entry> korean = { { 0, laptop, L"코어 온도", L"42 °C", L"42" },
+                                      { 1, laptop, L"IA 코어 전력", L"3.1 W", L"3.1" },
+                                      { 2, laptop, L"CPU 패키지 전력", L"6.4 W", L"6.42" } };
+        CHECK(PickCpuPower(korean, w) == 2 && approx(w, 6.42f));                     // a Korean HWiNFO: by the label's words
+        std::vector<Entry> temps = { { 0, amd, L"CPU (Tctl/Tdie)", L"46.0 °C", L"46.0" },
+                                     { 1, L"dGPU [#0]: NVIDIA GeForce RTX 5080", L"GPU 메모리 접합 온도", L"50.0 °C", L"50.0" } };
+        w = -1;
+        CHECK(PickCpuPower(temps, w) == -1 && w == -1);                              // a test PC's key (11-22): no power reported
+        std::vector<Entry> wrongUnit = { { 0, amd, L"CPU Package Power", L"44 %", L"44" } };
+        CHECK(PickCpuPower(wrongUnit, w) == -1);                                     // the label right, the value no power
+        CHECK(PickCpuPower({}, w) == -1);
+    }
+
     // Judge: freshness of the Gadget key
     int asked = 0;
     auto proc = [&](bool up) { return [&asked, up] { ++asked; return up; }; };
     Freshness f = Judge(12, 2.0, proc(false));
-    CHECK(f.running && f.usable && asked == 0);                 // fresh key: no process lookup at all
+    CHECK(f.running && asked == 0);                             // fresh key: no process lookup at all
     f = Judge(12, 30.0, proc(false));
-    CHECK(!f.running && !f.usable && asked == 1);               // left behind by a closed HWiNFO
+    CHECK(!f.running && asked == 1);                            // left behind by a closed HWiNFO
     f = Judge(12, 30.0, proc(true));
-    CHECK(f.running && f.usable);                               // quiet for a moment, HWiNFO still runs
+    CHECK(f.running);                                           // quiet for a moment, HWiNFO still runs
     f = Judge(0, 1.0, proc(true));
-    CHECK(!f.running && !f.usable);                             // key exists but nothing is reported (reporting switched off)
+    CHECK(!f.running);                                          // key exists but nothing is reported (reporting switched off)
     asked = 0;
     f = Judge(12, 19.9, proc(false));
-    CHECK(f.running && f.usable && asked == 0);                 // the last write within 20 s: HWiNFO is taken as running, unasked
+    CHECK(f.running && asked == 0);                             // the last write within 20 s: HWiNFO is taken as running, unasked
     f = Judge(12, 20.0, proc(false));
     CHECK(!f.running && asked == 1);                            // from 20 s on the process check decides
     // HWiNFO 8.54 writes a value only when it changes: a temperature steady for a minute
     // or an hour leaves the key quiet that long. While HWiNFO runs it is still its value.
     f = Judge(12, 60.5, proc(true));
-    CHECK(f.running && f.usable);
+    CHECK(f.running);
     f = Judge(12, 3600.0, proc(true));
-    CHECK(f.running && f.usable);
+    CHECK(f.running);
     f = Judge(12, 3600.0, proc(false));
-    CHECK(!f.running && !f.usable);                             // ...and nothing once HWiNFO is gone
+    CHECK(!f.running);                                          // ...and nothing once HWiNFO is gone
 
     std::printf(fails ? "%d FAILED\n" : "all hwinfo tests passed\n", fails);
+    std::printf("hwinfo_test: %s (%d checks, %d failure%s)\n", fails ? "FAILED" : "ALL PASSED", checks, fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

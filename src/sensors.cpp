@@ -6,24 +6,6 @@
 #include <shellapi.h>
 
 SensorClient g_sensors;
-extern Settings g_settings;
-
-static std::wstring HelperPath() {
-    wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr, p, MAX_PATH);
-    std::wstring s = p;
-    return s.substr(0, s.find_last_of(L'\\') + 1) + L"LiquidDockSensors.exe";
-}
-
-static int RunHidden(const std::wstring& cmd, DWORD timeoutMs) {
-    STARTUPINFOW si = { sizeof(si) }; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-    std::wstring c = cmd;
-    if (!CreateProcessW(nullptr, c.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return -1;
-    WaitForSingleObject(pi.hProcess, timeoutMs);
-    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    return (int)code;
-}
 
 void SensorClient::Start() {
     // optional: the HWiNFO reading to use when several CPU temperatures are reported (settings.ini)
@@ -43,6 +25,9 @@ void SensorClient::Start() {
     // the first pass goes by the settings too (Tick keeps these up to date)
     readHWiNFO = Items().ReadsHWiNFO();
     readDrives = Items().ssd;
+    powerView = Items().powerView;
+    powerCpu = Items().CpuPowerShown();
+    powerGpu = Items().GpuPowerShown();
     // SetPanelOpen wakes the sampler with it when a panel opens; without it the sampler sleeps its period out
     wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!wake) Log(L"sensors: no wake event (%lu): an opening panel waits up to 2 s for its first sample", GetLastError());
@@ -57,11 +42,17 @@ void SensorClient::Start() {
                 else Sleep(period);
                 const bool open = panelOpen.load();
                 t.Want(readHWiNFO.load(), readDrives.load());
+                t.WantPower(powerView.load(), powerCpu.load(), powerGpu.load());
                 LDSensorBlock b = {};
-                t.SampleCell(open, GetTickCount64(), b);
+                const ULONGLONG at = GetTickCount64();
+                t.SampleCell(open, at, b);
+                // the power draw is read in the same pass (no wake of its own), published with the cell's sample
+                sensorlogic::PowerData pw;
+                const bool powerNew = t.SamplePower(open, at, pw);
                 {
                     std::lock_guard<std::mutex> lk(mu);
                     localBlk = b;
+                    if (powerNew) { localPower = std::move(pw); localPowerNew = true; }
                 }
                 localNew = true;
                 PanelData p;
@@ -110,6 +101,8 @@ sensorlogic::ShowItems SensorClient::Items() const {
     s.source = std::clamp(g_settings.sensorSource, 0, 2);
     s.cpuTemp = g_settings.showCpuTemp; s.gpu = g_settings.showGpu; s.vram = g_settings.showVram;
     s.vramTemp = g_settings.showVramTemp; s.ramTemp = g_settings.showRamTemp; s.ssd = g_settings.showSsd;
+    s.powerView = std::clamp(g_settings.powerView, 0, 2);
+    s.cpuPower = g_settings.showCpuPower; s.gpuPower = g_settings.showGpuPower;
     return s;
 }
 
@@ -130,35 +123,22 @@ bool SensorClient::PawnIOInstalled() {
     return ok;
 }
 
-// Must run on the UI thread right after a user click: Windows only shows a UAC prompt in
-// front for the foreground app (otherwise it just flashes on the - hidden - taskbar).
-bool SensorClient::InstallHelper(HWND owner) {
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    std::wstring path = HelperPath();
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.hwnd = owner;
-    sei.lpVerb = L"runas";
-    sei.lpFile = path.c_str();
-    sei.lpParameters = L"--install";
-    sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei)) { Log(L"sensor helper install not started (%lu)", GetLastError()); return false; }
-    if (sei.hProcess) CloseHandle(sei.hProcess);
-    return true;
-}
-
 void SensorClient::ShowHWiNFOGuide() {
     // no owner: the dock window is topmost/no-activate and would leave the box hidden behind it
     MessageBoxW(nullptr,
-        L"HWiNFO가 읽은 CPU 온도를 그대로 가져옵니다. 드라이버 설치나 관리자 권한이 필요 없습니다.\n\n"
+        L"HWiNFO가 읽은 CPU 온도와 전력을 그대로 가져옵니다. 드라이버 설치나 관리자 권한이 필요 없습니다.\n\n"
         L"1. HWiNFO 센서 창 아래쪽 톱니(Configure Sensors)를 엽니다.\n"
         L"2. 'HWiNFO Gadget' 탭에서 'Enable reporting to Gadget'을 체크합니다.\n"
         L"3. 목록에서 CPU 온도 항목을 고르고 'Report value in Gadget'을 체크합니다.\n"
         L"    AMD: CPU (Tctl/Tdie)   ·   Intel: CPU Package\n"
         L"    한국어 HWiNFO는 항목 이름이 한국어입니다. [CPU #0] 아래의 온도 항목(예: 코어 온도)이면 됩니다.\n"
         L"    (그 아래의 내장 그래픽 온도 'CPU GT Cores (Graphics)'는 GPU 온도라 쓰지 않습니다.)\n"
-        L"4. 확인을 누르면 몇 초 안에 독에 온도가 표시됩니다.\n\n"
+        L"4. CPU 전력(설정 → 센서의 '전력 소비량'을 쓸 때): 같은 [CPU #0] 아래의 패키지 전력 항목도 체크합니다.\n"
+        L"    AMD: CPU Package Power (또는 CPU PPT)   ·   Intel: CPU Package Power\n"
+        L"    (한도인 'PPT Limit'·'Power Limit', 코어별·IA Cores·GT Cores 전력은 쓰지 않습니다.)\n"
+        L"5. 확인을 누르면 몇 초 안에 독에 온도와 전력이 표시됩니다.\n\n"
         L"RTSS가 쓰는 '공유 메모리 지원'과는 별개 설정이라 둘 다 켜 둬도 됩니다.",
-        L"Liquid Dock - HWiNFO에서 CPU 온도 가져오기", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+        L"Liquid Dock - HWiNFO에서 CPU 온도·전력 가져오기", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
 bool SensorClient::EnablePawnIO(HWND owner) {
@@ -178,7 +158,7 @@ bool SensorClient::EnablePawnIO(HWND owner) {
     }
     // the helper installed only when it is not the dock's own copy byte for byte (a UAC prompt each time it is)
     const bool install = adminhelper::NeedsInstall();
-    if (install && !InstallHelper(owner)) return false;   // the UAC prompt declined: the source stays as it was
+    if (install && !adminhelper::InstallHelper(owner)) return false;   // the UAC prompt declined: the source stays as it was
     g_settings.sensorSource = sensorlogic::kSourcePawnIO;
     g_settings.Save();
     helperRetry = 20.0;
@@ -190,17 +170,6 @@ bool SensorClient::EnablePawnIO(HWND owner) {
         helperTried = false;
     }
     return true;
-}
-
-// Start the elevated helper through its scheduled task (no UAC prompt once installed).
-void SensorClient::StartHelper() {
-    if (GetFileAttributesW(HelperPath().c_str()) == INVALID_FILE_ATTRIBUTES) return;
-    int rc = RunHidden(SystemExe(L"schtasks.exe") + L" /Run /TN " LD_SENSOR_TASK, 8000);
-    Log(L"sensor task run rc=%d", rc);
-}
-
-bool SensorClient::HelperTaskRegistered() {
-    return RunHidden(SystemExe(L"schtasks.exe") + L" /Query /TN " LD_SENSOR_TASK, 8000) == 0;
 }
 
 float SensorClient::Temp(Metric m) const {
@@ -238,6 +207,24 @@ bool SensorClient::DropUnread(const sensorlogic::ShowItems& show) {
     return d.flags != before;
 }
 
+// The power draw the settings no longer show leaves at once, as DropUnread's readings do: a device switched off
+// (or the view 없음, or the CPU's with another source than HWiNFO) all of it, the histories when the view is not
+// 그래프. The sampler drops its own copy at its next pass; a pass it took before the change is dropped again here.
+// True when anything went.
+bool SensorClient::DropUnshownPower(const sensorlogic::ShowItems& show) {
+    bool dropped = false;
+    auto drop = [&](sensorlogic::PowerSeries& ps, bool shown) {
+        if (!shown) {
+            if (ps.read || !ps.history.empty() || ps.top > 0 || !std::isnan(ps.limitW)) { ps = {}; dropped = true; }
+        } else if (!show.PowerGraph() && (!ps.history.empty() || ps.top > 0)) {
+            ps.history.clear(); ps.top = 0; dropped = true;
+        }
+    };
+    drop(power.cpu, show.CpuPowerShown());
+    drop(power.gpu, show.GpuPowerShown());
+    return dropped;
+}
+
 // The CPU's temperature switched off (or none read): its load. The GPU hidden: no GPU line at all.
 sensorlogic::CellKey SensorClient::CellKeyNow() const {
     sensorlogic::CellKey k;
@@ -248,12 +235,17 @@ sensorlogic::CellKey SensorClient::CellKeyNow() const {
     return k;
 }
 
+// The helper's memory let go: its view, then the mapping (each only when held).
+void SensorClient::DropHelperView() {
+    if (view) { UnmapViewOfFile(view); view = nullptr; }
+    if (map) { CloseHandle(map); map = nullptr; }
+}
+
 void SensorClient::ReadHelper(double now) {
     if (!Items().WantsPawnIO()) {
         // its readings are used only with the source PawnIO: no looking for its memory 4 times a second
         // meanwhile (for most users it is not there), none held (turned on again: looked for at once)
-        if (view) { UnmapViewOfFile(view); view = nullptr; }
-        if (map) { CloseHandle(map); map = nullptr; }
+        DropHelperView();
         helperLive = false;
         return;
     }
@@ -271,7 +263,7 @@ void SensorClient::ReadHelper(double now) {
             helperTried = true;
             lastHelperTry = now;
             static bool saidNoThread = false;   // said when it starts, not on every try
-            const bool started = TryDetach([] { StartHelper(); });
+            const bool started = TryDetach([] { adminhelper::StartHelper(); });
             if (!started && !saidNoThread) Log(L"sensors: no thread to start the helper on (tried again in %.0f s)", helperRetry);
             saidNoThread = !started;
         }
@@ -297,9 +289,13 @@ void SensorClient::ReadHelper(double now) {
     }
     if (helperLive && now - lastHelperSample > 5.0) {   // helper died
         helperLive = false;
-        UnmapViewOfFile(view); view = nullptr;
-        CloseHandle(map); map = nullptr;
+        DropHelperView();   // both held here: the view was read just now
     }
+}
+
+// The cell's look as of now: cellVersion bumps only when it changed (a resting dock redraws only then).
+void SensorClient::UpdateCellKey() {
+    if (const auto key = CellKeyNow(); !(key == cellKey)) { cellKey = key; cellVersion++; }
 }
 
 void SensorClient::Tick(double now) {
@@ -307,6 +303,10 @@ void SensorClient::Tick(double now) {
     // the sampler's next pass: HWiNFO read only when it is the source, the drives asked only while shown
     readHWiNFO = show.ReadsHWiNFO();
     readDrives = show.ssd;
+    powerView = show.powerView;
+    powerCpu = show.CpuPowerShown();
+    powerGpu = show.GpuPowerShown();
+    if (DropUnshownPower(show)) { powerVersion++; version++; }
     if (now - lastPoll >= 0.25) {
         lastPoll = now;
         // the helper samples only while this event exists (it also serves the windows of elevated programs:
@@ -320,7 +320,7 @@ void SensorClient::Tick(double now) {
     // when that changes its look)
     if (DropUnread(show)) {
         version++;
-        if (const auto key = CellKeyNow(); !(key == cellKey)) { cellKey = key; cellVersion++; }
+        UpdateCellKey();
     }
     // a new local sample is taken on the pass it arrives (only the helper's memory is looked at 4 times a
     // second): the panel's first sample, asked for when it opens, shows on the next frame
@@ -330,7 +330,9 @@ void SensorClient::Tick(double now) {
         std::lock_guard<std::mutex> lk(mu);
         d = localBlk;
         if (localPanelNew) { panel = localPanel; localPanelNew = false; }
+        if (localPowerNew) { power = std::move(localPower); localPower = {}; localPowerNew = false; powerVersion++; }
     }
+    DropUnshownPower(show);   // a pass the sampler took before the settings changed: nothing they no longer show
     if (panel.vram.nvmlTemp) vramNvmlTempSeen = true;
     // a pass the sampler took before the source or the drives changed: nothing of what is no longer read
     DropUnread(show);
@@ -344,7 +346,7 @@ void SensorClient::Tick(double now) {
     version++;
     // the cell's look: after the helper's merge, so its CPU temperature counts; the first sample (going
     // live) differs from the key before it
-    if (const auto key = CellKeyNow(); !(key == cellKey)) { cellKey = key; cellVersion++; }
+    UpdateCellKey();
 
     // overheat: alert once, re-arm after cooling 5 °C or 10 minutes; what the settings hide never alerts, but
     // re-arms by what is read (hidden while it cooled down: shown again and hot, it alerts)

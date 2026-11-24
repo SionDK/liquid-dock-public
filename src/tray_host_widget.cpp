@@ -7,28 +7,18 @@ namespace trayhost {
 // "Shell_TrayWnd" - this window while the host runs. Hosting on, the dock shows this window where it
 // keeps a slot for the widget: transparent, cut to the widget's own region, so it takes no clicks
 // beside it. The program lays its widget out in this window as it would in the taskbar.
+namespace {
 std::atomic<bool> g_hosting{ false };
 std::atomic<HWND> g_hostOnly{ nullptr };  // the one hosted window shown (others that moved in stay cut away)
 struct Placement { bool valid = false, shown = false, raise = false; RECT rect{}, clip{}; HWND over = nullptr; };
 std::mutex g_placeMu;
 Placement g_place;                        // the dock's request (UI thread writes, host thread applies)
+}   // namespace
 std::mutex g_hostedMu;
 RECT g_hostedBox{};                       // what the hosted windows show, in this window's coordinates
 bool g_hostedFitted = false;              // the hosted window spans this window: laid out for its size
 HWND g_hostedChild = nullptr;
-bool g_hostingApplied = false;            // host thread
-bool g_showing = false;                   // host thread: this SetWindowPos may show the window
-bool g_regionShown = false;               // host thread: the region shows the hosted widget (else empty)
-HRGN g_appliedRgn = nullptr;              // host thread: a copy of the window's region
-HWND g_shownLogged = nullptr;             // host thread: the hosted window last described in the log
-bool g_coveredLogged = false;             // host thread: "the dock came over it" logged in this hosting
-HRGN g_widgetRgn = nullptr;               // host thread: the shown widget's region as last read...
-HWND g_widgetRgnOf = nullptr;             // ...of this window
-double g_widgetRgnAt = -1;                // ...then
-HWND g_realignOf = nullptr;               // host thread: the widget last put back at this window's corner
-POINT g_realignOff{};                     // ...from this offset
-double g_realignAt = -1;                  // ...then
-int g_realigned = 0;                      // ...how often while running (for the log)
+HostedWidget g_hostedWidget;              // host thread (tray_host_internal.h)
 struct Realigner {                        // the realign thread's own (each such thread has one)
     HANDLE wake = nullptr;
     std::atomic<HWND> to{ nullptr };      // the widget to put back...
@@ -36,8 +26,6 @@ struct Realigner {                        // the realign thread's own (each such
     std::atomic<DWORD> hostThread{ 0 };   // the host thread, woken once it is back
     std::atomic<bool> stop{ false };
 };
-Realigner* g_realigner = nullptr;         // host thread makes it and the thread
-HANDLE g_realignThread = nullptr;
 
 namespace {
 
@@ -47,7 +35,7 @@ void PlaceNotifyWnd() {
     if (!g_notifyWnd) return;
     RECT r{};
     GetClientRect(g_wnd, &r);
-    if (g_hostingApplied) SetWindowPos(g_notifyWnd, nullptr, std::max(0L, r.right - 1), 0, 1, r.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_hostedWidget.hostingApplied) SetWindowPos(g_notifyWnd, nullptr, std::max(0L, r.right - 1), 0, 1, r.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
     else SetWindowPos(g_notifyWnd, nullptr, 0, 0, r.right, r.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
@@ -95,7 +83,7 @@ void PutBackNow(Realigner* r, HWND c) {
     for (size_t i = 0;; ++i) {
         const Spot spot = SpotOf(r, c);
         if (spot != Spot::Off) {
-            if (spot == Spot::InPlace) PostThreadMessageW(r->hostThread, kPlaceMsg, 0, 0);
+            if (spot == Spot::InPlace) PostThreadMessageW(r->hostThread, kPlaceMsg, kPlaceHosting, 0);
             return;
         }
         if (i == std::size(kWaits)) return;
@@ -117,7 +105,7 @@ DWORD WINAPI RealignThread(void* p) {
 }
 
 void PutBack(HWND c) {
-    if (!g_realigner) {
+    if (!g_hostedWidget.realigner) {
         auto* r = new Realigner;
         r->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         HANDLE t = r->wake ? CreateThread(nullptr, 0, RealignThread, r, 0, nullptr) : nullptr;
@@ -126,13 +114,13 @@ void PutBack(HWND c) {
             delete r;
             return;
         }
-        g_realigner = r;
-        g_realignThread = t;
+        g_hostedWidget.realigner = r;
+        g_hostedWidget.realignThread = t;
     }
-    g_realigner->host = g_wnd;
-    g_realigner->hostThread = GetCurrentThreadId();   // PutBack runs on the host thread
-    g_realigner->to = c;
-    SetEvent(g_realigner->wake);
+    g_hostedWidget.realigner->host = g_wnd;
+    g_hostedWidget.realigner->hostThread = GetCurrentThreadId();   // PutBack runs on the host thread
+    g_hostedWidget.realigner->to = c;
+    SetEvent(g_hostedWidget.realigner->wake);
 }
 
 // Asked for when the widget is found off its place, again at once when it is off by another amount
@@ -140,19 +128,19 @@ void PutBack(HWND c) {
 // stays off. Returns whether it was off.
 bool Realign(HWND c, int ox, int oy) {
     if (!ox && !oy) {
-        if (c == g_realignOf) g_realignAt = -1;   // back: the next drift is put back at once, even by the same amount
+        if (c == g_hostedWidget.realignOf) g_hostedWidget.realignAt = -1;   // back: the next drift is put back at once, even by the same amount
         return false;
     }
     const double now = NowSeconds();
-    if (c != g_realignOf || ox != g_realignOff.x || oy != g_realignOff.y || now - g_realignAt >= 0.1) {
-        g_realignOf = c;
-        g_realignOff = { ox, oy };
-        g_realignAt = now;
+    if (c != g_hostedWidget.realignOf || ox != g_hostedWidget.realignOff.x || oy != g_hostedWidget.realignOff.y || now - g_hostedWidget.realignAt >= 0.1) {
+        g_hostedWidget.realignOf = c;
+        g_hostedWidget.realignOff = { ox, oy };
+        g_hostedWidget.realignAt = now;
         PutBack(c);
-        ++g_realigned;
-        if (g_realigned <= 3 || g_realigned % 100 == 0)
+        ++g_hostedWidget.realigned;
+        if (g_hostedWidget.realigned <= 3 || g_hostedWidget.realigned % 100 == 0)
             Log(L"tray host: the widget was %d,%d off this window's corner (moved while it drew) - put back (%d time%s)",
-                ox, oy, g_realigned, g_realigned == 1 ? L"" : L"s");
+                ox, oy, g_hostedWidget.realigned, g_hostedWidget.realigned == 1 ? L"" : L"s");
     }
     return true;
 }
@@ -163,12 +151,12 @@ bool Realign(HWND c, int ox, int oy) {
 void WidgetRegion(HWND c, HRGN r, int cw, int ch) {
     const double now = NowSeconds();
     if (GetWindowRgn(c, r) != ERROR) {
-        if (!g_widgetRgn) g_widgetRgn = CreateRectRgn(0, 0, 0, 0);
-        CombineRgn(g_widgetRgn, r, nullptr, RGN_COPY);
-        g_widgetRgnOf = c;
-        g_widgetRgnAt = now;
-    } else if (c == g_widgetRgnOf && g_widgetRgn && now - g_widgetRgnAt < 1.0) {
-        CombineRgn(r, g_widgetRgn, nullptr, RGN_COPY);
+        if (!g_hostedWidget.widgetRgn) g_hostedWidget.widgetRgn = CreateRectRgn(0, 0, 0, 0);
+        CombineRgn(g_hostedWidget.widgetRgn, r, nullptr, RGN_COPY);
+        g_hostedWidget.widgetRgnOf = c;
+        g_hostedWidget.widgetRgnAt = now;
+    } else if (c == g_hostedWidget.widgetRgnOf && g_hostedWidget.widgetRgn && now - g_hostedWidget.widgetRgnAt < 1.0) {
+        CombineRgn(r, g_hostedWidget.widgetRgn, nullptr, RGN_COPY);
     } else {
         SetRectRgn(r, 0, 0, cw, ch);
     }
@@ -180,27 +168,44 @@ void WidgetRegion(HWND c, HRGN r, int cw, int ch) {
 // moved. It only posts; should it be held anyway, it is left with what it uses (its own stop flag and
 // event, so a host started again makes a thread of its own and this one still ends once free).
 void StopRealign() {
-    if (g_realigner) {
-        g_realigner->stop = true;
-        SetEvent(g_realigner->wake);
-        if (WaitForSingleObject(g_realignThread, 500) == WAIT_OBJECT_0) {
-            CloseHandle(g_realigner->wake);
-            delete g_realigner;
+    if (g_hostedWidget.realigner) {
+        g_hostedWidget.realigner->stop = true;
+        SetEvent(g_hostedWidget.realigner->wake);
+        if (WaitForSingleObject(g_hostedWidget.realignThread, 500) == WAIT_OBJECT_0) {
+            CloseHandle(g_hostedWidget.realigner->wake);
+            delete g_hostedWidget.realigner;
         }
-        CloseHandle(g_realignThread);
-        g_realigner = nullptr;
-        g_realignThread = nullptr;
+        CloseHandle(g_hostedWidget.realignThread);
+        g_hostedWidget.realigner = nullptr;
+        g_hostedWidget.realignThread = nullptr;
     }
 }
+
+namespace {
 
 // The host thread ends: what it kept of the widget goes.
 void ForgetWidget() {
     StopRealign();
-    if (g_widgetRgn) { DeleteObject(g_widgetRgn); g_widgetRgn = nullptr; }
-    g_widgetRgnOf = g_realignOf = nullptr;
-    g_realignOff = {};
-    g_realigned = 0;
-    g_widgetRgnAt = g_realignAt = -1;
+    if (g_hostedWidget.widgetRgn) { DeleteObject(g_hostedWidget.widgetRgn); g_hostedWidget.widgetRgn = nullptr; }
+    g_hostedWidget.widgetRgnOf = g_hostedWidget.realignOf = nullptr;
+    g_hostedWidget.realignOff = {};
+    g_hostedWidget.realigned = 0;
+    g_hostedWidget.widgetRgnAt = g_hostedWidget.realignAt = -1;
+}
+
+}   // namespace
+
+// The host thread ends, its window destroyed: hosting off, and what it kept of the hosting goes - the
+// region's copy, the widget's region and realigning, what it published for the dock (HostedState).
+void EndHosting() {
+    g_hostedWidget.hostingApplied = false;
+    g_hostedWidget.regionShown = false;
+    if (g_hostedWidget.appliedRgn) { DeleteObject(g_hostedWidget.appliedRgn); g_hostedWidget.appliedRgn = nullptr; }
+    ForgetWidget();
+    {
+        std::lock_guard<std::mutex> lk(g_hostedMu);
+        g_hostedBox = {}; g_hostedChild = nullptr; g_hostedFitted = false;
+    }
 }
 
 // What the hosted windows show: their regions (the whole window without one), clipped to them.
@@ -224,7 +229,7 @@ void UpdateHosted(const RECT* at) {
         RECT cr{};
         GetWindowRect(c, &cr);
         int cw = cr.right - cr.left, ch = cr.bottom - cr.top, ox = cr.left - host.left, oy = cr.top - host.top;
-        const bool widget = only && c == only && g_hostingApplied;
+        const bool widget = only && c == only && g_hostedWidget.hostingApplied;
         const bool off = widget && Realign(c, ox, oy);
         HRGN r = CreateRectRgn(0, 0, 0, 0);
         if (widget) WidgetRegion(c, r, cw, ch);
@@ -252,21 +257,21 @@ void UpdateHosted(const RECT* at) {
         std::lock_guard<std::mutex> lk(g_hostedMu);
         g_hostedBox = box; g_hostedChild = first; g_hostedFitted = fitted;
     }
-    if (!g_hostingApplied) { DeleteObject(all); return; }
+    if (!g_hostedWidget.hostingApplied) { DeleteObject(all); return; }
     RECT clip{};
     {
         std::lock_guard<std::mutex> lk(g_placeMu);
         clip = g_place.clip;
     }
-    if (!g_regionShown) SetRectRgn(all, 0, 0, 0, 0);
+    if (!g_hostedWidget.regionShown) SetRectRgn(all, 0, 0, 0, 0);
     else if (!IsRectEmpty(&clip)) {   // sliding in with the dock: cut at the edge of its monitor, as the dock is
         HRGN c = CreateRectRgn(clip.left - dest.left, clip.top - dest.top, clip.right - dest.left, clip.bottom - dest.top);
         CombineRgn(all, all, c, RGN_AND);
         DeleteObject(c);
     }
-    if (g_appliedRgn && EqualRgn(all, g_appliedRgn)) { DeleteObject(all); return; }
-    if (!g_appliedRgn) g_appliedRgn = CreateRectRgn(0, 0, 0, 0);
-    CombineRgn(g_appliedRgn, all, nullptr, RGN_COPY);
+    if (g_hostedWidget.appliedRgn && EqualRgn(all, g_hostedWidget.appliedRgn)) { DeleteObject(all); return; }
+    if (!g_hostedWidget.appliedRgn) g_hostedWidget.appliedRgn = CreateRectRgn(0, 0, 0, 0);
+    CombineRgn(g_hostedWidget.appliedRgn, all, nullptr, RGN_COPY);
     if (!SetWindowRgn(g_wnd, all, TRUE)) DeleteObject(all);   // the window owns it on success
 }
 
@@ -284,10 +289,10 @@ bool Covered(HWND over) {
 // The widget sits on the dock's glass. The dock comes to the front on its own at times (shown again,
 // next to a shell pop-up), and should it come over the widget, the widget goes back on top.
 void KeepAbove(HWND over) {
-    if (!g_regionShown || !Covered(over)) return;
+    if (!g_hostedWidget.regionShown || !Covered(over)) return;
     SetWindowPos(g_wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    if (g_coveredLogged) return;
-    g_coveredLogged = true;
+    if (g_hostedWidget.coveredLogged) return;
+    g_hostedWidget.coveredLogged = true;
     Log(L"tray host: the dock had come over the widget - back on top");
 }
 
@@ -299,12 +304,12 @@ void DescribeShown(HWND over) {
         std::lock_guard<std::mutex> lk(g_hostedMu);
         child = g_hostedChild; box = g_hostedBox;
     }
-    if (!child || child == g_shownLogged) return;
-    g_shownLogged = child;
+    if (!child || child == g_hostedWidget.shownLogged) return;
+    g_hostedWidget.shownLogged = child;
     RECT host{}, cr{}, cut{};
     GetWindowRect(g_wnd, &host);
     GetWindowRect(child, &cr);
-    if (g_appliedRgn) GetRgnBox(g_appliedRgn, &cut);
+    if (g_hostedWidget.appliedRgn) GetRgnBox(g_hostedWidget.appliedRgn, &cut);
     const bool layered = (GetWindowLongPtrW(child, GWL_EXSTYLE) & WS_EX_LAYERED) != 0;
     Log(L"tray host: widget seen - window %ld,%ld %ldx%ld, its window %ld,%ld %ldx%ld drawn %s, widget %ld,%ld-%ld,%ld, cut to %ld,%ld-%ld,%ld, %s",
         host.left, host.top, host.right - host.left, host.bottom - host.top,
@@ -324,10 +329,10 @@ void ApplyPlacement() {
         p = g_place;
         g_place.raise = false;
     }
-    if (!g_hostingApplied) return;
+    if (!g_hostedWidget.hostingApplied) return;
     const bool shown = p.valid && p.shown && !IsRectEmpty(&p.rect);
-    const bool wasShown = g_regionShown;
-    if (wasShown && !shown) { g_regionShown = false; UpdateHosted(); }   // gone at once, then moved
+    const bool wasShown = g_hostedWidget.regionShown;
+    if (wasShown && !shown) { g_hostedWidget.regionShown = false; UpdateHosted(); }   // gone at once, then moved
     RECT cur{};
     GetWindowRect(g_wnd, &cur);
     const bool moved = p.valid && !IsRectEmpty(&p.rect) && !EqualRect(&cur, &p.rect);
@@ -341,14 +346,14 @@ void ApplyPlacement() {
     if (!p.raise && !appearing) flags |= SWP_NOZORDER;   // coming into view: on top of the dock
     if (moved || !(flags & SWP_NOZORDER) || (flags & SWP_SHOWWINDOW)) {
         RECT r = moved ? p.rect : cur;
-        g_showing = true;
+        g_hostedWidget.showing = true;
         SetWindowPos(g_wnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
-        g_showing = false;
+        g_hostedWidget.showing = false;
     }
     if (sized) PlaceNotifyWnd();
-    if (appearing) { g_regionShown = true; UpdateHosted(); }   // in place first, then seen
+    if (appearing) { g_hostedWidget.regionShown = true; UpdateHosted(); }   // in place first, then seen
     else if (sized) UpdateHosted();
-    if (g_regionShown) {
+    if (g_hostedWidget.regionShown) {
         KeepAbove(p.over);
         DescribeShown(p.over);
     }
@@ -357,10 +362,10 @@ void ApplyPlacement() {
 // Hosting switched: the window goes where the dock wants it, or back to mirroring Explorer's taskbar.
 void ApplyHosting() {
     bool on = g_hosting;
-    if (on == g_hostingApplied) return;
-    g_hostingApplied = on;
-    g_regionShown = false;
-    g_coveredLogged = false;
+    if (on == g_hostedWidget.hostingApplied) return;
+    g_hostedWidget.hostingApplied = on;
+    g_hostedWidget.regionShown = false;
+    g_hostedWidget.coveredLogged = false;
     if (on) {
         UpdateHosted();      // an empty region before the window shows
         ApplyPlacement();    // shows it (cut to nothing until the dock wants the widget seen)
@@ -368,10 +373,10 @@ void ApplyHosting() {
         UpdateHosted();
         return;
     }
-    g_showing = false;
+    g_hostedWidget.showing = false;
     SetWindowPos(g_wnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
     SetWindowRgn(g_wnd, nullptr, FALSE);
-    if (g_appliedRgn) { DeleteObject(g_appliedRgn); g_appliedRgn = nullptr; }
+    if (g_hostedWidget.appliedRgn) { DeleteObject(g_hostedWidget.appliedRgn); g_hostedWidget.appliedRgn = nullptr; }
     MirrorRect();
     PlaceNotifyWnd();
     UpdateHosted();
@@ -391,7 +396,7 @@ void SetHosting(bool on, HWND only) {
     // to show, hosting switched), and then at once instead of at its next check
     const bool onlyChanged = g_hostOnly.exchange(only) != only;
     const bool onChanged = g_hosting.exchange(on) != on;
-    if ((onlyChanged || onChanged) && g_thread && g_ready) PostThreadMessageW(g_threadId, kPlaceMsg, 0, 0);
+    if ((onlyChanged || onChanged) && g_thread && g_ready) PostThreadMessageW(g_threadId, kPlaceMsg, kPlaceHosting, 0);
 }
 
 void Place(bool shown, const RECT& rect, bool raise, const RECT& clip, HWND over) {
@@ -407,7 +412,7 @@ void Place(bool shown, const RECT& rect, bool raise, const RECT& clip, HWND over
         g_place.raise = g_place.raise || raise;
         g_place.over = over;
     }
-    if (changed && g_thread && g_ready) PostThreadMessageW(g_threadId, kPlaceMsg, 0, 0);
+    if (changed && g_thread && g_ready) PostThreadMessageW(g_threadId, kPlaceMsg, kPlaceHosting, 0);
 }
 
 Hosted HostedState() {

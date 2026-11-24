@@ -130,5 +130,30 @@ int main() {
     Check(Protect(bar), "protected (then Explorer restarts)");
     fake::w.erase(bar);
     Check(Restore(bar), "a window that is gone: nothing to restore");
+
+    // NativeTaskbar::StartEnforcer's passes (EnforcerPlan): its wake-ups as they are - every 250 ms in the first
+    // minute, auto-hide asked on every pass then; later every second, asked on every fifth pass (and on a recheck,
+    // which the enforcer takes itself after the sleep).
+    {
+        const EnforcerPass first = EnforcerPlan(0, 0), lastEarly = EnforcerPlan(59.99, 239);
+        Check(first.sleepMs == 250 && first.alwaysAsk && lastEarly.sleepMs == 250 && lastEarly.alwaysAsk,
+              "enforcer: the first minute, 250 ms and auto-hide asked on every pass");
+        const EnforcerPass at60 = EnforcerPlan(60, 241), fifth = EnforcerPlan(60.25, 245), later = EnforcerPlan(3600, 14401);
+        Check(at60.sleepMs == 1000 && !at60.alwaysAsk && later.sleepMs == 1000 && !later.alwaysAsk,
+              "enforcer: from 60 s, a second, and auto-hide not asked as such...");
+        Check(fifth.sleepMs == 1000 && fifth.alwaysAsk && EnforcerPlan(7200, 0).alwaysAsk, "...except on every fifth pass");
+        int asked = 0;
+        for (int pass = 1000; pass < 1100; ++pass) asked += EnforcerPlan(600, pass).alwaysAsk ? 1 : 0;
+        Check(asked == 20, "enforcer: later on, one pass in five asks");
+        double t = 0;
+        int passes = 0, asks = 0;
+        for (int pass = 0; t < 120; ++pass) {
+            const EnforcerPass p = EnforcerPlan(t, pass);
+            t += p.sleepMs / 1000.0;
+            ++passes;
+            if (p.alwaysAsk) ++asks;
+        }
+        Check(passes == 300 && asks == 252, "enforcer: its first two minutes, 300 wake-ups (240 + 60) and 252 auto-hide questions");
+    }
     return Summary("tray_visibility_test");
 }

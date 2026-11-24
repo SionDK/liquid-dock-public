@@ -32,17 +32,28 @@ private:
         RECT sentDestination{};     // what DWM has for this thumbnail (empty: nothing sent since it was registered)
         BYTE sentOpacity = 0;
     };
+    // The popup's measures at its scale, each rounded on its own (Px): Arrange, CloseRect and Paint use the same.
+    struct Metrics { int pad, gap, header, nav; };
+    // Where Arrange puts the popup (screen coordinates) and how the cards of its page lie in it.
+    struct Placement { bool vertical; int cw, ch, count, x, y, w, h; };
     bool Create(HWND owner);
     void Hide();
     void ReleaseThumbnails();
     void Refresh();
     void Arrange(bool follow = false);
+    Metrics Measure() const;
+    bool PlacePopup(const Metrics& m, Placement& at);
+    void PlaceCards(const Metrics& m, const Placement& at, bool& moved);
+    void ShowThumbnail(Entry& e, const RECT& image, bool minimized, const wchar_t* none, std::wstring& fallback);
     void Paint();
     void DrawClose(HDC dc, RECT r, bool over, bool down) const;
     void ChangePage(int delta);
+    int PageEnd() const;
     int Hit(POINT client) const;
     int HitClose(POINT client) const;
     RECT CloseRect(const Entry& entry) const;
+    RECT CloseRect(const Entry& entry, const Metrics& m) const;
+    bool SameWindow(int index, HWND source, DWORD pid) const;
     void AskClose(int index);
     bool Valid(const Entry& entry) const;
     static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);

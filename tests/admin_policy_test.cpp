@@ -112,7 +112,14 @@ template <class F> bool FakeTryDetach(F&& work) { return !fake::noThread && TryD
 #define GetFileVersionInfoSizeW FakeVersionSize
 #define GetFileVersionInfoW FakeVersionInfo
 #define VerQueryValueW FakeVerQuery
+// The helper's own process - its install (runas: a real UAC prompt) and its scheduled task (schtasks.exe) - is not
+// compiled here: the stubs below stand for it (it is tested in sensors_client_test, under that test's fakes). Should
+// the policy ever call these itself, this test does not compile (it would run the real ones).
+#define ShellExecuteExW DO_NOT_CALL_ShellExecuteExW
+#define CreateProcessW DO_NOT_CALL_CreateProcessW
 #include "../src/admin_helper.cpp"
+#undef ShellExecuteExW
+#undef CreateProcessW
 #undef TryDetach
 #undef Call
 #undef PipeExists
@@ -137,9 +144,9 @@ void Log(const wchar_t* fmt, ...) {
     fake::logs.emplace_back(line);
     std::printf("  log: %ls\n", line);
 }
-bool SensorClient::InstallHelper(HWND) { ++fake::installs; return fake::installOk; }
-void SensorClient::StartHelper() { ++fake::starts; }
-bool SensorClient::HelperTaskRegistered() { return fake::taskRegistered; }
+bool adminhelper::InstallHelper(HWND) { ++fake::installs; return fake::installOk; }
+void adminhelper::StartHelper() { ++fake::starts; }
+bool adminhelper::HelperTaskRegistered() { return fake::taskRegistered; }
 
 namespace {
 

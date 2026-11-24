@@ -6,3 +6,4 @@ demo/
 *.manifest
 third_party/pawnio/*.zip
 userResult/
+__pycache__/

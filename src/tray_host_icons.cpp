@@ -29,9 +29,10 @@ bool IsNullGuid(const GUID& g) { static const GUID zero{}; return IsEqualGUID(g,
 std::mutex g_mu;                          // guards g_icons (host thread writes, UI thread reads)
 std::vector<Icon> g_icons;
 std::atomic<int> g_version{ 0 };
-uint64_t g_nextKey = 1, g_nextSeq = 0;
 
 namespace {
+
+uint64_t g_nextKey = 1, g_nextSeq = 0;
 
 struct Picture { int w = 0, h = 0; std::vector<uint32_t> px; bool glyph = false; };
 
@@ -104,6 +105,15 @@ std::wstring Lower(std::wstring s) {
     return s;
 }
 
+// process: opened with PROCESS_QUERY_LIMITED_INFORMATION
+std::wstring ImagePath(HANDLE process) {
+    wchar_t path[MAX_PATH * 2];
+    DWORD n = ARRAYSIZE(path);
+    std::wstring s;
+    if (QueryFullProcessImageNameW(process, 0, path, &n)) s.assign(path, n);
+    return s;
+}
+
 std::vector<std::pair<HWND, std::wstring>> g_exeCache;   // host thread: the program behind each icon window
 
 namespace {
@@ -114,10 +124,7 @@ std::wstring WindowExe(HWND h) {
     GetWindowThreadProcessId(h, &pid);
     HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
     if (!p) return {};
-    wchar_t path[MAX_PATH * 2];
-    DWORD n = ARRAYSIZE(path);
-    std::wstring s;
-    if (QueryFullProcessImageNameW(p, 0, path, &n)) s.assign(path, n);
+    std::wstring s = ImagePath(p);
     CloseHandle(p);
     s = Lower(s);
     g_exeCache.emplace_back(h, s);
@@ -267,7 +274,8 @@ LRESULT OnCopyData(WPARAM wp, LPARAM lp) {
         memcpy(&id, cds->lpData, sizeof(id));
         if (AnswerIconRect(id, r)) return r;
     }
-    Forward(WM_COPYDATA, wp, lp, r);   // app bars (dwData 0) and everything else: Explorer's business
+    if (cds && cds->dwData == 0) ForwardAppBar(wp, lp, r);   // app bars: Explorer's business
+    else Forward(WM_COPYDATA, wp, lp, r);                   // and everything else
     return r;
 }
 
@@ -277,7 +285,7 @@ std::vector<IconView> Shown() {
     std::lock_guard<std::mutex> lk(g_mu);
     std::vector<const Icon*> shown;
     for (const auto& ic : g_icons)
-        if (ic.promoted && !ic.hidden && ic.w > 0) shown.push_back(&ic);
+        if (ShownOnDock(ic)) shown.push_back(&ic);
     std::stable_sort(shown.begin(), shown.end(), [](const Icon* a, const Icon* b) {
         return a->order != b->order ? a->order < b->order : a->seq < b->seq;
     });

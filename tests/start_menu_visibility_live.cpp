@@ -13,6 +13,7 @@
 //   cl /std:c++20 /EHsc /utf-8 /DUNICODE /D_UNICODE tests\start_menu_visibility_live.cpp /link user32.lib ole32.lib advapi32.lib
 #include "../src/common.h"
 #include "../src/explorer_taskbar.h"
+#include "../src/app_visibility.h"
 #include <objbase.h>
 #include <cstdarg>
 #include <cstdio>
@@ -20,13 +21,7 @@
 
 namespace {
 
-// IAppVisibility (shobjidl_core.h), as src/start_menu.cpp declares it
-const CLSID kAppVisibility = { 0x7e5fe3d9, 0x985f, 0x4908, { 0x91, 0xf9, 0xee, 0x19, 0xf9, 0xfd, 0x15, 0x14 } };
-const IID kAppVisibilityIid = { 0x2246ea2d, 0xcaea, 0x4444, { 0xa3, 0xc4, 0x6d, 0xe8, 0x27, 0xe4, 0x43, 0x13 } };
-struct IVisibility : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE GetAppVisibilityOnMonitor(HMONITOR, int*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE IsLauncherVisible(BOOL* visible) = 0;
-};
+using IVisibility = IAppVisibilityDecl;   // IAppVisibility, the dock's own declaration (src/app_visibility.h)
 
 double Now() {
     static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();

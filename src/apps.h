@@ -24,6 +24,8 @@ struct AppItem {
 
 struct AttentionEvent { int id; };
 
+namespace taskbarapps { struct Result; }   // taskbar_apps.h: a press's result (AppModel::PollPresses and its parts)
+
 // A minimized window's restore command, sent on a worker thread (app_click.h says why).
 struct RestoreJob {
     std::atomic<int> state{ 0 };            // 0 waiting for the program, 1 handled, 2 not delivered
@@ -41,7 +43,6 @@ public:
     void Init();
     void ReloadIcons();                             // after a GPU reset (bitmaps belong to the old device)
     void Tick(double now);                          // periodic refresh
-    void MarkDirty() { dirty = true; }
     void OnShellHook(WPARAM code, LPARAM lp);
 
     // monitor: the clicked dock's (its taskbar's button is pressed first: taskbar_apps.h); nullptr: the pointer's
@@ -69,31 +70,45 @@ private:
 
     struct WinCache { std::wstring aumid, family, exe; };   // family: store-app package
     std::unordered_map<HWND, WinCache> winCache;
-    // the window being brought up: looked at every appclick::kLook until it came (app_click.h, Next)
+    static bool IdentifyWindow(HWND h, WinCache& wc);       // Refresh: a window first seen (false: not known yet)
+    std::shared_ptr<AppItem> ItemFor(const WinCache& wc) const;   // ...the app it belongs to (none: a new one)
+    // the window being brought up: looked at every appclick::kLook until it came (app_click.h, Next). The fields
+    // in parts, in their order: every watch's; the dock's own way's (BringUp, Push, CheckWatch) - its tries, a
+    // pop-up closed first, a closed one keeping the front, the last try's answers; the taskbar's press's
+    // (PollPresses, CheckPress). watch = {} clears them all.
     struct Watch {
+        // ---- every watch: window ... clicked from NewWatch; next: the next look; clicks: the clicks on it so far
         HWND window = nullptr, before = nullptr;
         std::wstring name;
         const wchar_t* why = L"";      // the click's decision (appclick::WhyText)
         int windows = 0;               // the app's windows at the click
         double clicked = 0, next = 0;
-        int clicks = 1, refocused = 0;
+        int clicks = 1;
+        // ---- the dock's own way: its tries
+        int refocused = 0;
         bool saidBusy = false;
         std::shared_ptr<RestoreJob> restore;   // the restore command sent for it, if it was minimized (or an earlier watch's, unanswered)
-        int right = 0;                 // ForegroundRight (system.h) at the last try, for the log
+        int right = 0;                 // ForegroundRight (shell_front.h) at the last try, for the log
         int rightAtClick = 0;          // ...and at the click
         unsigned long attachError = 0; // AttachThreadInput to the window in front failed with this (0: it did, or was not needed)
         int overAdmin = 0;             // tries handed to the admin helper: an administrator's window was in front (Push)
-        // a shell pop-up (Start, Search) in front at the click: closed first, the window brought up once it has
-        // gone (app_click.h NextForPopup)
+        // ---- the dock's own way: a shell pop-up (Start, Search) in front at the click: closed first, the window
+        // brought up once it has gone (app_click.h NextForPopup)
         HWND popup = nullptr;
         int popupClosed = 0;           // times the dock went to send Esc (kPopupTries)
         int popupEsc = 0;              // ...and sent it: not when the pop-up was gone or not shown by then
         double popupClosedAt = 0;
         bool hadPopup = false;         // there was one, for the log
-        // a shell window in front at the click that is not shown (cloaked): a closed Start or Search keeping the front -
-        // nothing to close, the window brought up as usual; for the log
+        // ---- the dock's own way: a shell window in front at the click that is not shown (cloaked): a closed Start
+        // or Search keeping the front - nothing to close, the window brought up as usual; for the log
         bool ghostFront = false;
-        // the taskbar's button was pressed for it (taskbar_apps.h): the dock only looks, and steps in only
+        int launcherAtClick = -1;      // ...and then: LauncherVisible (shell_front.h) at the click, for the log
+        DWORD cloakAtClick = 0;        // ...and that window's DWMWA_CLOAKED value
+        // ---- the dock's own way: SetForegroundWindow's answers at the last try (ForceForeground; -1 not called,
+        // 1 took it), for the log
+        int frontFirst = -1, frontSecond = -1;
+        unsigned long frontError = 0;  // GetLastError after the second (0: none set)
+        // ---- the taskbar's press: its button was pressed for it (taskbar_apps.h): the dock only looks, and steps in only
         // after a press that did nothing while its program answered, or one that restored it behind another
         // window (CheckPress, taskbar_apps_logic.h Judge)
         bool byTaskbar = false;
@@ -135,9 +150,15 @@ private:
     std::vector<LaunchCheck> launchChecks;
     taskbarapps::LaunchLearning launchUse;
     void ClickWith(AppItem& a, int dockIndex, HMONITOR monitor, bool taskbar);
+    void SayClickChoice(AppItem& a, const appclick::Decision& d, HWND target, int usable, uint64_t pending, double now) const;
+    taskbarapps::Click TaskbarClickFacts(const AppItem& a, const appclick::Decision& d, HWND target, int usable, double now) const;
     bool StartPress(AppItem& a, const appclick::Decision& d, int dockIndex, HMONITOR monitor, int usable, double now);
     void PollPresses(double now);
+    void SayPressOutcome(const AppItem& a, const Press& p, const taskbarapps::Result& r, const taskbarapps::Next& next,
+                         bool launch, double now);
+    void HandOnPress(AppItem& a, const Press& p, const taskbarapps::Result& r, const taskbarapps::Next& next, double now);
     taskbarapps::Verdict CheckPress(double now);   // the verdict reached (Judge)
+    taskbarapps::Seen LookAtPress(HWND h, double now) const;
     void CheckLaunches(double now);
     // Presses that may still arrive (taskbarapps::Outcome::Unsure): nothing of the dock's for that window - no
     // click, no preview pick - until the press shows (it went down or came up), or kBusyWait from the click passes.
@@ -145,6 +166,7 @@ private:
     std::vector<Maybe> maybes;
     bool MaybeOnItsWay(HWND h, double now);   // true: a press for it may still arrive
     void ForgetMaybe(HWND h);
+    void EndPressWatch(HWND h);   // ForgetMaybe, then the watch cleared (CheckPress's verdicts but a dud)
     // A window Windows would not put in front for the dock flashes instead (HSHELL_FLASH): that is not
     // its program asking for attention, so no attention bounce for it while the dock brings it up - nor for
     // another window of its program (a browser's window and its apps' are one process, clicked by turns), nor
@@ -162,10 +184,15 @@ private:
     std::shared_ptr<RestoreJob> SendRestore(HWND h);
     std::shared_ptr<RestoreJob> RestoreUnderWay(HWND h, double now);   // its command not answered yet, or just handled
     void ForgetHandledRestores(HWND h);   // it came up: its handled commands are done with
+    void SawCameUp(HWND h, double now);    // the watched window came: lastUp, and the above
+    void NewWatch(HWND h, HWND before, const std::wstring& name, const wchar_t* why, int windows, double clicked);
     void BringUp(HWND h, const wchar_t* why, int windows);
     void Push(double now, bool atClick);   // the watched window put in front
     void ClosePopup(double now);           // Esc to the watch's pop-up, while it is in front
     void CheckWatch(double now);
+    void CheckPopupWatch(HWND h, double now);   // ...while the pop-up in front at the click closes
+    appclick::Look LookAtWatch(HWND h, double now, HWND& fg) const;
+    void SayWatchGaveUp(HWND h, HWND fg, const appclick::Look& l) const;
     int nextId = 1;
     bool dirty = true;
     double lastRefresh = 0;

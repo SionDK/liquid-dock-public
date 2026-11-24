@@ -18,6 +18,7 @@
 // cl /std:c++20 /EHsc /utf-8 tests\fluent_lifecycle_test.cpp user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib version.lib dwmapi.lib
 #include "../src/explorer_taskbar.h"
 #include "../src/tray_host.h"
+#include "../src/elevation.h"   // before the stub's name below: its ProcessElevated stays the real one, unused
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
@@ -36,7 +37,8 @@ HWND g_stubWindow = nullptr;
 Hosted g_stubHosted;
 HWND Window() { return g_stubWindow; }
 Hosted HostedState() { return g_stubHosted; }
-bool ProcessElevated() { return false; }
+bool g_stubElevated = false;   // the dock as administrator (the log's line for the widget not moved in)
+bool ProcessElevated() { return g_stubElevated; }
 }
 
 static HWND g_fakeExplorer = nullptr;
@@ -75,6 +77,24 @@ static int HuntGetWindowTextW(HWND h, LPWSTR out, int n) {
     return (int)wcslen(out);
 }
 
+// A made-up monitor fluent_flyout.cpp can describe in its log (the real ones pass through): left of the
+// main one at -1440,-560, as on a two-monitor desktop. Only fluent_flyout.cpp sees it (placement reads the real ones).
+static const HMONITOR kHuntOther = (HMONITOR)(UINT_PTR)0x48F3;
+static BOOL HuntGetMonitorInfoW(HMONITOR m, LPMONITORINFO mi) {
+    if (m != kHuntOther) return GetMonitorInfoW(m, mi);
+    mi->rcMonitor = mi->rcWork = { -1440, -560, 0, 2000 };
+    mi->dwFlags = 0;
+    return TRUE;
+}
+
+// fluent_flyout.cpp's and fluent_media.cpp's waits with a timeout (Shutdown's for the media thread, in StopMedia)
+// are noted, then made as asked
+static DWORD g_waitedMs = 0;
+static DWORD HuntWaitForSingleObject(HANDLE h, DWORD ms) {
+    if (ms) g_waitedMs = ms;
+    return WaitForSingleObject(h, ms);
+}
+
 #define ExplorerTaskbar HuntExplorerTaskbar
 #define LD_FLUENT_SETTINGS_FILE HuntSettingsFiles
 #define LD_FLUENT_NO_MEDIA
@@ -83,9 +103,15 @@ static int HuntGetWindowTextW(HWND h, LPWSTR out, int n) {
 #define FindWindowExW HuntFindWindowExW
 #define GetClassNameW HuntGetClassNameW
 #define GetWindowTextW HuntGetWindowTextW
+#define GetMonitorInfoW HuntGetMonitorInfoW
+#define WaitForSingleObject HuntWaitForSingleObject
+#define ProcessElevated trayhost::ProcessElevated   // the stub above (the dock as administrator or not)
 #include "../src/fluent_flyout.cpp"
+#undef ProcessElevated
+#undef GetMonitorInfoW
 #include "../src/fluent_settings_file.cpp"
-#include "../src/fluent_media.cpp"
+#include "../src/fluent_media.cpp"   // its StopMedia: Shutdown's wait for the media thread
+#undef WaitForSingleObject
 #include "../src/fluent_placement.cpp"
 #undef FindWindowExW
 #undef GetClassNameW
@@ -97,12 +123,18 @@ Settings g_settings;
 static std::atomic<int> g_playingLogs{ 0 };   // "media playing" lines written
 static std::atomic<int> g_mediaLogs{ 0 };     // "media playing" and "nothing playing" lines
 static std::atomic<int> g_slotLogs{ 0 };      // "widget slot open / closed" lines
+static std::mutex g_logMu;
+static std::vector<std::wstring> g_logLines;   // every line, in order (the media thread's too)
 
 void Log(const wchar_t* fmt, ...) {
     wchar_t buf[1024];
     va_list ap; va_start(ap, fmt);
     _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
     va_end(ap);
+    {
+        std::lock_guard<std::mutex> lk(g_logMu);
+        g_logLines.push_back(buf);
+    }
     if (!wcscmp(buf, L"fluentflyout: media playing")) ++g_playingLogs;
     if (!wcscmp(buf, L"fluentflyout: media playing") || !wcscmp(buf, L"fluentflyout: nothing playing")) ++g_mediaLogs;
     if (!wcsncmp(buf, L"fluentflyout: widget slot ", 26)) ++g_slotLogs;
@@ -110,37 +142,72 @@ void Log(const wchar_t* fmt, ...) {
     WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8, sizeof(utf8), nullptr, nullptr);
     std::printf("  log: %s\n", utf8);
 }
+static double g_frozenNow = -1;   // >= 0: the module's clock held there (a boundary looked at exactly)
 double NowSeconds() {
+    if (g_frozenNow >= 0) return g_frozenNow;
     static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     return double(t.QuadPart) / double(f.QuadPart);
 }
-std::wstring FromUtf8(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-    return w;
-}
+#define TEST_SUPPORT_FROM_UTF8
+#include "test_support.h"
 
 // ---------------------------------------------------------------- helpers
-static int g_failures = 0, g_checks = 0;
-static bool Check(bool ok, const char* what) {
-    ++g_checks;
-    std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++g_failures;
-    return ok;
+#include "portable_check.h"
+
+// The log's lines, word for word (characterization: what the module writes now). A mark, then the
+// module's lines ("fluentflyout: ...") written since, in order.
+static size_t LogMark() {
+    std::lock_guard<std::mutex> lk(g_logMu);
+    return g_logLines.size();
+}
+static std::vector<std::wstring> FluentLines(size_t from) {
+    std::lock_guard<std::mutex> lk(g_logMu);
+    std::vector<std::wstring> out;
+    for (size_t i = from; i < g_logLines.size(); ++i)
+        if (!g_logLines[i].compare(0, 14, L"fluentflyout: ")) out.push_back(g_logLines[i]);
+    return out;
+}
+static void PrintLines(const char* what, const std::vector<std::wstring>& lines) {
+    std::printf("  %s (%zu):\n", what, lines.size());
+    for (auto& l : lines) {
+        char utf8[4096];
+        WideCharToMultiByte(CP_UTF8, 0, l.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
+        std::printf("    %s\n", utf8);
+    }
+}
+static bool SameLines(size_t from, const std::vector<std::wstring>& want) {
+    const auto got = FluentLines(from);
+    if (got == want) return true;
+    PrintLines("lines expected", want);
+    PrintLines("lines written", got);
+    return false;
+}
+static std::wstring Fmt(const wchar_t* fmt, ...) {
+    wchar_t buf[1024];
+    va_list ap; va_start(ap, fmt);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+static std::wstring SettingsLine(const std::wstring& path, int widget, int hide, int monitor, int visualizer, int filter, const wchar_t* mode, int animation) {
+    return Fmt(L"fluentflyout: settings %s - widget %d, hide when nothing plays %d, monitor %d, visualizer %d, app filter %d (%s), animation %d",
+               path.c_str(), widget, hide, monitor, visualizer, filter, mode, animation);
+}
+// ParentKind by name: Explorer's main and secondary taskbars by one name (ParentKind tells them apart; the
+// checks that tell them apart compare the kind itself)
+static std::string KindName(fluentflyout::ParentKind k) {
+    switch (k) {
+    case fluentflyout::ParentKind::None: return "None";
+    case fluentflyout::ParentKind::Host: return "Host";
+    case fluentflyout::ParentKind::ExplorerMain: return "Explorer";
+    case fluentflyout::ParentKind::ExplorerSecondary: return "Explorer";
+    case fluentflyout::ParentKind::Other: return "Other";
+    }
+    return "?";
 }
 
-static void Pump() {
-    MSG m;
-    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
-}
-
-static bool WaitFor(const std::function<bool()>& cond, int ms) {
-    for (int i = 0; i < ms / 20; ++i) { Pump(); if (cond()) return true; Sleep(20); }
-    return cond();
-}
+#include "fluent_harness.h"
 
 // a hidden window on its own thread with a message loop (a fake FluentFlyout widget, a fake taskbar)
 struct WindowThread {
@@ -208,13 +275,6 @@ static void WriteSettings(const std::wstring& path, const std::wstring& body, in
 
 static std::wstring Monitor(int n) { return L"  <TaskbarWidgetSelectedMonitor>" + std::to_wstring(n) + L"</TaskbarWidgetSelectedMonitor>\r\n"; }
 
-static void SetSessions(std::vector<std::wstring> ids) {
-    std::lock_guard<std::mutex> lk(fluentflyout::g_mediaMu);
-    fluentflyout::g_sessions = std::move(ids);
-    fluentflyout::g_mediaKnown = true;
-    ++fluentflyout::g_mediaVersion;
-}
-
 // a flyout of "FluentFlyout": a top-level window of flyout size, shown for the module but cloaked
 static HWND MakeFlyout(int x, int y, int w, int h) {
     static bool registered = false;
@@ -230,8 +290,6 @@ static HWND MakeFlyout(int x, int y, int w, int h) {
     fluentflyout::OnWinEvent(nullptr, EVENT_OBJECT_SHOW, f, OBJID_WINDOW, CHILDID_SELF, 0, 0);
     return f;
 }
-
-static RECT Rect(HWND h) { RECT r{}; GetWindowRect(h, &r); return r; }
 
 // FluentFlyout moves its flyout (its animation): the module hears of it as from its hook
 static void FluentMoves(HWND f, int x, int y) {
@@ -292,6 +350,32 @@ static bool TickUntil(const std::function<bool()>& cond, int ms) {
     return WaitFor([&] { fluentflyout::Tick(NowSeconds()); return cond(); }, ms);
 }
 
+// ---------------------------------------------------------------- a fake media thread for Shutdown
+// Its rounds (MediaRounds) as the media thread runs them, its look a fake one (no media sessions are
+// asked): one that hangs (a media service that does not answer) notes what Shutdown had done by the
+// time the stop came, and returns only when released.
+struct FakeMedia {
+    bool hang = false;
+    HANDLE inLook = nullptr, release = nullptr;
+    size_t mark = 0;                              // the log's lines from here on
+    std::atomic<int> looks{ 0 };
+    std::atomic<bool> sawStop{ false }, forgottenFirst{ false };
+};
+static FakeMedia g_fakeMedia;
+
+static DWORD WINAPI FakeMediaThread(void*) {
+    fluentflyout::MediaRounds([] {
+        ++g_fakeMedia.looks;
+        SetEvent(g_fakeMedia.inLook);
+        if (!g_fakeMedia.hang) return;
+        g_fakeMedia.sawStop = WaitForSingleObject(fluentflyout::g_mediaStop, 5000) == WAIT_OBJECT_0;
+        const auto lines = FluentLines(g_fakeMedia.mark);
+        g_fakeMedia.forgottenFirst = std::find(lines.begin(), lines.end(), L"fluentflyout: shutting down") != lines.end() && !fluentflyout::g_mediaWanted;
+        WaitForSingleObject(g_fakeMedia.release, 5000);
+    });
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 4 && !wcscmp(argv[1], L"--hunt-fluent-widget")) return ChildMain(argv[2], _wtoi(argv[3]));
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -310,6 +394,7 @@ int wmain(int argc, wchar_t** argv) {
     {
         using namespace fluentflyout;
         const double t = NowSeconds() + 1000;   // a clock of its own (reset below)
+        const size_t settingsMark = LogMark();
         WriteSettings(fileA, L"  <TaskbarWidgetEnabled>true</TaskbarWidgetEnabled>\r\n" + Monitor(1), 120);
         g_settingsFilesAt = -1; g_settingsLookups = 0;
         LoadSettings(t, true);
@@ -353,6 +438,7 @@ int wmain(int argc, wchar_t** argv) {
         LoadSettings(t + 40, false);
         Check(g_ffPath == fileB && g_ff.filtering && g_ff.blocked.size() == 2 && g_ff.blocked[0] == L"멜론" && g_ff.blocked[1] == L"Tom & Jerry",
               "UTF-8 without a byte order mark; Korean names and entities in the lists");
+        Check(g_namesWanted, "...its app filter on: the apps are named for it (g_namesWanted, set with each file read)");
         Check(g_fileAt == t + 4, "the same monitor setting in another file: not noted as new (it decides only when it changes)");
         version = g_ffVersion;
         LoadSettings(t + 42, false);
@@ -366,11 +452,26 @@ int wmain(int argc, wchar_t** argv) {
         LoadSettings(t + 48, false);
         Check(g_ff.loaded && g_ff.filtering, "gone for a moment: its values are kept");
         Check(g_settingsLookups == lookups + 2, "while no file exists the folders are looked up at every check (the Store folder may appear)");
+        LoadSettings(t + 52, false);
+        Check(g_ff.loaded && g_ff.filtering && g_fileSetting == 1 && g_ffPath == fileB && g_namesWanted, "gone for 8 s: its values still kept (FluentFlyout's defaults only after 10 s)");
+        const int versionGone = g_ffVersion;
+        g_choiceDirty = false;   // as UpdateMonitor leaves it: only the file gone sets it again
         LoadSettings(t + 54.5, false);
         Check(!g_ff.loaded && g_fileSetting == -1 && g_ffPath.empty() && g_choiceDirty, "gone for more than 10 s: FluentFlyout's defaults, its monitor no longer known");
+        Check(!g_namesWanted && g_fileAt == t + 54.5 && g_ffVersion == versionGone + 1,
+              "...and no apps named for its filter, the setting noted as new now (\"not known\"), the settings' version one on");
         WriteSettings(fileA, L"  <TaskbarWidgetEnabled>true</TaskbarWidgetEnabled>\r\n" + Monitor(1), 1);
         LoadSettings(t + 56.5, false);
         Check(g_ff.loaded && g_fileSetting == 1 && g_fileAt == t + 56.5, "back: read at once, its monitor noted as new");
+        // the log: one line for each file read (its path and values), one for the file gone; none for what is not taken
+        Check(SameLines(settingsMark, {
+                  SettingsLine(fileA, 1, 0, 1, 0, 0, L"block", 2),
+                  SettingsLine(fileB, 1, 0, 0, 0, 0, L"block", 2),
+                  SettingsLine(fileA, 1, 0, 1, 0, 0, L"block", 2),
+                  SettingsLine(fileB, 1, 0, 1, 0, 1, L"block", 2),
+                  L"fluentflyout: settings file gone - its defaults assumed",
+                  SettingsLine(fileA, 1, 0, 1, 0, 0, L"block", 2) }),
+              "the log: \"settings <path> - widget ..., animation N\" for each file read, \"settings file gone - its defaults assumed\" after 10 s, nothing for a file not taken");
         // back on the real clock for the rest, nothing read yet
         g_nextSettingsCheck = 0; g_settingsFilesAt = -1; g_ffMissingSince = -1;
         g_ff = {}; g_ffPath.clear(); g_ffTime = {}; g_fileSetting = -1; g_fileAt = -1; g_choiceDirty = true;
@@ -422,7 +523,7 @@ int wmain(int argc, wchar_t** argv) {
         useLayout();
         fluentflyout::g_nextScan = 0;
         fluentflyout::Tick(NowSeconds());
-        Check(fluentflyout::g_widget == widget.hwnd && fluentflyout::g_parentKind == fluentflyout::ParentKind::Explorer,
+        Check(fluentflyout::g_widget == widget.hwnd && fluentflyout::g_parentKind == fluentflyout::ParentKind::ExplorerMain,
               "its widget in Explorer's main taskbar: found there");
         Check(fluentflyout::WidgetMonitor() == portrait,
               "no secondary taskbar: its widget in Explorer's main taskbar is FluentFlyout's fallback - the file's monitor (\"2\") holds the slot");
@@ -439,7 +540,7 @@ int wmain(int argc, wchar_t** argv) {
         fluentflyout::g_shownMonitor = nullptr;
         SetParent(widget.hwnd, secondary.hwnd);
         fluentflyout::Tick(NowSeconds());
-        Check(fluentflyout::g_parentKind == fluentflyout::ParentKind::Explorer && fluentflyout::g_shownMonitor == realMain,
+        Check(fluentflyout::g_parentKind == fluentflyout::ParentKind::ExplorerSecondary && fluentflyout::g_shownMonitor == realMain,
               "its widget in a secondary taskbar: that taskbar's monitor");
         SetParent(widget.hwnd, mainTray.hwnd);   // not destroyed with that window
         secondary.Quit();
@@ -539,17 +640,22 @@ int wmain(int argc, wchar_t** argv) {
         ++g_ffVersion;
         WantMedia(true);   // as Tick does now: the slot follows the sessions
         g_namesWanted = true;
+        const size_t namedMark = LogMark();
         PublishSessions({ L"fluent_lifecycle_test.exe" });
         {
             std::lock_guard<std::mutex> lk(g_mediaMu);
             Check(g_appNames[L"fluent_lifecycle_test.exe"] == L"HuntFluent Player", "a new list: its apps named first");
         }
+        Check(SameLines(namedMark, { L"fluentflyout: media app fluent_lifecycle_test.exe - FluentFlyout's name for it \"HuntFluent Player\" (its app filter)" }),
+              "the log: \"media app <id> - FluentFlyout's name for it \"<name>\" (its app filter)\" for a new name");
         const double t2 = NowSeconds();
         UpdateHasMedia(t2);
         Check(g_rawMedia && g_media.value && WidgetState().open, "allowed by FluentFlyout's name for it: playing, the slot open (not cut while FluentFlyout shows it)");
         int published = g_mediaVersion;
+        const size_t sameListMark = LogMark();
         PublishSessions({ L"fluent_lifecycle_test.exe" });
         Check(g_mediaVersion == published, "the same list again, its apps named: nothing new");
+        Check(SameLines(sameListMark, {}), "...and no line (a name once found is not written again)");
         g_ff.allowed = { L"Spotify" };
         ++g_ffVersion;
         UpdateHasMedia(t2 + 0.1);
@@ -562,6 +668,27 @@ int wmain(int argc, wchar_t** argv) {
             Check(g_mediaVersion == published + 1 && g_sessions == std::vector<std::wstring>({ L"Other.Player" }) && !g_appNames.count(L"Other.Player"),
                   "filter off: the list without naming its apps");
         }
+        // an app FluentFlyout names by its id (nothing knows it): looked up again when the list changes -
+        // the same name again, no line
+        g_namesWanted = true;
+        const std::wstring noSuch = L"LiquidDockHunt.NoSuchPlayer_0000!App";
+        size_t idMark = LogMark();
+        PublishSessions({ noSuch });
+        Check(SameLines(idMark, { L"fluentflyout: media app " + noSuch + L" - FluentFlyout's name for it \"" + noSuch + L"\" (its app filter)" }),
+              "the log: \"media app <id> - FluentFlyout's name for it \"<id>\"\" for an app named by its id");
+        idMark = LogMark();
+        PublishSessions({ noSuch, L"fluent_lifecycle_test.exe" });
+        {
+            std::lock_guard<std::mutex> lk(g_mediaMu);
+            Check(g_appNames[noSuch] == noSuch && g_appNames[L"fluent_lifecycle_test.exe"] == L"HuntFluent Player" &&
+                      g_sessions == std::vector<std::wstring>({ noSuch, L"fluent_lifecycle_test.exe" }),
+                  "...the list changed: the one named by its id looked up again (the same), the other's name kept");
+        }
+        Check(SameLines(idMark, {}), "...and no line (its name did not change)");
+        const int versionSame = g_mediaVersion;
+        PublishSessions({ noSuch, L"fluent_lifecycle_test.exe" });
+        Check(g_mediaVersion == versionSame, "...the same list again: nothing looked up again, nothing new (an app named by its id is tried again only when the list changes)");
+        g_namesWanted = false;
         // FluentFlyout gone, its filter on: the media thread (asleep) names no apps; found again with its
         // settings file unchanged (LoadSettings reads nothing): named again
         g_namesWanted = true;
@@ -824,9 +951,14 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("  (after %.1f s)\n", NowSeconds() - startedAt);
         // an update: the new version starts while the old one closes its widget window and lingers
         Check(c.Start(L"c", 0), "the updated FluentFlyout starts while the old one runs");
+        const size_t updateMark = LogMark();
         b.CloseWidget();
         Check(TickUntil([&] { return g_widget == c.widget; }, 2000) && g_pid == c.pi.dwProcessId && watches(c),
               "the old one's widget window gone: the new one's window is taken at once, its process watched instead");
+        Check(SameLines(updateMark, { L"fluentflyout: its widget window closed - keeping its place for the new one",
+                                      Fmt(L"fluentflyout: running (process %lu)", c.pi.dwProcessId),
+                                      L"fluentflyout: widget window is in a window of its own (not moved into a taskbar)" }),
+              "the log: the old window closed, then the new process \"running (process <pid>)\" - no \"new widget window is here\" for another process");
         Check(b.WaitExit(5000), "(the old process left)");
         TickUntil([] { return false; }, 300);
         Check(g_widget == c.widget && Present(), "the old process leaving changes nothing");
@@ -855,8 +987,612 @@ int wmain(int argc, wchar_t** argv) {
         Check(rounds && handlesAfter <= handlesBefore + 1, "no handles left behind by FluentFlyout processes coming and going");
     }
 
+    // ================================================================ as it is now (a characterization)
+    // Characterization: the module's log lines word for word on each path, what each path forgets and
+    // keeps, the kind of each parent, Shutdown with a media thread. Made-up monitors only (kHuntOther,
+    // which the GetMonitorInfoW fake describes, and the real main one, at 0,0 on every PC); the 6 s and
+    // 3 s waits by moving back the times they count from, not by a clock ahead.
+    {
+        using namespace fluentflyout;
+        const std::wstring running = Fmt(L"fluentflyout: running (process %lu)", GetCurrentProcessId());
+        MONITORINFO mainInfo = { sizeof(mainInfo) };
+        GetMonitorInfoW(realMain, &mainInfo);
+        const std::wstring mainText = Fmt(L"main monitor at %ld,%ld (FluentFlyout's \"1\")", mainInfo.rcMonitor.left, mainInfo.rcMonitor.top);
+        const std::wstring otherText = L"other monitor at -1440,-560 (FluentFlyout's \"2\")";
+        const std::wstring own = L"a window of its own (not moved into a taskbar)", dock = L"the dock's window",
+                           mainBar = L"Explorer's taskbar (hidden by the dock)", secondBar = L"a secondary Explorer taskbar (hidden by the dock)";
+        auto in = [](const std::wstring& where) { return L"fluentflyout: widget window is in " + where; };
+        auto noBars = [](int secondaries, int monitors) {
+            return Fmt(L"fluentflyout: Explorer has no taskbar on every display (%d secondary, %d monitors): FluentFlyout puts its widget into the main one when its monitor has none - its settings decide",
+                       secondaries, monitors);
+        };
+        const std::wstring tookMain = L"fluentflyout: FluentFlyout took that taskbar: its widget belongs on the " + mainText;
+        auto goesTo = [](const std::wstring& monitor, const wchar_t* why, int setting) {
+            return L"fluentflyout: its widget goes to the dock on the " + monitor + L" - " + why + (setting > 0 ? Fmt(L", its setting \"%d\"", setting) : std::wstring());
+        };
+        const std::wstring notMoved = L"fluentflyout: FluentFlyout has not moved its widget into the dock's window (it is in ";
+        auto layout = [&](std::vector<HMONITOR> handles, std::vector<fluentlogic::Monitor> descs) {
+            g_monitorHandles = std::move(handles);
+            g_monitorDescs = std::move(descs);
+            g_monitorsAt = NowSeconds() + 1e6;   // kept: RefreshMonitors would read the real ones
+            g_choiceDirty = true;
+        };
+        auto twoMonitors = [&] { layout({ kHuntOther, realMain }, { { false, -1440 }, { true, mon.left } }); };
+        auto makeOwn = [](HWND w) {   // a window of its own again
+            SetWindowLongPtrW(w, GWL_STYLE, (GetWindowLongPtrW(w, GWL_STYLE) & ~WS_CHILD) | WS_POPUP);
+            SetParent(w, nullptr);
+        };
+        WindowThread tray, host, stale, other, second;
+        tray.Run(kHuntMainTray, L"");     // Explorer's main taskbar
+        host.Run(kHuntMainTray, L"");     // the dock's host window: a "Shell_TrayWnd" with the dock's mark
+        stale.Run(kHuntMainTray, L"");    // one with the mark that is not the host window now (an earlier one)
+        other.Run(L"HuntFluent_OtherParent", L"");
+        second.Run(kHuntSecondary, L"");
+        SetPropW(host.hwnd, kTrayHostProp, (HANDLE)1);
+        SetPropW(stale.hwnd, kTrayHostProp, (HANDLE)1);
+        g_fakeExplorer = tray.hwnd;
+        trayhost::g_stubHosted = {};
+
+        // ---- the kind of each parent (Classify) and its name in the log (ParentName)
+        trayhost::g_stubWindow = host.hwnd;
+        Check(KindName(Classify(nullptr)) == "None" && KindName(Classify(GetDesktopWindow())) == "None" && ParentName(nullptr) == own && ParentName(GetDesktopWindow()) == own,
+              "parent: none or the desktop - None, \"a window of its own (not moved into a taskbar)\"");
+        Check(KindName(Classify(host.hwnd)) == "Host" && ParentName(host.hwnd) == dock, "parent: the dock's host window (a Shell_TrayWnd with the dock's mark) - Host, \"the dock's window\"");
+        Check(KindName(Classify(tray.hwnd)) == "Explorer" && ParentName(tray.hwnd) == mainBar, "parent: Explorer's main taskbar - Explorer, \"Explorer's taskbar (hidden by the dock)\"");
+        Check(KindName(Classify(second.hwnd)) == "Explorer" && ParentName(second.hwnd) == secondBar,
+              "parent: a secondary taskbar - Explorer, \"a secondary Explorer taskbar (hidden by the dock)\"");
+        Check(KindName(Classify(stale.hwnd)) == "Other" && ParentName(stale.hwnd) == mainBar,
+              "parent: a Shell_TrayWnd with the dock's mark that is not the host window now - Other, yet named \"Explorer's taskbar (hidden by the dock)\"");
+        Check(KindName(Classify(other.hwnd)) == "Other" && ParentName(other.hwnd) == L"a window of class HuntFluent_OtherParent",
+              "parent: any other window - Other, \"a window of class <its class>\"");
+        trayhost::g_stubWindow = nullptr;
+        Check(KindName(Classify(host.hwnd)) == "Other" && ParentName(host.hwnd) == mainBar, "...the dock's window while the host is not up: as that one");
+        second.Quit();
+
+        // ---- found with no settings file: the dock's monitor "not known yet", no setting in the line
+        Forget(L"test: next case");
+        DeleteFileW(fileA.c_str()); DeleteFileW(fileB.c_str());
+        g_nextSettingsCheck = 0; g_settingsFilesAt = -1; g_ffMissingSince = -1;
+        g_ff = {}; g_ffPath.clear(); g_ffTime = {}; g_fileSetting = -1; g_fileAt = -1;
+        twoMonitors();
+        {
+            WindowThread w0;
+            w0.Run(std::wstring(kHuntWrapper) + L"lines-0]", kHuntTitle);
+            const size_t mark0 = LogMark();
+            g_nextScan = 0;
+            Tick(NowSeconds());
+            Check(g_widget == w0.hwnd && !g_ff.loaded && g_fileSetting == -1 && g_monitor == realMain &&
+                      SameLines(mark0, { running, in(own), goesTo(mainText, L"not known yet", 0) }),
+                  "the log, found with no settings file: \"running\", where, \"its widget goes to the dock on the main monitor at <x>,<y> (FluentFlyout's \"1\") - not known yet\" (no setting)");
+            w0.Quit();
+        }
+        // ---- found with its setting "1" (0 in the file): "from its settings, its setting \"1\""
+        Forget(L"test: next case");
+        WriteSettings(fileA, L"  <TaskbarWidgetEnabled>true</TaskbarWidgetEnabled>\r\n" + Monitor(0), 1);
+        g_nextSettingsCheck = 0; g_settingsFilesAt = -1; g_ffMissingSince = -1; g_ffPath.clear(); g_ffTime = {};
+        twoMonitors();
+        {
+            WindowThread wz;
+            wz.Run(std::wstring(kHuntWrapper) + L"lines-z]", kHuntTitle);
+            const size_t markZ = LogMark();
+            g_nextScan = 0;
+            Tick(NowSeconds());
+            Check(g_widget == wz.hwnd && g_fileSetting == 0 && g_fileMonitor == 1 && g_monitor == realMain &&
+                      SameLines(markZ, { running, SettingsLine(fileA, 1, 0, 0, 0, 0, L"block", 2), in(own), goesTo(mainText, L"from its settings", 1) }),
+                  "the log, found with its setting \"1\": \"its widget goes to the dock on the main monitor ... - from its settings, its setting \"1\"\"");
+            wz.Quit();
+        }
+
+        // ---- found, then moved between Explorer's taskbars: the lines of each step
+        Forget(L"test: next case");
+        WriteSettings(fileA, L"  <TaskbarWidgetEnabled>true</TaskbarWidgetEnabled>\r\n  <TaskbarVisualizerEnabled>true</TaskbarVisualizerEnabled>\r\n"
+                             L"  <AppFilteringMode>1</AppFilteringMode>\r\n  <FlyoutAnimationSpeed>3</FlyoutAnimationSpeed>\r\n" + Monitor(1), 1);
+        g_nextSettingsCheck = 0; g_settingsFilesAt = -1; g_ffMissingSince = -1; g_ffPath.clear(); g_ffTime = {};
+        twoMonitors();
+        WindowThread w1;
+        w1.Run(std::wstring(kHuntWrapper) + L"lines-1]", kHuntTitle);
+        size_t mark = LogMark();
+        g_nextScan = 0;
+        Tick(NowSeconds());
+        Check(g_widget == w1.hwnd && SameLines(mark, { running, SettingsLine(fileA, 1, 0, 1, 1, 0, L"allow", 3), in(own), goesTo(otherText, L"from its settings", 2) }),
+              "the log, found: \"running (process <pid>)\", its settings file, \"widget window is in a window of its own ...\", \"its widget goes to the dock on the other monitor at -1440,-560 (FluentFlyout's \"2\") - from its settings, its setting \"2\"\"");
+        // the same setting, the monitors listed in another order: its position worked out again - the same
+        // monitor, nothing written
+        layout({ realMain, kHuntOther }, { { true, mon.left }, { false, -1440 } });
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_fileMonitor == 1 && g_monitor == kHuntOther && WidgetMonitor() == kHuntOther && SameLines(mark, {}),
+              "the monitors listed in another order, the same setting \"2\": worked out again, the same monitor - nothing written");
+        // a monitor the system does not describe (GetMonitorInfo fails) in its place: "(no monitor)"
+        const HMONITOR undescribed = (HMONITOR)(UINT_PTR)0x48F7;
+        layout({ undescribed, realMain }, { { false, -1440 }, { true, mon.left } });
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_monitor == undescribed && SameLines(mark, { goesTo(L"(no monitor)", L"from its settings", 2) }),
+              "the log, the dock's monitor not described by the system: \"its widget goes to the dock on the (no monitor) - from its settings, its setting \"2\"\"");
+        twoMonitors();
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_monitor == kHuntOther && SameLines(mark, { goesTo(otherText, L"from its settings", 2) }), "...the layout back: the other monitor again");
+        MakeChild(w1.hwnd, tray.hwnd);   // Explorer's main taskbar, no secondary one
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(KindName(g_parentKind) == "Explorer" && !g_parentTells && SameLines(mark, { in(mainBar), noBars(0, 2) }),
+              "the log, into Explorer's main taskbar, no secondary one: where, then \"Explorer has no taskbar on every display (0 secondary, 2 monitors): ...\"");
+        Check(!trayhost::Window() && g_notInHostSince == -1 && !g_notInHostLogged, "...the dock's window not up: no wait for the widget to move into it");
+        g_choiceDirty = true;   // the displays looked at again: the same
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(SameLines(mark, {}), "...looked at again, the same: nothing written");
+        second.Run(kHuntSecondary, L"");   // Explorer's taskbar on the other display too
+        g_choiceDirty = true;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_parentTells && g_shownMonitor == realMain && SameLines(mark, { tookMain, goesTo(mainText, L"where FluentFlyout put it", 2) }),
+              "the log, a taskbar on every display: \"FluentFlyout took that taskbar: its widget belongs on the main monitor ...\", the dock \"- where FluentFlyout put it, its setting \"2\"\"");
+        {
+            const double s1 = NowSeconds(), s2 = s1 + 0.25;
+            mark = LogMark();
+            Tick(s1);
+            const double shownAt1 = g_shownAt;
+            Tick(s2);
+            Check(shownAt1 == s1 && g_shownAt == s2 && g_shownMonitor == realMain && SameLines(mark, {}),
+                  "...while it stays in that taskbar: when it was seen there noted at every Tick (the same monitor: nothing written)");
+        }
+        second.Quit();
+        g_choiceDirty = true;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(!g_parentTells && g_shownMonitor == realMain && SameLines(mark, { noBars(0, 2) }),
+              "...the secondary taskbar gone: \"no taskbar on every display\" again (it told before); the dock stays where FluentFlyout put it");
+        // three displays, one secondary taskbar: in it a sure answer, in the main one not
+        second.Run(kHuntSecondary, L"");
+        layout({ kHuntOther, realMain, (HMONITOR)(UINT_PTR)0x48F5 }, { { false, -1440 }, { true, mon.left }, { false, mon.left + 2560 } });
+        SetParent(w1.hwnd, second.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(KindName(g_parentKind) == "Explorer" && g_parentTells && SameLines(mark, { in(secondBar) }),
+              "the log, into a secondary taskbar (1 of 3 displays): where only - it tells, the same monitor as before (no \"took that taskbar\" again)");
+        SetParent(w1.hwnd, tray.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(!g_parentTells && SameLines(mark, { in(mainBar), noBars(1, 3) }), "...back into the main one: \"(1 secondary, 3 monitors)\"");
+        // secondary taskbars are counted up to 16
+        std::vector<HWND> more;
+        for (int i = 0; i < 17; ++i)
+            more.push_back(CreateWindowExW(WS_EX_TOOLWINDOW, kHuntSecondary, L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr));
+        std::vector<HMONITOR> many = { kHuntOther, realMain };
+        std::vector<fluentlogic::Monitor> manyDescs = { { false, -1440 }, { true, mon.left } };
+        for (int i = 2; i < 18; ++i) { many.push_back((HMONITOR)(UINT_PTR)(0x4900 + i)); manyDescs.push_back({ false, mon.left + 2560 * (i - 1) }); }
+        layout(many, manyDescs);
+        SetParent(w1.hwnd, other.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(KindName(g_parentKind) == "Other" && SameLines(mark, { in(L"a window of class HuntFluent_OtherParent") }), "the log, into another window: \"widget window is in a window of class <its class>\"");
+        SetParent(w1.hwnd, tray.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(SameLines(mark, { in(mainBar), noBars(16, 18) }), "...back into the main one, 18 secondary taskbars on 18 displays: counted up to 16 (\"16 secondary, 18 monitors\")");
+        for (HWND h : more) DestroyWindow(h);
+        twoMonitors();
+        SetParent(w1.hwnd, stale.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(KindName(g_parentKind) == "Other" && !g_parentTells && SameLines(mark, { in(mainBar) }),
+              "the log, into a marked Shell_TrayWnd that is not the host window: \"Explorer's taskbar\" by its name, nothing about its monitor (Other)");
+
+        // ---- the dock's window up, the widget not in it: one line after 6 s
+        trayhost::g_stubWindow = host.hwnd;
+        SetParent(w1.hwnd, tray.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_notInHostSince >= 0 && !g_notInHostLogged && SameLines(mark, { in(mainBar) }),
+              "...the dock's window up, its widget in Explorer's main taskbar (a taskbar on every display, the same monitor): where only; the wait begins");
+        g_notInHostSince = NowSeconds() - 5.5;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(!g_notInHostLogged && SameLines(mark, {}), "...nothing after 5.5 s");
+        g_notInHostSince = NowSeconds() - 6.5;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_notInHostLogged && SameLines(mark, { notMoved + mainBar + L") - is FluentFlyout's taskbar widget on, with Premium?" }),
+              "the log, after 6 s: \"FluentFlyout has not moved its widget into the dock's window (it is in <where>) - is FluentFlyout's taskbar widget on, with Premium?\"");
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(SameLines(mark, {}), "...written once");
+        makeOwn(w1.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_notInHostLogged && SameLines(mark, { in(own) }), "...moved elsewhere outside the dock's window: not written again");
+        MakeChild(w1.hwnd, host.hwnd);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(KindName(g_parentKind) == "Host" && g_notInHostSince == -1 && !g_notInHostLogged && SameLines(mark, { in(dock) }),
+              "the log, into the dock's window: \"widget window is in the dock's window\"; the wait and its line reset");
+        makeOwn(w1.hwnd);
+        Tick(NowSeconds());
+        trayhost::g_stubElevated = true;
+        g_notInHostSince = NowSeconds() - 6.5;
+        mark = LogMark();
+        Tick(NowSeconds());
+        trayhost::g_stubElevated = false;
+        Check(SameLines(mark, { notMoved + own +
+                                L") - the dock runs as administrator, and Windows does not let an ordinary program put a window into an elevated one: start Liquid Dock normally" }),
+              "the log, out of it for 6 s again, the dock as administrator: \"... - the dock runs as administrator, and Windows does not let an ordinary program put a window into an elevated one: start Liquid Dock normally\"");
+        // the dock's window gone meanwhile (the host stopped): the wait and its line reset; up again, it begins
+        // again and the line comes once more after 6 s
+        trayhost::g_stubWindow = nullptr;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_notInHostLogged == false && g_notInHostSince == -1 && SameLines(mark, {}), "...the dock's window gone: the wait and its line reset, nothing written");
+        trayhost::g_stubWindow = host.hwnd;
+        Tick(NowSeconds());
+        const bool waitsAgain = g_notInHostSince >= 0 && !g_notInHostLogged;
+        g_notInHostSince = NowSeconds() - 6.5;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(waitsAgain && g_notInHostLogged && SameLines(mark, { notMoved + own + L") - is FluentFlyout's taskbar widget on, with Premium?" }),
+              "...up again: the wait begins again, the line once more after 6 s");
+
+        // ---- the slot's four lines
+        MakeChild(w1.hwnd, host.hwnd);
+        Tick(NowSeconds());
+        trayhost::g_stubHosted.window = w1.hwnd;
+        trayhost::g_stubHosted.box = { 20, 15, 210, 55 };
+        trayhost::g_stubHosted.fitted = true;
+        mark = LogMark();
+        Check(WidgetState().open && SameLines(mark, { L"fluentflyout: widget slot open (showing)" }), "the log: \"widget slot open (showing)\"");
+        trayhost::g_stubHosted.window = nullptr;
+        g_adoptedAt = NowSeconds() - 1.0;
+        mark = LogMark();
+        Check(WidgetState().open && SameLines(mark, {}), "...the widget not in the host window within 1.6 s of being found: kept open, nothing written");
+        g_frozenNow = NowSeconds();   // the module's clock held: the 1.6 s boundary looked at exactly
+        g_adoptedAt = g_frozenNow - 1.55;
+        mark = LogMark();
+        Check(WidgetState().open && SameLines(mark, {}), "...1.55 s after being found: still kept open");
+        g_settings.edge = Edge::Left;   // a side edge for a moment: no slot answered (g_slotShown), its last state (g_decidedOpen) kept
+        WidgetState();
+        g_settings.edge = Edge::Bottom;
+        const bool sideMeanwhile = !g_slotShown && g_decidedOpen;
+        g_adoptedAt = g_frozenNow - 1.0;
+        mark = LogMark();
+        Check(sideMeanwhile && WidgetState().open && g_slotShown && SameLines(mark, {}),
+              "...kept by its last state open (not by what was last answered, closed on the side edge): open again, nothing written");
+        g_frozenNow = -1;
+        g_adoptedAt = NowSeconds() - 2.0;
+        mark = LogMark();
+        Check(!WidgetState().open && SameLines(mark, { L"fluentflyout: widget slot closed (widget hidden or not in the dock's window)" }),
+              "...later: \"widget slot closed (widget hidden or not in the dock's window)\"");
+        trayhost::g_stubHosted.window = w1.hwnd;
+        WidgetState();   // open again
+        trayhost::g_stubHosted.window = nullptr;
+        g_frozenNow = NowSeconds();
+        g_adoptedAt = g_frozenNow - 1.65;
+        mark = LogMark();
+        Check(!WidgetState().open && SameLines(mark, { L"fluentflyout: widget slot closed (widget hidden or not in the dock's window)" }),
+              "...1.65 s after being found: closed");
+        g_frozenNow = -1;
+        trayhost::g_stubHosted.window = w1.hwnd;
+        WidgetState();
+        g_ff.hideCompletely = true;
+        g_media.value = false;
+        mark = LogMark();
+        Check(!WidgetState().open && SameLines(mark, { L"fluentflyout: widget slot closed (nothing playing, hide completely)" }), "the log: \"widget slot closed (nothing playing, hide completely)\"");
+        g_media.value = true;
+        WidgetState();
+        trayhost::g_stubHosted.box = {};
+        mark = LogMark();
+        Check(!WidgetState().open && SameLines(mark, { L"fluentflyout: widget slot closed (empty)" }), "the log: \"widget slot closed (empty)\"");
+        // not in the host window and nothing playing with "hide completely": the first reason is the one written
+        trayhost::g_stubHosted.box = { 20, 15, 210, 55 };
+        WidgetState();   // open again
+        trayhost::g_stubHosted.window = nullptr;
+        g_media.value = false;
+        g_adoptedAt = NowSeconds() - 2.0;
+        mark = LogMark();
+        Check(!WidgetState().open && SameLines(mark, { L"fluentflyout: widget slot closed (widget hidden or not in the dock's window)" }),
+              "the log, not in the host window and nothing playing (hide completely): \"widget slot closed (widget hidden or not in the dock's window)\" - that reason first");
+        trayhost::g_stubHosted.window = w1.hwnd;
+        g_media.value = true;
+        g_ff.hideCompletely = false;
+        g_media = {};
+        trayhost::g_stubHosted.box = { 20, 15, 210, 55 };
+        WidgetState();
+
+        // ---- "nothing playing" and "media playing" (UpdateHasMedia), the lists handed over by hand
+        g_media = {};
+        SetSessions({});
+        mark = LogMark();
+        const double tMedia = NowSeconds();
+        UpdateHasMedia(tMedia);
+        const bool nothingAtOnce = !g_media.value;
+        SetSessions({ L"Spotify.exe" });
+        UpdateHasMedia(tMedia + 0.1);
+        Check(!g_mediaWanted && nothingAtOnce && g_media.value && SameLines(mark, { L"fluentflyout: nothing playing", L"fluentflyout: media playing" }),
+              "the log: \"nothing playing\" (a first list, empty), then \"media playing\"");
+        {
+            std::lock_guard<std::mutex> lk(g_mediaMu);
+            g_mediaKnown = false;
+        }
+        g_listSeen = false; g_rawMedia = true; g_rawMediaFor.sessions = g_rawMediaFor.settings = -1;
+        g_media = {};
+
+        // ---- its flyouts gone without the hook hearing of it (hidden, destroyed): dropped by the next Tick
+        Unhook();   // no events from the windows below: Tick's own look only
+        const bool noFlyouts = g_flyouts.empty();
+        HWND shownFly = MakeFlyout(mon.left + 16, mon.bottom - 200, 100, 50);
+        HWND hiddenFly = MakeFlyout(mon.left + 16, mon.bottom - 300, 100, 50);
+        HWND goneFly = MakeFlyout(mon.left + 16, mon.bottom - 400, 100, 50);
+        const bool threeFlyouts = g_flyouts.size() == 3;
+        ShowWindow(hiddenFly, SW_HIDE);
+        DestroyWindow(goneFly);
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(noFlyouts && threeFlyouts && g_flyouts.size() == 1 && g_flyouts[0].h == shownFly && SameLines(mark, {}),
+              "Tick: a flyout hidden and one destroyed without a hook event dropped, the shown one kept (nothing written)");
+        DestroyWindow(hiddenFly);
+        DestroyWindow(shownFly);
+        g_flyouts.clear(); g_lift.clear();
+        Hook();
+
+        // ---- its widget window closed (Tick): what is forgotten and what is kept
+        g_parentTells = true; g_notInHostSince = 12.5; g_notInHostLogged = true;
+        const HMONITOR shownMonitor = g_shownMonitor, monitor = g_monitor;
+        const double shownAt = g_shownAt, adoptedAt = g_adoptedAt;
+        const bool lastOpen = g_decidedOpen, slotShown = g_slotShown;
+        const RECT lastBox = g_lastBox;
+        const DWORD pidBefore = g_pid;
+        const HANDLE procBefore = g_proc;
+        const HWND first = w1.hwnd;
+        Check(shownMonitor == realMain && monitor == realMain && lastOpen && slotShown && lastBox.right == 210 && pidBefore && procBefore, "fixture: the widget shown, its process watched");
+        w1.Quit();
+        mark = LogMark();
+        double t = NowSeconds();
+        Tick(t);
+        Check(SameLines(mark, { L"fluentflyout: its widget window closed - keeping its place for the new one" }), "the log: \"its widget window closed - keeping its place for the new one\"");
+        Check(!g_widget && g_lostWidget == first && g_lostAt == t && g_parent == (HWND)-1 && KindName(g_parentKind) == "None" && g_nextScan == t + 0.1,
+              "...forgotten: the widget (kept as the lost one, since then), its parent and its kind; the next look in 0.1 s");
+        Check(g_parentTells && g_notInHostSince == 12.5 && g_notInHostLogged && g_shownMonitor == shownMonitor && g_shownAt == shownAt && g_monitor == monitor &&
+              g_decidedOpen == lastOpen && g_slotShown == slotShown && EqualRect(&g_lastBox, &lastBox) && g_adoptedAt == adoptedAt && g_pid == pidBefore && g_proc == procBefore,
+              "...kept: whether its parent told the monitor, the 6 s wait and its line, where FluentFlyout showed it, the dock's monitor, the slot's last state and box, when it was found, its process");
+        WindowThread w2;   // the same FluentFlyout's new widget window
+        w2.Run(std::wstring(kHuntWrapper) + L"lines-2]", kHuntTitle);
+        MakeChild(w2.hwnd, host.hwnd);
+        trayhost::g_stubHosted.window = w2.hwnd;
+        g_nextScan = 0;
+        mark = LogMark();
+        const double t2 = NowSeconds();
+        Tick(t2);
+        Check(SameLines(mark, { Fmt(L"fluentflyout: its new widget window is here after %.1f s", t2 - t), in(dock) }),
+              "the log, the same FluentFlyout's new widget window: \"its new widget window is here after <s> s\" (no \"running\"), where it is");
+        Check(g_widget == w2.hwnd && !g_lostWidget && g_lostAt == -1 && g_adoptedAt == t2 && g_pid == pidBefore && g_proc == procBefore &&
+              g_shownMonitor == shownMonitor && g_shownAt == shownAt,
+              "...taken: the lost one forgotten, found now; its process and where FluentFlyout showed it kept");
+        w2.Quit();
+        Tick(NowSeconds());
+        g_lostAt = NowSeconds() - 4;   // closed more than 3 s ago
+        g_nextScan = 0;
+        mark = LogMark();
+        const double t3 = NowSeconds();
+        Tick(t3);
+        Check(!Present() && g_nextScan == t3 + 0.5 && SameLines(mark, { L"fluentflyout: its widget window did not come back" }),
+              "the log, none within 3 s: \"its widget window did not come back\" (the next look in 0.5 s)");
+        {
+            // its process ended and its widget window closed by the same Tick: the process first - "no longer
+            // running" only (no "keeping its place")
+            WindowThread w4;
+            w4.Run(std::wstring(kHuntWrapper) + L"lines-4]", kHuntTitle);
+            MakeChild(w4.hwnd, host.hwnd);
+            g_nextScan = 0;
+            Tick(NowSeconds());
+            const bool found4 = g_widget == w4.hwnd;
+            CloseHandle(g_proc);
+            g_proc = CreateEventW(nullptr, TRUE, TRUE, nullptr);   // its process ended: a set event in its place
+            w4.Quit();
+            mark = LogMark();
+            const double t6 = NowSeconds();
+            Tick(t6);
+            Check(found4 && !Present() && !g_lostWidget && g_nextScan == t6 + 2.0 && SameLines(mark, { L"fluentflyout: no longer running" }),
+                  "the log, its process ended and its widget window closed at once: \"no longer running\" only (the process looked at first)");
+            // a look that finds nothing: the next one in 2 s
+            const double t7 = t6 + 2.5;
+            mark = LogMark();
+            Tick(t7);
+            Check(!Present() && g_nextScan == t7 + 2.0 && SameLines(mark, {}), "a look that finds no widget window: the next look in 2 s, nothing written");
+        }
+
+        // ---- its process ended, the integration switched off
+        WindowThread w3;
+        w3.Run(std::wstring(kHuntWrapper) + L"lines-3]", kHuntTitle);
+        MakeChild(w3.hwnd, host.hwnd);
+        trayhost::g_stubHosted.window = w3.hwnd;
+        g_nextScan = 0;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(g_widget == w3.hwnd && SameLines(mark, { running, in(dock), goesTo(otherText, L"from its settings", 2) }),
+              "the log, found again: \"running\", where, the dock again (its settings file unchanged: no line)");
+        CloseHandle(g_proc);
+        g_proc = CreateEventW(nullptr, TRUE, TRUE, nullptr);   // its process ended: a set event in its place
+        mark = LogMark();
+        const double t4 = NowSeconds();
+        Tick(t4);
+        Check(!Present() && !g_proc && !g_pid && g_nextScan == t4 + 2.0 && SameLines(mark, { L"fluentflyout: no longer running" }),
+              "the log, its process ended: \"no longer running\" (forgotten, the next look in 2 s)");
+        g_nextScan = 0;
+        Tick(NowSeconds());
+        g_settings.fluentFlyout = false;
+        mark = LogMark();
+        Tick(NowSeconds());
+        Check(!Present() && SameLines(mark, { L"fluentflyout: integration switched off" }), "the log, the integration switched off: \"integration switched off\"");
+        mark = LogMark();
+        Tick(NowSeconds());
+        g_settings.fluentFlyout = true;
+        Check(SameLines(mark, {}), "...once");
+        mark = LogMark();
+        Forget(L"test: nothing to forget");
+        Check(SameLines(mark, {}), "Forget with nothing found: no line");
+
+        // ---- Forget: what it clears and what it keeps (everything set first)
+        g_nextScan = 0;
+        Tick(NowSeconds());   // found again: its process watched, its windows hooked
+        g_parent = other.hwnd; g_parentKind = ParentKind::Other; g_parentTells = true;
+        g_notInHostSince = 12.5; g_notInHostLogged = true;
+        g_monitor = realMain; g_lostWidget = first; g_lostAt = 3.5;
+        g_shownMonitor = realMain; g_shownAt = 4.5;
+        g_decidedOpen = g_slotShown = true; g_lastBox = { 1, 2, 3, 4 };
+        g_adoptedAt = 5.5; g_nextScan = 6.5;
+        g_namesWanted = true;
+        WantMedia(true);
+        {
+            std::lock_guard<std::mutex> lk(g_mediaMu);
+            g_mediaKnown = true;
+        }
+        g_media.value = false;
+        g_rawMedia = false; g_rawMediaFor.sessions = 3; g_rawMediaFor.settings = 4; g_listSeen = true;   // worked out from a list
+        {
+            std::lock_guard<std::mutex> lk(g_mediaMu);
+            g_sessions = { L"Fixture.Player" };
+            g_appNames[L"Fixture.Player"] = L"Fixture Player";
+        }
+        const int mediaVersion = g_mediaVersion;
+        const double mediaWantedAt = g_mediaWantedAt;
+        Flyout flyout;
+        flyout.h = other.hwnd;
+        g_flyouts.push_back(flyout);
+        g_lift[realMain] = 7;
+        const bool dirty = g_choiceDirty;
+        const int fileSetting = g_fileSetting, fileMonitor = g_fileMonitor, ffVersion = g_ffVersion;
+        const double fileAt = g_fileAt, monitorsAt = g_monitorsAt;
+        const size_t monitorCount = g_monitorHandles.size();
+        const HANDLE proc = g_proc;
+        Check(g_widget == w3.hwnd && g_pid && proc && g_hooks[0] && g_hooks[1] && g_mediaWanted, "fixture: everything set before Forget");
+        mark = LogMark();
+        Forget(L"test: forget");
+        DWORD flags = 0;
+        const RECT none{};
+        Check(SameLines(mark, { L"fluentflyout: test: forget" }), "Forget: \"fluentflyout: <why>\" while something was found");
+        Check(g_parent == (HWND)-1 && KindName(g_parentKind) == "None" && !g_parentTells, "Forget clears: its parent, the kind, whether it told the monitor");
+        Check(g_notInHostSince == -1 && !g_notInHostLogged, "Forget clears: the 6 s wait and its line");
+        Check(!g_widget && !g_lostWidget && g_lostAt == -1 && !g_monitor, "Forget clears: the widget, the lost one and when, the dock's monitor");
+        Check(!g_shownMonitor && g_shownAt == -1, "Forget clears: where FluentFlyout showed it");
+        Check(!g_decidedOpen && !g_slotShown && EqualRect(&g_lastBox, &none), "Forget clears: the slot's last state and box");
+        Check(!g_namesWanted && !g_mediaWanted && !g_mediaKnown, "Forget clears: apps named, the session list wanted and known");
+        Check(!g_pid && !g_proc && !GetHandleInformation(proc, &flags) && !g_hooks[0] && !g_hooks[1] && g_flyouts.empty() && g_lift.empty(),
+              "Forget clears: its process (the handle closed), the hooks, the flyouts and their lifts");
+        Check(g_adoptedAt == 5.5 && g_nextScan == 6.5 && g_choiceDirty == dirty && g_fileSetting == fileSetting && g_fileMonitor == fileMonitor && g_fileAt == fileAt &&
+              g_monitorsAt == monitorsAt && g_monitorHandles.size() == monitorCount && g_ffVersion == ffVersion && g_ff.loaded && !g_media.value,
+              "Forget keeps: when it was found, the next look, the monitors and the file's setting, FluentFlyout's settings, what counted last (nothing plays)");
+        Check(g_rawMedia && g_rawMediaFor.sessions == -1 && g_rawMediaFor.settings == -1 && !g_listSeen,
+              "Forget clears (the list no longer wanted): what was worked out from the sessions - something may play, for no version, no list seen");
+        {
+            std::lock_guard<std::mutex> lk(g_mediaMu);
+            Check(g_sessions == std::vector<std::wstring>({ L"Fixture.Player" }) && g_appNames[L"Fixture.Player"] == L"Fixture Player" &&
+                      g_mediaVersion == mediaVersion && g_mediaWantedAt == mediaWantedAt,
+                  "Forget keeps: the last session list, the apps' names, the list's version, when it was last wanted");
+        }
+
+        // ---- Adopt: a FluentFlyout found anew, another one than the one known, the same one's new window
+        g_parent = other.hwnd; g_parentKind = ParentKind::Other; g_parentTells = true;
+        g_notInHostSince = 12.5; g_notInHostLogged = true; g_monitor = realMain;
+        g_decidedOpen = g_slotShown = true; g_lastBox = { 1, 2, 3, 4 };
+        g_shownMonitor = realMain; g_shownAt = 4.5;
+        g_lostWidget = first; g_lostAt = 3.5;   // a lost window, no FluentFlyout known (g_pid 0)
+        g_flyouts.push_back(flyout);
+        mark = LogMark();
+        t = NowSeconds();
+        Adopt(w3.hwnd, t);
+        Check(SameLines(mark, { running }) && g_widget == w3.hwnd && g_adoptedAt == t && g_pid == GetCurrentProcessId() && g_proc && g_hooks[0] &&
+              !g_shownMonitor && g_shownAt == -1 && !g_lostWidget && g_lostAt == -1,
+              "Adopt, a FluentFlyout found anew: \"running\"; where it showed and the lost window forgotten, its process watched and hooked");
+        Check(g_parent == other.hwnd && KindName(g_parentKind) == "Other" && g_parentTells && g_notInHostSince == 12.5 && g_notInHostLogged && g_monitor == realMain &&
+              g_decidedOpen && g_slotShown && g_lastBox.right == 3 && g_flyouts.size() == 1,
+              "...kept (Tick looks at them next): its parent and kind, the 6 s wait, the dock's monitor, the slot, the flyouts");
+        g_pid = GetCurrentProcessId() + 4;   // another FluentFlyout was known
+        g_shownMonitor = realMain; g_shownAt = 4.5;
+        g_lift[realMain] = 7;
+        const HANDLE procOther = g_proc;   // the handle for the one known
+        mark = LogMark();
+        Adopt(w3.hwnd, t = NowSeconds());
+        Check(SameLines(mark, { running }) && g_pid == GetCurrentProcessId() && g_proc && g_hooks[0] && g_flyouts.empty() && g_lift.empty() && !g_shownMonitor && g_shownAt == -1,
+              "Adopt, another FluentFlyout than the one known: \"running\"; the last one's process forgotten first (its flyouts and lifts gone)");
+        Check((!GetHandleInformation(procOther, &flags) || procOther == g_proc) && g_parent == other.hwnd && KindName(g_parentKind) == "Other" && g_parentTells &&
+                  g_notInHostSince == 12.5 && g_notInHostLogged && g_monitor == realMain && g_decidedOpen && g_slotShown && g_lastBox.right == 3,
+              "...the last one's handle closed (or its slot taken by the new one); kept: its parent and kind, whether it told, the 6 s wait, the dock's monitor, the slot");
+        g_widget = nullptr; g_lostWidget = first; g_lostAt = t - 1.5;
+        g_shownMonitor = realMain; g_shownAt = 4.5;
+        g_flyouts.push_back(flyout);
+        const HANDLE procSame = g_proc;
+        mark = LogMark();
+        const double t5 = t;
+        Adopt(w3.hwnd, t5);
+        Check(SameLines(mark, { L"fluentflyout: its new widget window is here after 1.5 s" }) && g_widget == w3.hwnd && !g_lostWidget && g_lostAt == -1 && g_adoptedAt == t5 &&
+              g_proc == procSame && g_shownMonitor == realMain && g_shownAt == 4.5 && g_flyouts.size() == 1,
+              "Adopt, the same FluentFlyout's new window: \"its new widget window is here after 1.5 s\"; its process, where it showed and the flyouts kept");
+        Check(g_pid == GetCurrentProcessId() && g_parent == other.hwnd && KindName(g_parentKind) == "Other" && g_parentTells && g_notInHostSince == 12.5 &&
+                  g_notInHostLogged && g_monitor == realMain && g_decidedOpen && g_slotShown && g_lastBox.right == 3,
+              "...kept too: its parent and kind, whether it told, the 6 s wait and its line, the dock's monitor, the slot");
+        g_flyouts.clear(); g_lift.clear();
+        g_media = {};
+
+        // ---- Shutdown with the media thread: FluentFlyout forgotten first, then the stop, 1.5 s at most
+        Check(MediaEvents(), "fixture: the media thread's events");
+        ResetEvent(g_mediaStop); ResetEvent(g_mediaWake);
+        g_fakeMedia.hang = true;
+        g_fakeMedia.inLook = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_fakeMedia.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_fakeMedia.mark = LogMark();
+        HANDLE th = CreateThread(nullptr, 0, FakeMediaThread, nullptr, 0, nullptr);
+        HANDLE watch = nullptr;
+        DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(), &watch, SYNCHRONIZE, FALSE, 0);
+        g_mediaThread = th;
+        WantMedia(true);   // the list wanted: the media thread looks at once (and hangs in that look)
+        Check(th && watch && WaitForSingleObject(g_fakeMedia.inLook, 3000) == WAIT_OBJECT_0, "fixture: the media thread hangs in a look");
+        mark = LogMark();
+        g_waitedMs = 0;
+        double from = NowSeconds();
+        Shutdown();
+        const double tookHanging = NowSeconds() - from;
+        Check(g_waitedMs == 1500 && g_mediaWake && WaitForSingleObject(g_mediaWake, 0) != WAIT_FAILED,
+              "...Shutdown waits for the media thread with a timeout of 1500 ms; its wake-up event left open");
+        Check(SameLines(mark, { L"fluentflyout: shutting down" }), "the log, Shutdown: \"shutting down\"");
+        Check(tookHanging >= 1.4 && tookHanging < 3.0 && !g_mediaThread && WaitForSingleObject(watch, 0) == WAIT_TIMEOUT && !GetHandleInformation(th, &flags),
+              "Shutdown, the media thread hanging in a look: back after 1.5 s, the thread left running, its handle closed and let go");
+        Check(g_fakeMedia.sawStop && g_fakeMedia.forgottenFirst, "...FluentFlyout forgotten (\"shutting down\", the list not wanted) before the stop is set");
+        Check(g_mediaStop && WaitForSingleObject(g_mediaStop, 0) == WAIT_OBJECT_0, "...the stop event left set and open");
+        SetEvent(g_fakeMedia.release);
+        Check(WaitForSingleObject(watch, 3000) == WAIT_OBJECT_0 && g_fakeMedia.looks == 1, "...its look over, the thread ends (no other look)");
+        CloseHandle(watch);
+        ResetEvent(g_mediaStop); ResetEvent(g_mediaWake);
+        g_fakeMedia.hang = false;
+        g_fakeMedia.looks = 0;
+        g_nextScan = 0;
+        Tick(NowSeconds());   // found again
+        th = CreateThread(nullptr, 0, FakeMediaThread, nullptr, 0, nullptr);
+        watch = nullptr;
+        DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(), &watch, SYNCHRONIZE, FALSE, 0);
+        g_mediaThread = th;
+        mark = LogMark();
+        g_waitedMs = 0;
+        from = NowSeconds();
+        Shutdown();
+        const double tookAsleep = NowSeconds() - from;
+        Check(g_waitedMs == 1500, "...Shutdown, the media thread asleep: the same wait (1500 ms at most)");
+        Check(th && watch && !g_widget && SameLines(mark, { L"fluentflyout: shutting down" }) && tookAsleep < 1.0 && !g_mediaThread &&
+              WaitForSingleObject(watch, 0) == WAIT_OBJECT_0 && g_fakeMedia.looks == 0,
+              "Shutdown, the media thread asleep: \"shutting down\", the thread ended and waited for at once, no look");
+        CloseHandle(watch);
+        CloseHandle(g_fakeMedia.inLook);
+        CloseHandle(g_fakeMedia.release);
+        g_fakeMedia.inLook = g_fakeMedia.release = nullptr;
+
+        RemovePropW(host.hwnd, kTrayHostProp);
+        RemovePropW(stale.hwnd, kTrayHostProp);
+        trayhost::g_stubWindow = nullptr;
+        trayhost::g_stubHosted = {};
+        g_fakeExplorer = nullptr;
+    }
+
     fluentflyout::Shutdown();
     DeleteFileW(fileA.c_str()); DeleteFileW(fileB.c_str());
-    std::printf("fluent_lifecycle_test: %s (%d checks, %d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_checks, g_failures, g_failures == 1 ? "" : "s");
-    return g_failures;
+    return Summary("fluent_lifecycle_test");
 }

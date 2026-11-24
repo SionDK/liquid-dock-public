@@ -27,10 +27,7 @@ static bool g_testElevated = false;
 static HWND g_fakeExplorer = nullptr;
 static HWND TestExplorerTaskbar() { return g_fakeExplorer; }
 #define ExplorerTaskbar TestExplorerTaskbar
-#include "../src/tray_host.cpp"
-#include "../src/tray_host_icons.cpp"
-#include "../src/tray_host_settings.cpp"
-#include "../src/tray_host_widget.cpp"
+#include "parts_tray_host.inc"
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
@@ -92,6 +89,19 @@ static bool Logged(const wchar_t* part) {
     for (auto& l : g_logLines) if (l.find(part) != std::wstring::npos) return true;
     return false;
 }
+// The module's lines ("fluentflyout: ...", or those starting with `prefix`) since a mark, in order
+// (characterization: the words it writes now)
+static size_t LogMark() {
+    std::lock_guard<std::mutex> lk(g_logMu);
+    return g_logLines.size();
+}
+static std::vector<std::wstring> FluentLines(size_t from, const wchar_t* prefix = L"fluentflyout: ") {
+    std::lock_guard<std::mutex> lk(g_logMu);
+    std::vector<std::wstring> out;
+    for (size_t i = from; i < g_logLines.size(); ++i)
+        if (!g_logLines[i].compare(0, wcslen(prefix), prefix)) out.push_back(g_logLines[i]);
+    return out;
+}
 void Log(const wchar_t* fmt, ...) {
     wchar_t buf[1024];
     va_list ap; va_start(ap, fmt);
@@ -105,34 +115,18 @@ void Log(const wchar_t* fmt, ...) {
     WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8, sizeof(utf8), nullptr, nullptr);
     std::printf("  log: %s\n", utf8);
 }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
-}
-std::wstring FromUtf8(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-    return w;
-}
+#define TEST_SUPPORT_QPC_NOW
+#define TEST_SUPPORT_FROM_UTF8
+#include "test_support.h"
 
-static int g_failures = 0;
+static int g_failures = 0, g_checks = 0;   // g_checks: Check()s run (the last line's count)
 static void Check(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
+    ++g_checks;
     if (!ok) ++g_failures;
 }
 
-static void Pump() {
-    MSG m;
-    while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
-}
-
-static bool WaitFor(const std::function<bool()>& cond, int ms) {
-    for (int i = 0; i < ms / 20; ++i) { Pump(); if (cond()) return true; Sleep(20); }
-    return cond();
-}
+#include "fluent_harness.h"
 
 // a window on its own thread with a message loop (FluentFlyout's widget window, the fake Explorer)
 struct WindowThread {
@@ -178,13 +172,6 @@ static void WriteSettings(const std::wstring& body, int secondsAgo) {
     CloseHandle(f);
 }
 
-static void SetSessions(std::vector<std::wstring> ids) {
-    std::lock_guard<std::mutex> lk(fluentflyout::g_mediaMu);
-    fluentflyout::g_sessions = std::move(ids);
-    fluentflyout::g_mediaKnown = true;
-    ++fluentflyout::g_mediaVersion;
-}
-
 static HWND MakeFlyout(int x, int y, int w, int h) {
     static bool registered = false;
     if (!registered) {
@@ -198,8 +185,6 @@ static HWND MakeFlyout(int x, int y, int w, int h) {
     return f;
 }
 
-static RECT Rect(HWND h) { RECT r{}; GetWindowRect(h, &r); return r; }
-
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -210,7 +195,7 @@ int main() {
 
     // ---- FluentFlyout's settings
     {
-        auto s = fluentflyout::ParseSettings(LR"(<?xml version="1.0" encoding="utf-8"?>
+        auto s = fluentsettings::Parse(LR"(<?xml version="1.0" encoding="utf-8"?>
 <UserSettings xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <Position>0</Position>
   <FlyoutAnimationSpeed>1</FlyoutAnimationSpeed>
@@ -231,9 +216,9 @@ int main() {
               "settings.xml: switches and numbers");
         Check(s.filtering && s.filterMode == 0 && s.allowed.empty() && s.blocked.size() == 2 && s.blocked[0] == L"Spotify" && s.blocked[1] == L"Tom & Jerry",
               "settings.xml: app lists, an empty one and an escaped name");
-        auto d = fluentflyout::ParseSettings(L"<UserSettings>\n</UserSettings>");
+        auto d = fluentsettings::Parse(L"<UserSettings>\n</UserSettings>");
         Check(d.loaded && !d.widgetEnabled && !d.hideCompletely && d.animationSpeed == 2 && d.widgetMonitor == 0, "missing values: FluentFlyout's defaults");
-        Check(!fluentflyout::ParseSettings(L"<html>no</html>").loaded, "another file is not taken for its settings");
+        Check(!fluentsettings::Parse(L"<html>no</html>").loaded, "another file is not taken for its settings");
     }
     WriteSettings(L"<TaskbarWidgetEnabled>true</TaskbarWidgetEnabled>\r\n<TaskbarWidgetHideCompletely>true</TaskbarWidgetHideCompletely>\r\n"
                   L"<FlyoutAnimationSpeed>1</FlyoutAnimationSpeed>\r\n", 60);
@@ -538,8 +523,17 @@ int main() {
     {
         Check(!wcscmp(fluentflyout::kSettingsEvent, L"FluentFlyout_OpenSettings"), "the dock sets FluentFlyout's event (its name in FluentFlyout's MainWindow)");
         HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, LD_FLUENT_SETTINGS_EVENT);   // what FluentFlyout waits on, under the test's name
+        const DWORD pid = fluentflyout::g_pid;
+        fluentflyout::g_pid = 0;   // no FluentFlyout found: it returns before the event
+        size_t mark = LogMark();
+        Check(ev && !fluentflyout::OpenSettings() && WaitForSingleObject(ev, 0) == WAIT_TIMEOUT && FluentLines(mark).empty(),
+              "\"open its settings\" with no FluentFlyout found: nothing asked, no line");
+        fluentflyout::g_pid = pid;
+        mark = LogMark();
         // without the event OpenSettings would start "FluentFlyout" again: this test
         Check(ev && fluentflyout::OpenSettings() && WaitForSingleObject(ev, 0) == WAIT_OBJECT_0, "\"open its settings\" sets FluentFlyout's event");
+        Check(FluentLines(mark) == std::vector<std::wstring>({ L"fluentflyout: asked FluentFlyout to open its settings" }),
+              "...the log: \"asked FluentFlyout to open its settings\"");
         if (ev) CloseHandle(ev);
     }
 
@@ -548,16 +542,22 @@ int main() {
         WindowThread secondary;
         secondary.Run(kTestSecondary, L"");
         fluentflyout::g_fileSetting = 0; fluentflyout::g_fileAt = NowSeconds() - 5;   // the file was read earlier
+        const size_t parentMark = LogMark();
         SetParent(widget.hwnd, secondary.hwnd);
         fluentflyout::Tick(NowSeconds());
         HMONITOR there = MonitorFromWindow(secondary.hwnd, MONITOR_DEFAULTTONEAREST);
-        Check(fluentflyout::g_parentKind == fluentflyout::ParentKind::Explorer && fluentflyout::g_shownMonitor == there &&
+        Check(fluentflyout::g_parentKind == fluentflyout::ParentKind::ExplorerSecondary && fluentflyout::g_shownMonitor == there &&
               fluentflyout::g_shownAt > fluentflyout::g_fileAt, "an Explorer taskbar as its parent tells FluentFlyout's monitor");
         Check(fluentflyout::WidgetMonitor() == there && fluentflyout::FindWidget() == widget.hwnd, "...the slot goes there; the widget is still found");
         SetParent(widget.hwnd, FindWindowW(LD_TRAY_CLASS, nullptr));   // FluentFlyout's next tick: into the dock's window
         SetWindowPos(widget.hwnd, HWND_TOP, 0, 0, hostW, hostH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         fluentflyout::Tick(NowSeconds());
         Check(fluentflyout::g_parentKind == fluentflyout::ParentKind::Host, "back in the dock's window");
+        // where it is, by the production tray host's window (the other lines name the real monitors: not looked at)
+        Check(FluentLines(parentMark, L"fluentflyout: widget window is in ") ==
+                  std::vector<std::wstring>({ L"fluentflyout: widget window is in a secondary Explorer taskbar (hidden by the dock)",
+                                              L"fluentflyout: widget window is in the dock's window" }),
+              "...the log: \"widget window is in a secondary Explorer taskbar (hidden by the dock)\", then \"... in the dock's window\"");
         secondary.Quit();
     }
 
@@ -601,5 +601,7 @@ int main() {
     DeleteFileW(g_settingsFile.c_str());
     RegDeleteTreeW(HKEY_CURRENT_USER, LD_TRAY_SETTINGS_PARENT);
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
+    std::printf("fluent_flyout_test: %s (%d checks, %d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_checks, g_failures,
+                g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -8,19 +8,17 @@
 #include "tray_host.h"
 #include "fluent_flyout.h"
 #include <shellapi.h>
-
-extern Settings g_settings;
-extern HWND g_mainWnd;
-constexpr UINT WM_APP_REBUILD = WM_APP + 1;
-constexpr UINT WM_APP_AUTOSTART = WM_APP + 2;
-constexpr UINT WM_APP_RELAYOUT = WM_APP + 3;    // shape settings changed: lay the docks out again in place
-constexpr UINT WM_APP_SETTINGS = WM_APP + 4;    // open the settings window
-constexpr UINT WM_APP_HOTKEY = WM_APP + 5;      // the reveal shortcut setting changed
-constexpr UINT WM_APP_TRAYHOST = WM_APP + 6;    // the tray icons setting changed: start or stop the tray host
-bool RevealHotkeyFailed();                       // the chosen shortcut belongs to another program
-constexpr UINT WM_APP_APPBAR = WM_APP + 40;     // shell notifications for an always-shown dock
+#include "main.h"   // g_mainWnd, WM_APP_*
 
 void OpenTaskManager();
+UINT TaskbarCreatedMessage();   // Explorer announces a (new) taskbar with it (dock_window.cpp)
+namespace sensorlogic { struct PanelFit; }   // sensor_logic.h (Dock::PanelRowsNow)
+// a temperature in whole degrees ("62°", "62°C" with the unit, "--°" unknown) and its colour by severity (red hot,
+// orange warm, otherwise `normal`): the sensor cell and its peek (dock_sensors.cpp, where they are) and the panel (dock_panel.cpp)
+std::wstring TempStr(float t, bool unit = false);
+D2D1_COLOR_F SevColor(int sev, D2D1_COLOR_F normal, float a);
+
+#include "dock_shared.h"   // IconGapRatio, ThicknessRatio, StackButtons; g_settingsHold (the settings window holds the docks up)
 
 // One dock per monitor. The implementation is split by concern:
 //   dock.cpp           per-frame state (reveal, magnify, drag, bounce), model sync, window-in-front rules, region
@@ -28,7 +26,8 @@ void OpenTaskManager();
 //   dock_input.cpp     mouse messages, clicks, drag and drop (WndProc)
 //   dock_layout.cpp    sizes, positions, u/v coordinates and hit testing
 //   dock_render.cpp    glass and Direct2D drawing
-//   dock_sensors.cpp   system monitor drawing: sensor and battery cells, overheat peek, panel
+//   dock_sensors.cpp   system monitor drawing: sensor and battery cells, overheat peek
+//   dock_panel.cpp     the "PC 상태" panel: what fits in its room, its drawing
 //   dock_controls.cpp  the small tray buttons, clicks and menus
 //   dock_notify.cpp    the taskbar's tray icons
 //   dock_record.cpp    the built-in screen recorder
@@ -49,8 +48,6 @@ public:
     // set by the main loop before the docks' Update: nobody sees the screen (locked, a UAC prompt, the display
     // off). The sensor cell's changes wait meanwhile (one redraw when it is seen again).
     static inline bool screenUnseen = false;
-    static inline bool settingsOpen = false;   // the shape settings window keeps every dock shown...
-    static inline HWND settingsWnd = nullptr;  // ...while that window can be seen (SettingsHold in dock.cpp)
     static void ResetNotifyBitmaps();          // tray icon pictures belong to the old device after a GPU reset
     // FluentFlyout's widget window went where a dock asked this frame (main hides it when none did)
     static inline bool widgetPlaced = false;
@@ -79,7 +76,6 @@ private:
     struct Hit {
         HitKind kind = HitNone; int slot = -1; ButtonId button = ButtonId::Count; int notify = -1;
         bool Is(ButtonId b) const { return kind == HitButton && button == b; }
-        bool operator==(const Hit& o) const { return kind == o.kind && slot == o.slot && button == o.button && notify == o.notify; }
     };
     static Hit ButtonHit(ButtonId b) { Hit h; h.kind = HitButton; h.button = b; return h; }
 
@@ -153,27 +149,51 @@ private:
     float ButtonIconScale() const { return stackButtons ? 0.8f : 1.0f; }
     void Metrics();
     void ApplyFit(float dt);
-    void Layout(double now);
+    void Layout();
     Hit HitTestUV(float u, float v);
     void ScreenToUV(POINT p, float& u, float& v) const;
     void ClientToUV(int x, int y, float& u, float& v) const;
+    Hit HitAtClient(LPARAM lp);            // a mouse message's point (dock_input.cpp)
     D2D1_POINT_2F W(float u, float v) const;
     D2D1_RECT_F RectUV(float u0, float u1, float v0, float v1) const;
     POINT ScreenPointUV(float u, float v) const;
     RECT  BarScreenRect() const;
+    // A rectangle in window coordinates on the screen, outward to whole pixels (floor / ceil: what the window in
+    // front must cover, the preview's anchor, a tray icon's) or cut toward zero ((LONG): the bar and the widget's
+    // slot handed to FluentFlyout, BarScreenRect). The two differ by a pixel and are kept apart.
+    RECT ScreenRectOut(const D2D1_RECT_F& r) const {
+        return { winX + (LONG)std::floor(r.left), winY + (LONG)std::floor(r.top), winX + (LONG)std::ceil(r.right), winY + (LONG)std::ceil(r.bottom) };
+    }
+    RECT ScreenRectTrunc(const D2D1_RECT_F& r) const { return { winX + (LONG)r.left, winY + (LONG)r.top, winX + (LONG)r.right, winY + (LONG)r.bottom }; }
+    // the bar across the edge where it is drawn now (slid toward the edge by hideOff while it hides); where it
+    // sits when up (no hideOff: KeepInFront, the FluentFlyout view) is margin .. margin + barThick
+    float BarV0() const { return margin - hideOff; }
+    float BarV1() const { return margin + barThick - hideOff; }
+    void SplitHalf(D2D1_RECT_F& r, int half) const;   // a cell shared by two (half 0 / 1; -1: the whole cell)
+    // the top of a fully magnified icon + 10 px (UnpinLine and UpdateRegion: the same line, dock.h UnpinLine)
+    float MagnifiedTop() const { return margin + pad + base * mag + 10 * scale; }
+    // along the dock: on the sensor cell or just beside it (the bridge to its panel)
+    bool NearSensorCell(float u) const { return u >= cells[HitSensor].u0 - 4 * scale && u <= cells[HitSensor].u1 + 4 * scale; }
+    bool RevealShown() const { return reveal.x > 0.002f || reveal.target > 0.5f; }      // up, or on its way up
+    bool PanelShown() const { return panelAlpha.x > 0.01f || panelAlpha.target > 0.5f; }   // the panel shows or opens
     float TextWidth(IDWriteTextFormat* f, const std::wstring& s);
     D2D1_SIZE_F TextSize(IDWriteTextFormat* f, const std::wstring& s);
     IDWriteTextFormat* ClockFont(bool date = false) const;
+    const std::wstring& ClockTime() const;   // the clock's time text: "15:45" (settings clockFormat 1) or Windows' format
+    enum class SensorText { Value, Line, Label };   // vertical value, horizontal "CPU 50°" line, vertical label
+    IDWriteTextFormat* SensorFont(SensorText t) const;
     void ComputePanelRect();
     bool CursorInPanel() const;
 
     // ---- tray icons (dock_notify.cpp): the icons Windows shows on its taskbar, between the hidden-icons
     // chevron and network / volume, two to a cell across the bar like the small buttons
-    struct NotifyCell { uint64_t key = 0; std::wstring tip; uint32_t imageVersion = 0; bool glyph = false; float u0 = 0, u1 = 0; int half = -1; };
+    struct NotifyCell {
+        uint64_t key = 0; std::wstring tip; uint32_t imageVersion = 0; bool glyph = false; float u0 = 0, u1 = 0; int half = -1;
+        float Mid() const { return (u0 + u1) * 0.5f; }
+    };
     std::vector<NotifyCell> notifyCells;
     int notifyVersion = -1;
     double nextNotifySync = 0;
-    int hoverNotify = -1;
     uint64_t pressNotifyKey = 0;
     uint64_t notifyHoverKey = 0; double notifyHoverSince = 0, nextNotifyMove = 0; bool notifyEntered = false;
     POINT lastNotifyCursor{}; RECT notifyHoverAnchor{};
@@ -212,13 +232,51 @@ private:
 
     // ---- frame (dock.cpp), window and app bar (dock_window.cpp), input (dock_input.cpp)
     void SyncSlots();
+    // Update's steps (dock.cpp), run in this order once a frame. FrameState holds what a step worked out for the
+    // steps after it, as it was then - read again, it could differ within the frame (the press safety lets a press
+    // go after keep was taken; the dock told to come up after insideDock was).
+    struct FrameState {
+        double now; float dt; POINT cursor;
+        bool wasVisible = false;                // FrameStart: reveal.x > 0.002f before this frame moved it
+        float prevU = 0, prevV = 0;             // FrameStart: the pointer's u/v of the frame before
+        bool inMonitor = false;                 // FrameStart
+        HWND front = nullptr; HMONITOR fsMonitor = nullptr; bool fullscreen = false;   // FrameFullscreen
+        bool insideDock = false, wasUp = false, keep = false, inPreview = false, inFlyout = false, alwaysShown = false;   // FrameShowHide
+        bool anim = false;                      // FrameSprings on: something still moves
+    };
+    void FrameStart(FrameState& f);
+    void FrameFullscreen(FrameState& f);
+    void FrameBounceStarts(const FrameState& f);
+    void FrameShowHide(FrameState& f);
+    void FrameMagnify(const FrameState& f);
+    void FramePressDrag(const FrameState& f);
+    void FrameSprings(FrameState& f);
+    void FramePlace(const FrameState& f);
+    void FrameHover(const FrameState& f);
+    void FramePanel(FrameState& f);
+    void FrameTooltip(FrameState& f);
+    void FrameCapture(const FrameState& f);
     void UpdateRegion();
     // Always-shown dock (auto-hide off, or a secondary monitor set to always show; never where OLED
     // mode is on): registered as an app bar so maximised windows stop at it, like the taskbar.
-    // (its Explorer, retry time and failure: appBarShell, nextAppBarTry, appBarFailing at the end of the class)
     bool AlwaysShown() const;
     void UpdateAppBar(bool want, double now = 0);
+    void RemoveAppBar();                   // ABM_REMOVE; appBar off
+    void OnTaskbarCreated();               // a new Explorer: register again (dock_window.cpp; WndProc)
     bool appBar = false; RECT appBarRect{};
+    HWND appBarShell = nullptr;            // Explorer's taskbar the app bar was registered with (a new one knows none)
+    double nextAppBarTry = 0;              // ABM_NEW failed (no Explorer yet), or a strip is registered again: when to ask (0: at once)
+    bool appBarFailing = false;            // ABM_NEW has failed since the strip was last wanted or held (logged once)
+    // The work area must leave the strip out (CheckAppBar): looked at a second after the strip is claimed and when the
+    // work area changes (WM_SETTINGCHANGE). Not so: registered again, up to kAppBarRetries times until the strip is
+    // wanted anew, claimed again or Explorer is new.
+    void CheckAppBar(double now);
+    RECT appBarGranted{};                  // the strip as the shell took it (ABM_SETPOS's answer)
+    UINT appBarEdge = ABE_BOTTOM;          // ...on that edge
+    double appBarCheckAt = 0;              // when to look at the work area (0: not due)
+    bool workAreaChanged = false;          // WM_SETTINGCHANGE (SPI_SETWORKAREA) came: looked at shortly
+    int appBarMisses = 0;                  // registered again since the work area last left the strip out
+    static constexpr int kAppBarRetries = 3;
     void StartBounce(Slot& s, int count, bool loop, bool hiddenMode, double now);
     bool CreateDeviceResources();
     // Start, search, quick settings or the notification centre is in front on this monitor
@@ -236,15 +294,24 @@ private:
     int  PopupMenu(HMENU m);
     void ToggleOled();
 
-    // ---- drawing (dock_render.cpp; sensor and battery cells, peek and panel: dock_sensors.cpp)
+    // ---- drawing (dock_render.cpp; sensor and battery cells, peek: dock_sensors.cpp; panel: dock_panel.cpp)
+    // Render's parts, in the order it draws them: the glass (Direct3D, before BeginDraw), then in one Direct2D
+    // draw the app icons, the bar's contents (while it shows) with its hover highlight, what is drawn over them
+    void DrawGlass(bool glassVisible);
+    void DrawSlotIcons(ID2D1DeviceContext2* dc, float vis);
+    void DrawBarContents(ID2D1DeviceContext2* dc, float vis);
+    void DrawHoverHighlight(ID2D1DeviceContext2* dc, float v0, float v1, float vis);
+    void DrawOverlays(bool glassVisible);
     void DrawIcon(Slot& s, float u, float vBottom, float size, float alpha);
     void DrawStartIcon(D2D1_RECT_F r, float alpha);
     void DrawTooltip(const std::wstring& text, float u, float vBase);
-    void DrawShadowText(const std::wstring& t, IDWriteTextFormat* f, D2D1_RECT_F r, float u, float alpha);
+    void DrawShadowText(const std::wstring& t, IDWriteTextFormat* f, D2D1_RECT_F r, float u, float alpha);   // in the ink at u
+    void DrawShadowText(const std::wstring& t, IDWriteTextFormat* f, D2D1_RECT_F r, float ink, float alpha, D2D1_COLOR_F color);
     void DrawSensorCell(float v0, float v1, float vis);
     void DrawBatteryCell(float v0, float v1, float vis);
     void DrawSensorPeek();
     void DrawPanel();
+    struct PanelPaint;                     // DrawPanel's values, helpers and blocks (dock_panel.cpp)
     float InkAt(float u) const;
     D2D1_COLOR_F Ink(float u, float alpha) const;
 
@@ -279,7 +346,7 @@ private:
     bool glassKept = false;                // the last captured backdrop stays in use while the dock stays shown
                                            // (capture paused during a game elsewhere, or restarting)
     int lastStructure = -1, lastSysVersion = -1;
-    int hoverSlot = -1; HitKind hoverKind = HitNone; ButtonId hoverButton = ButtonId::Count;
+    Hit hover;                             // what the pointer is over (Update; none while hidden or dragging)
     std::wstring tooltipText; float tooltipU = 0, tooltipV = 0;
 
     std::vector<Slot> slots;
@@ -299,25 +366,23 @@ private:
     float panelW = 0, panelH = 0;
     bool panelVramRoom = false, panelVramTempRoom = false;
     D2D1_RECT_F panelRect{};               // window coords
-    // the "PC 상태" panel's rows (dock_sensors.cpp): DIP sizes, and what fits in the room panelH leaves.
+    // the "PC 상태" panel's rows (dock_panel.cpp): DIP sizes, and what fits in the room panelH leaves.
     // 450 DIP wide with two modules / drives a row on a horizontal dock (the reference picture); 320 DIP with
     // one a row on a vertical one, where the panel's width is the window's thickness T (450 would make T 150
     // DIP thicker than the old 300 DIP panel, the window a third larger; 320: 20 DIP, about 4 %).
     static float PanelWidthDip(bool vertical) { return vertical ? 320.f : 450.f; }
     static int PanelColumns(bool vertical) { return vertical ? 1 : 2; }
     static constexpr int kPanelMaxDimmRows = 4, kPanelMaxDriveRows = 6;   // the room a window is built with, at most
-    // vram: with the GPU's memory block (its line and bar as the RAM's, vramTemp: and its temperature row)
-    // between the memory rows and the drives (sensorlogic::PanelHeightDip)
-    static float PanelHeightDip(int dimmRows, int driveRows, bool vram, bool vramTemp = true);
-    struct PanelRows {
-        int dimmRows = 0, driveRows = 0;   // PanelColumns modules / drives a row
-        bool vram = false;                 // the VRAM block is shown (the GPU has memory of its own, and the room holds it)
-        bool vramTemp = false;             // ...with its temperature row
-        int drivesShown = 0, drivesHidden = 0;   // hidden: more than the room ("SSD 외 N개")
-        int dimmsShown = 0, dimmsHidden = 0;     // ...("RAM 외 N개"); drives keep their rows first
-        float height = 0;                  // DIP
-    };
-    PanelRows PanelRowsNow() const;
+    // What it shows now (sensorlogic::PanelFit): dimmRows, driveRows (PanelColumns modules / drives a row); vram 1:
+    // the VRAM block is shown (the GPU has memory of its own, and the room holds it), 2: ...with its temperature row;
+    // drivesHidden: more than the room ("SSD 외 N개"), dimmsHidden ("RAM 외 N개": drives keep their rows first); height in DIP.
+    sensorlogic::PanelFit PanelRowsNow() const;
+    // The 그래프 power view's sparkline in a card (0 CPU, 1 GPU; dock_panel.cpp): its area and its line, as paths in
+    // pixels from the card's graph box's top-left corner (drawn moved there), built again only when the sample
+    // (g_sensors.powerVersion) or the box's size (w, h) changed - not while the panel slides in its fade or follows
+    // the sensor cell. Device-independent (the factory's): kept across a GPU reset.
+    struct PanelSpark { ComPtr<ID2D1PathGeometry> fill, line; int version = -1; float w = -1, h = -1; };
+    PanelSpark panelSpark[2];
     int lastSensorVersion = -1;   // every sample: a redraw only while this dock's panel shows
     int lastCellVersion = -1;     // the sensor cell's look (g_sensors.cellVersion): a redraw while the screen is seen
     // overheat bounce of the sensor cell
@@ -327,6 +392,7 @@ private:
     // input
     int pressSlot = -1; HitKind pressKind = HitNone; ButtonId pressButton = ButtonId::Count;
     POINT pressPt{};
+    double pressUpSince = -1;              // a press under way: since when its primary button is seen up (-1: held)
     bool startInFrontAtPress = false;   // Start was open when the start button went down: the click closes it
     bool dragging = false;
     int dropIndex = -1; bool dropRemove = false;
@@ -377,20 +443,19 @@ public:
     void StopRecording();
     void SuspendRecording();
     void RecordTick(double now);
-    bool Recording() const { return recording; }
+    bool Recording() const { return rec.recording; }
 private:
-    bool recording = false;
-    double recNext = 0;
-    int recFrames = 0, recW = 0, recH = 0, recSlot = 0;
-    RECT recCrop{};
-    FILE* recFile = nullptr;
-    RTTexture dockFrame, fullTex, recRT;
-    ComPtr<ID3D11Texture2D> recStage[3];
-    ComPtr<ID2D1Bitmap1> recTarget;
-
-    // ---- frame, window and input (dock.cpp, dock_window.cpp, dock_input.cpp), continued
-    HWND appBarShell = nullptr;            // Explorer's taskbar the app bar was registered with (a new one knows none)
-    double nextAppBarTry = 0;              // ABM_NEW failed (no Explorer yet): when to ask again (0: at once)
-    bool appBarFailing = false;            // ABM_NEW has failed since the strip was last wanted or held (logged once)
-    double pressUpSince = -1;              // a press under way: since when its primary button is seen up (-1: held)
+    // The recorder's state (dock_record.cpp). Update and Render look at recording, dockFrame (Render copies the
+    // dock's frame there) and fullTex (the capture copies the whole monitor there) only.
+    struct DockRecorder {
+        bool recording = false;
+        double next = 0;                   // when the next frame is due
+        int frames = 0, w = 0, h = 0, slot = 0;   // frames written; the output's size; readback slot (two frames late)
+        RECT crop{};                       // monitor px
+        FILE* file = nullptr;              // frames.raw
+        RTTexture dockFrame, fullTex, rt;  // rt: the output frame
+        ComPtr<ID3D11Texture2D> stage[3];
+        ComPtr<ID2D1Bitmap1> target;
+    };
+    DockRecorder rec;
 };

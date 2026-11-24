@@ -2,9 +2,11 @@
 // from a raw SMBIOS table, HWiNFO's memory temperatures matched to slots, the panel's rows and footer counts,
 // the GPU's memory block (VRAM: when it shows, where its amounts and temperature come from), the sensor
 // thread's time-based periods, the panel-open linger, the dock cell's key and text, and the sensor settings
-// (the source, the six show switches) with the panel's layout that follows from them. Any C++20 compiler:
+// (the source, the six show switches) with the panel's layout that follows from them, and the power draw
+// (src/sensor_power.h: when it is read, its 60 s history, the graph's scale and points, its texts). Any C++20 compiler:
 //   g++ -std=c++20 tests/sensor_logic_test.cpp        cl /std:c++20 /EHsc /utf-8 tests\sensor_logic_test.cpp
 #include "../src/sensor_logic.h"
+#include "../src/sensor_power.h"
 #include "portable_check.h"
 #include <cstdint>
 #include <string>
@@ -529,6 +531,172 @@ void Settings() {
     Check(BuildVram(in).nvmlTemp && BuildVram(in).temp == 50, "NVML with one: NVML's");
 }
 
+// The power draw (powerView 없음 / 그래프 / 요약 and its two switches): when each device's is shown and read, the
+// 60 s history placed by time, the graph's scale and points, and the texts the panel draws from it.
+void Power() {
+    // the effective rules
+    ShowItems d;
+    Check(d.powerView == kPowerOff && d.cpuPower && d.gpuPower && !d.CpuPowerShown() && !d.GpuPowerShown() && !d.PowerGraph() && !d.PowerSummary(),
+          "power, the defaults: 없음 (both switches on underneath) - neither shown");
+    ShowItems g = d; g.powerView = kPowerGraph;
+    Check(g.PowerGraph() && !g.PowerSummary() && g.CpuPowerShown() && g.GpuPowerShown(), "그래프 with HWiNFO: both shown");
+    ShowItems s = d; s.powerView = kPowerSummary;
+    Check(s.PowerSummary() && s.CpuPowerShown() && s.GpuPowerShown(), "요약 with HWiNFO: both shown");
+    for (int src : { kSourceOff, kSourcePawnIO }) {
+        ShowItems x = g; x.source = src;
+        Check(!x.CpuPowerShown() && x.GpuPowerShown(), "그래프 with 온도 읽기 끄기 or PawnIO: no CPU power (HWiNFO's only), the GPU's still");
+    }
+    ShowItems noTemp = g; noTemp.cpuTemp = false;
+    Check(noTemp.CpuPowerShown(), "the CPU's temperature hidden: its power still (the card is there)");
+    ShowItems cpuOff = g; cpuOff.cpuPower = false;
+    ShowItems gpuOff = g; gpuOff.gpuPower = false;
+    ShowItems gpuHidden = g; gpuHidden.gpu = false;
+    Check(!cpuOff.CpuPowerShown() && cpuOff.GpuPowerShown() && gpuOff.CpuPowerShown() && !gpuOff.GpuPowerShown() && !gpuHidden.GpuPowerShown(),
+          "CPU 전력 / GPU 전력 off: that one only; the GPU hidden (its card gone): no GPU power");
+
+    // when it is read: 그래프 every pass, 요약 only while a panel is open, never unshown
+    Check(PowerReadDue(kPowerGraph, true, false) && PowerReadDue(kPowerGraph, true, true), "그래프: read closed and open");
+    Check(!PowerReadDue(kPowerSummary, true, false) && PowerReadDue(kPowerSummary, true, true), "요약: read only while a panel is open");
+    Check(!PowerReadDue(kPowerOff, true, true) && !PowerReadDue(kPowerGraph, false, true) && !PowerReadDue(kPowerSummary, false, true),
+          "없음, or not shown: never read");
+
+    // the history: the last 60 s by time, 2 s and 1 s points mixed, the newest point before the window kept
+    std::vector<PowerPoint> h;
+    uint64_t t = 1000000;
+    for (int i = 0; i < 30; ++i, t += 2000) AddPowerPoint(h, t, 50.f + i);
+    Check(h.size() == 30 && h.front().ms == 1000000 && h.back().ms == 1058000, "a minute closed: 30 points 2 s apart, none dropped yet");
+    for (int i = 0; i < 20; ++i, t += 1000) AddPowerPoint(h, t, 100.f);
+    Check(h.back().ms == 1079000 && h.front().ms <= 1079000 - kPowerWindowMs && h[1].ms > 1079000 - kPowerWindowMs,
+          "20 s open (1 s apart): the window moved on, the newest point before it kept for the left edge");
+    Check(h.size() == 1 + 20 + 20, "...one before the window, 20 of the 2 s ones and the 20 new 1 s ones");
+    Check(PowerMax(h, 1079000) == 100.f, "PowerMax: the window's highest");
+    std::vector<PowerPoint> back = h;
+    AddPowerPoint(back, 5, 10.f);
+    Check(back.size() == 1 && back[0].ms == 5, "a time before the last point's: the history starts afresh");
+    AddPowerPoint(back, 5, 12.f);
+    Check(back.size() == 1 && back[0].watts == 12.f, "...the same time twice: one point, the later reading");
+    std::vector<PowerPoint> stale = { { 1000, 40.f }, { 2000, 41.f } };
+    TrimPower(stale, 200000);
+    Check(stale.size() == 1 && stale[0].ms == 2000 && PowerMax(stale, 200000) == 0, "readings stopped 3 minutes ago: only the last one kept, nothing in the window");
+
+    // the scale's steps and its steadiness
+    Check(PowerNiceCeil(0) == 0 && PowerNiceCeil(30) == 30 && PowerNiceCeil(31) == 40 && PowerNiceCeil(71.2f) == 80 && PowerNiceCeil(101) == 120 &&
+          PowerNiceCeil(140) == 150 && PowerNiceCeil(287) == 300 && PowerNiceCeil(360) == 400 && PowerNiceCeil(999) == 1000 && PowerNiceCeil(0.7f) == 0.8f,
+          "PowerNiceCeil: 1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8 x 10^k (30, 40, 80, 120, 150, 300, 400, 1000, 0.8)");
+    PowerScale sc;
+    Check(sc.Update(5) == 30 && sc.Update(24) == 30, "the floor: a CPU idling at 5 W still has a 30 W top (24 W with its 20 % room too)");
+    Check(sc.Update(26) == 40, "...26 W: 31.2 with its room, up to 40");
+    Check(sc.Update(61) == 80, "61 W: 73.2 with its room, up to 80 at once");
+    Check(sc.Update(59) == 80 && sc.Update(53) == 80 && sc.Update(45) == 80, "...59, 53 or 45 W: stays 80 (no flip with a load around 60)");
+    Check(sc.Update(44) == 60, "...the minute's highest 44 W (35 % under 60): down to 60");
+    Check(sc.Update(50) == 60 && sc.Update(51) == 80, "...60 holds up to 50 W (20 % room), 51 W goes back up to 80");
+    Check(sc.Update(61) == 80 && sc.Update(10) == 30, "...a peak again, then it left the window: down to the floor in one go");
+    int flips = 0; float last = sc.Update(60);
+    for (int i = 0; i < 60; ++i) { const float top = sc.Update(i % 2 ? 58.f : 62.f); flips += top != last; last = top; }
+    Check(flips <= 1, "a load alternating 58 / 62 W every second: the top changes once at most, not every second");
+    bool under = true;
+    PowerScale rising;
+    for (float w = 1; w < 2000; w *= 1.07f) under = under && w / rising.Update(w) <= 1 / kPowerRiseMargin + 1e-4f;
+    Check(under, "a rising load (1 .. 2000 W): the line never above 1/1.2 of the top (clear of the box's top edge, dock_panel.cpp kSparkTop)");
+    PowerScale big;
+    Check(big.Update(287) == 400 && big.Update(350) == 500 && big.Update(300) == 500 && big.Update(200) == 300, "a GPU without its limit: 400, 500, kept, then 300");
+
+    // the graph's points
+    PowerSeries ps;
+    ps.top = 100;
+    ps.history = { { 1000, 20.f }, { 41000, 40.f }, { 61000, 60.f }, { 71000, 120.f } };
+    std::vector<SparkPoint> sp = PowerSpark(ps, 71000);
+    Check(sp.size() == 3 && sp[0].start && std::fabs(sp[0].x - 0.5f) < 0.001f && std::fabs(sp[0].y - 0.4f) < 0.001f && sp[1].start && sp[2].start,
+          "PowerSpark: a point before the window that a gap parts from the next is not cut in; points 20 and 10 s apart are runs of their own");
+    PowerSeries run;
+    run.top = 80;
+    run.history.push_back({ 9000, 20.f });
+    for (uint64_t ms = 11000; ms <= 69000; ms += 2000) run.history.push_back({ ms, 40.f });   // 2 s apart (closed)
+    run.history.push_back({ 70000, 40.f });                                                   // 1 s later (opened)
+    sp = PowerSpark(run, 70000);
+    Check(sp.size() == 32 && sp[0].x == 0 && sp[0].start && std::fabs(sp[0].y - 0.375f) < 0.001f,
+          "...a regular history: the point 1 s before the window cut at x 0 halfway to the next (30 W of 80)");
+    bool byTime = true, oneRun = true;
+    for (size_t i = 1; i < sp.size(); ++i) {
+        byTime = byTime && std::fabs(sp[i].x - (float)((run.history[i].ms - 10000.0) / 60000.0)) < 0.0001f && sp[i].y == 0.5f;
+        oneRun = oneRun && !sp[i].start;
+    }
+    Check(byTime && oneRun && sp.back().x == 1, "...every point placed by its time (2 s and 1 s steps alike), 40 W half the top, one run, the newest at x 1");
+    std::vector<SparkPoint> spiky = PowerSpark(ps, 71000);
+    Check(spiky.back().y == 1.f, "a reading over the top (120 of 100 W): clamped to the top");
+    PowerSeries gap;
+    gap.top = 50;
+    gap.history = { { 20000, 10.f }, { 22000, 10.f }, { 40000, 20.f }, { 42000, 20.f } };
+    sp = PowerSpark(gap, 42000);
+    Check(sp.size() == 4 && sp[0].start && !sp[1].start && sp[2].start && !sp[3].start, "a gap of 18 s (the dock asleep): a new run of the line after it");
+    Check(PowerSpark(PowerSeries{}, 1000).empty(), "no history: no points");
+    PowerSeries one; one.top = 50; one.history = { { 1000, 10.f } };
+    PowerSeries noTop; noTop.history = gap.history;
+    Check(PowerSpark(one, 1000).empty() && PowerSpark(noTop, 42000).empty(), "one point, or no top: nothing to draw");
+
+    // the texts
+    Check(PowerText(71.4f) == L"71 W" && PowerText(286.6f) == L"287 W" && PowerText(NAN) == L"--" && PowerText(-1) == L"0 W", "PowerText: whole watts, \"--\" unknown");
+    PowerData pd;
+    pd.cpu.read = pd.gpu.read = true; pd.cpu.watts = 71.4f; pd.gpu.watts = 286.6f;
+    Check(PowerTotalText(g, pd) == L"합계 358 W", "the 그래프 footer: \"합계 358 W\" (71 + 287: the figures the cards show)");
+    Check(PowerTotalText(s, pd).empty() && PowerTotalText(cpuOff, pd).empty() && PowerTotalText(gpuHidden, pd).empty(),
+          "...not in 요약, nor with one of them not shown");
+    PowerData half = pd; half.cpu.watts = NAN;
+    Check(PowerTotalText(g, half).empty(), "...nor with one unknown");
+    std::vector<PowerFooterItem> items = PowerSummaryItems(s, pd);
+    Check(items.size() == 2 && items[0].device == 0 && items[0].name == L"CPU" && items[0].value == L"71 W" && items[1].device == 1 &&
+          items[1].value == L"287 W", "the 요약 footer: CPU 71 W, GPU 287 W (CPU first)");
+    items = PowerSummaryItems(s, half);
+    Check(items.size() == 1 && items[0].device == 1, "...an unknown one left out");
+    PowerData none = pd; none.cpu.watts = none.gpu.watts = NAN;
+    Check(PowerSummaryItems(s, none).empty() && PowerSummaryItems(g, pd).empty() && PowerSummaryItems(d, pd).empty(),
+          "...nothing when neither is known; nothing in 그래프 or 없음");
+    Check(CpuPowerHint(g, half) && !CpuPowerHint(g, pd) && !CpuPowerHint(s, half), "the CPU card's hint: 그래프 with the CPU's power read and unknown; not in 요약");
+    PowerData notYet = half; notYet.cpu.read = false;
+    ShowItems gPawn = g; gPawn.source = kSourcePawnIO;
+    Check(!CpuPowerHint(g, notYet) && !CpuPowerHint(gPawn, half), "...not before the first read, not when the CPU's is not shown (PawnIO)");
+    Check(std::wstring(CpuPowerHintText(true)) == L"HWiNFO 전력: 클릭" && std::wstring(CpuPowerHintText(false)) == L"HWiNFO Gadget 필요",
+          "...its text: HWiNFO up \"HWiNFO 전력: 클릭\" (as the temperature's \"HWiNFO 설정: 클릭\"), not running \"HWiNFO Gadget 필요\" (the temperature hint's words)");
+
+    // the click that shows the HWiNFO guide (Dock::Click): HWiNFO the source and running, and the CPU's temperature
+    // shown and missing, or the 그래프 card's power hint
+    for (bool panel : { false, true })
+        Check(HWiNFOGuideWanted(d, false, true, pd, panel) && !HWiNFOGuideWanted(d, true, true, pd, panel) && !HWiNFOGuideWanted(d, false, false, pd, panel),
+              panel ? "the guide, a click on the panel: the CPU's temperature missing with HWiNFO up (as before mod.40); not with it there, not with HWiNFO off"
+                    : "...a click on the sensor cell: the same for the temperature (the cell says it has none too)");
+    Check(HWiNFOGuideWanted(g, true, true, half, true) && !HWiNFOGuideWanted(g, true, true, pd, true) && !HWiNFOGuideWanted(s, true, true, half, true) &&
+          !HWiNFOGuideWanted(g, true, false, half, true) && !HWiNFOGuideWanted(gPawn, false, true, half, true),
+          "...the 그래프 CPU power hint too, on the panel (HWiNFO up); not in 요약, not with HWiNFO off, never with PawnIO");
+    Check(!HWiNFOGuideWanted(g, true, true, half, false) && HWiNFOGuideWanted(g, false, true, half, false),
+          "...but not from the sensor cell (it shows no power: its click stays Task Manager), unless the temperature is missing too");
+    ShowItems noTempShown = d; noTempShown.cpuTemp = false;
+    Check(!HWiNFOGuideWanted(noTempShown, false, true, pd, true) && !HWiNFOGuideWanted(noTempShown, false, true, pd, false),
+          "...the CPU's temperature hidden and no power view: Task Manager");
+
+    // the footer with the power draw: the steps that make it fit (the vertical dock's 284 DIP; widths in DIP about as
+    // drawn: counts 130, the left out 105 / short 25, the dots with names 140 / without 80, the total 50)
+    Check(PanelLeftOutShort(true, 2, true, 1) == L"외 3개" && PanelLeftOutShort(true, 2, false, 1) == L"외 2개" &&
+          PanelLeftOutShort(true, 0, true, 0).empty() && PanelLeftOutShort(false, 4, false, 2).empty(),
+          "the short left out: one count of what is shown and left out (\"외 3개\"), empty when nothing is");
+    PowerFooterPlan fp = PlanPowerFooter(414, 10, 130, 105, 25, 140, 80);
+    Check(!fp.powerShort && !fp.leftOutShort && fp.countsRoom == 414 - 265, "the horizontal dock (414): all of it in full");
+    fp = PlanPowerFooter(284, 10, 130, 0, 0, 140, 80);
+    Check(!fp.powerShort && !fp.leftOutShort && fp.countsRoom >= 130, "vertical (284), nothing left out: the dots with their names fit");
+    fp = PlanPowerFooter(284, 10, 130, 105, 25, 140, 80);
+    Check(fp.powerShort && fp.leftOutShort && fp.countsRoom == 284 - 125 && fp.countsRoom >= 130,
+          "vertical, drives and modules left out: the dots without names, \"외 3개\" - the counts whole");
+    fp = PlanPowerFooter(284, 10, 130, 50, 25, 140, 80);
+    Check(fp.powerShort && !fp.leftOutShort && fp.countsRoom >= 130, "vertical, \"SSD 외 2개\" alone: only the names go");
+    fp = PlanPowerFooter(284, 10, 130, 105, 25, 50, 0);
+    Check(fp.powerShort && !fp.leftOutShort && fp.countsRoom == 284 - 115, "그래프 on the vertical dock with the left out: the total goes (the cards show both)");
+    fp = PlanPowerFooter(284, 10, 130, 0, 0, 50, 0);
+    Check(!fp.powerShort && fp.countsRoom == 284 - 60, "...and stays when it fits");
+    fp = PlanPowerFooter(150, 10, 130, 105, 25, 140, 80);
+    Check(fp.powerShort && fp.leftOutShort && fp.countsRoom == 150 - 125, "too narrow for all: the counts are cut (step 3), the dots kept");
+    fp = PlanPowerFooter(60, 10, 130, 105, 25, 140, 80);
+    Check(fp.countsRoom == 0, "...never below no room");
+}
+
 int main() {
     Models();
     Smbios();
@@ -539,5 +707,6 @@ int main() {
     Vram();
     Cell();
     Settings();
+    Power();
     return Summary("sensor_logic_test");
 }

@@ -12,6 +12,7 @@
 #include <vector>
 #include "hw_sample.h"
 #include "sensor_logic.h"
+#include "sensor_power.h"
 
 namespace hw {
 
@@ -241,6 +242,44 @@ inline const VideoInfo& Video() {
     return v;
 }
 
+// The NVIDIA GPU's power draw for the panel (its power view), dock only: the elevated helper compiles
+// hw_sample.h but not this file, so its binary and its shared memory (LDSensorBlock) stay as they were. A handle
+// of its own on NVML (Nvml::Init again: nvml.dll is already loaded by the sampler's, nvmlInit counts its
+// callers), made the first time the power is wanted and only when the sampler's NVML answered - never on a PC
+// without NVML, never while the power view is off. Both calls are optional: a driver without
+// nvmlDeviceGetPowerUsage gives no GPU power, one without nvmlDeviceGetEnforcedPowerLimit no limit (the graph's
+// top is then the auto scale); neither keeps NVML from working for the rest.
+class NvmlPower {
+public:
+    // false: no NVML or no power call - no GPU power (asked once; later calls answer at once)
+    bool Ready() {
+        if (!tried) {
+            tried = true;
+            if (nv.Init() && nv.lib) {
+                usage = (watts_t)GetProcAddress(nv.lib, "nvmlDeviceGetPowerUsage");
+                limit = (watts_t)GetProcAddress(nv.lib, "nvmlDeviceGetEnforcedPowerLimit");
+            }
+        }
+        return usage != nullptr && nv.dev != nullptr;
+    }
+    // the board's draw now (nvmlDeviceGetPowerUsage: mW, averaged by the driver over about a second)
+    bool Watts(float& w) { return Ask(usage, w); }
+    // the limit the driver enforces now (nvmlDeviceGetEnforcedPowerLimit: mW)
+    bool LimitWatts(float& w) { return Ask(limit, w); }
+
+private:
+    typedef int (*watts_t)(void*, unsigned*);
+    bool Ask(watts_t f, float& w) {
+        unsigned mw = 0;
+        if (!f || !Ready() || f(nv.dev, &mw) != 0 || mw == 0 || mw > 5000000u) return false;   // 0 or over 5 kW: no reading
+        w = mw / 1000.0f;
+        return true;
+    }
+    Nvml nv;
+    watts_t usage = nullptr, limit = nullptr;
+    bool tried = false;
+};
+
 // The dock's sensor thread (SensorClient::Start, sensors.cpp), one pass at a time, with HWiNFO's reader a
 // parameter (hwinfo::Reader there; a fake in tests/system_sampler_test.cpp):
 //   WaitMs       1 s before the first pass (the cell filled soon after the dock starts), then every 2 s, every
@@ -258,6 +297,11 @@ inline const VideoInfo& Video() {
 // SampleCell comes first and is published before SamplePanel runs: a drive slow to answer its temperature
 // (a sleeping disk spinning up) holds up the panel only, not the cell. The system drive's reading in the list
 // stands for the sampler's own (SetSystemDriveTemp: asked once a second, not twice).
+// The power draw (WantPower, set before each pass like Want; SamplePower, right after SampleCell): read on the
+// passes there are anyway, never a wake of its own (sensorlogic::PowerReadDue) - 그래프 every pass into a 60 s
+// history, 요약 only while a panel is open, 없음 or a device switched off not at all (its history dropped). The
+// CPU's is HWiNFO's package power, read in SampleCell's HWiNFO read (one more cached reading); the GPU's is
+// NVML's (NvmlPower), its enforced limit read again every 30 s and when a panel opens.
 template <class HWiNFOReader>
 class SensorThread {
 public:
@@ -266,6 +310,8 @@ public:
     void Init(const VideoInfo& adapters) { s.Init(); video = adapters; }   // a test's own adapters
     unsigned long WaitMs(bool panelOpen) const { return first || panelOpen ? 1000 : 2000; }
     void Want(bool hwinfo, bool driveTemps) { readHWiNFO = hwinfo; readDrives = driveTemps; s.SetDriveTemps(driveTemps); }
+    // view: sensorlogic::kPowerOff / kPowerGraph / kPowerSummary; cpu, gpu: ShowItems::CpuPowerShown / GpuPowerShown
+    void WantPower(int view, bool cpu, bool gpu) { powerView = view; powerCpu = cpu; powerGpu = gpu; }
     void SampleCell(bool panelOpen, unsigned long long nowMs, LDSensorBlock& b) {
         first = false;
         s.Sample(b, nowMs);
@@ -274,11 +320,58 @@ public:
         // in use is unknown for that pass
         if (b.gpuMemTotal > 0) { vramTotal = b.gpuMemTotal; vramUsed = b.gpuMemUsed; }
         else vramUsed = NAN;
-        if (readHWiNFO) h = hwi.Read(panelOpen);
-        else h = {};   // not the source: nothing of it (no CPU, memory or GPU memory reading)
+        cpuPowerAsked = readHWiNFO && sensorlogic::PowerReadDue(powerView, powerCpu, panelOpen);
+        if (readHWiNFO) h = hwi.Read(panelOpen, cpuPowerAsked);
+        else h = {};   // not the source: nothing of it (no CPU, memory, GPU memory or power reading)
         if (h.running) b.flags |= LD_HWINFO;
         if (h.cpuFound) { b.cpuTemp = h.cpuCelsius; b.flags |= LD_HAS_CPU_TEMP | LD_CPU_TEMP_HWINFO; }
     }
+    // The power draw after this pass's SampleCell. True (out set to the whole of it) when anything changed: a
+    // reading taken, or something the settings no longer show dropped; false (out untouched) otherwise - with
+    // 없음, and with 요약 while no panel is open, after the first pass that dropped what was there.
+    bool SamplePower(bool panelOpen, unsigned long long nowMs, sensorlogic::PowerData& out) {
+        using namespace sensorlogic;
+        bool changed = false;
+        if (pw.view != powerView) { pw.view = powerView; changed = true; }
+        // what the settings no longer show goes: a device switched off (or the view off) all of it, the history
+        // and its scale whenever the view is not 그래프
+        auto drop = [&](PowerSeries& ps, PowerScale& sc, bool shown) {
+            if (!shown) {
+                if (ps.read || !ps.history.empty() || ps.top > 0 || !std::isnan(ps.limitW)) changed = true;
+                ps = {}; sc = {};
+            } else if (powerView != kPowerGraph && (!ps.history.empty() || ps.top > 0)) {
+                ps.history.clear(); ps.top = 0; sc = {}; changed = true;
+            }
+        };
+        drop(pw.cpu, cpuScale, powerCpu);
+        drop(pw.gpu, gpuScale, powerGpu);
+        if (!powerGpu) limitPeriod = {};   // on again: the limit read at its first pass
+        const bool opened = panelOpen && !powerWasOpen;
+        powerWasOpen = panelOpen;
+        // the CPU: what SampleCell's HWiNFO read gave (asked for there when due)
+        if (PowerReadDue(powerView, powerCpu, panelOpen)) {
+            pw.cpu.read = true;
+            pw.cpu.watts = cpuPowerAsked && h.cpuPowerFound ? h.cpuPowerW : NAN;
+            Record(pw.cpu, cpuScale, nowMs);
+            changed = true;
+        }
+        // the GPU: NVML (only where the sampler's NVML answers: no library looked for on other PCs)
+        if (PowerReadDue(powerView, powerGpu, panelOpen)) {
+            float w = 0, lim = 0;
+            const bool nvml = s.HasNvml() && nvp.Ready();
+            if (nvml && (limitPeriod.Due(nowMs, kLimitPeriodMs) || opened)) {
+                pw.gpu.limitW = nvp.LimitWatts(lim) ? lim : NAN;
+                limitPeriod.Mark(nowMs, kLimitPeriodMs);
+            }
+            pw.gpu.read = true;
+            pw.gpu.watts = nvml && nvp.Watts(w) ? w : NAN;
+            Record(pw.gpu, gpuScale, nowMs);
+            changed = true;
+        }
+        if (changed) { pw.atMs = nowMs; out = pw; }
+        return changed;
+    }
+    static constexpr unsigned long long kLimitPeriodMs = 30000;
     // false (p untouched) while no panel is open
     bool SamplePanel(bool panelOpen, unsigned long long nowMs, sensorlogic::PanelData& p) {
         if (!panelOpen) {
@@ -329,10 +422,29 @@ public:
     Sampler& Cell() { return s; }
 
 private:
+    // 그래프: the reading into the history (an unknown one adds no point, the window still moves on) and the
+    // graph's top - NVML's enforced limit when known (the GPU), otherwise the steady auto scale; 요약: nothing kept
+    void Record(sensorlogic::PowerSeries& ps, sensorlogic::PowerScale& sc, unsigned long long nowMs) {
+        using namespace sensorlogic;
+        if (powerView != kPowerGraph) return;
+        if (ps.Known()) AddPowerPoint(ps.history, nowMs, ps.watts);
+        else TrimPower(ps.history, nowMs);
+        if (ps.history.empty()) { ps.top = 0; sc = {}; return; }
+        const float autoTop = sc.Update(PowerMax(ps.history, nowMs));
+        ps.top = ps.limitW > 0 ? ps.limitW : autoTop;
+    }
+
     HWiNFOReader& hwi;
     Sampler s;
     DriveList drives;
-    decltype(std::declval<HWiNFOReader&>().Read(false)) h{};   // the last read
+    decltype(std::declval<HWiNFOReader&>().Read(false, false)) h{};   // the last read
+    // the power draw: what WantPower last said, this pass's HWiNFO ask, and what SamplePower keeps between passes
+    int powerView = sensorlogic::kPowerOff;
+    bool powerCpu = false, powerGpu = false, cpuPowerAsked = false, powerWasOpen = false;
+    sensorlogic::PowerData pw;
+    sensorlogic::PowerScale cpuScale, gpuScale;
+    sensorlogic::Period limitPeriod;      // the GPU's enforced limit, every kLimitPeriodMs
+    NvmlPower nvp;
     VideoInfo video;
     float vramUsed = NAN, vramTotal = 0;   // GB: NVML's amount in use at the last SampleCell (NAN: no answer), its size (0: never known)
     bool first = true, wasOpen = false;

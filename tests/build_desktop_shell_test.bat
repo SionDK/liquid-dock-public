@@ -1,6 +1,8 @@
 @echo off
+rem Builds it only: running it touches the real taskbar and windows (mod.28).
+rem tests\build_live_tests.bat builds it too, with the same lines.
 setlocal
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 2
+call "%~dp0vsenv.bat" || exit /b 2
 cd /d "%~dp0.."
 if not exist build\tests\desktop-shell mkdir build\tests\desktop-shell
 cl /nologo /std:c++20 /EHsc /O2 /MT /W3 /utf-8 /Brepro /DUNICODE /D_UNICODE ^

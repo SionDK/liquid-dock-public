@@ -223,6 +223,61 @@ bool ParseAmount(const std::wstring& value, const std::wstring& raw, float& amou
     return true;
 }
 
+bool ParsePower(const std::wstring& value, const std::wstring& raw, float& watts) {
+    // the unit: what the shown value ends with - "W", or "mW" / "kW"; right before it a digit or a space
+    size_t end = value.size();
+    while (end > 0 && (value[end - 1] == L' ' || value[end - 1] == 0x00A0 || value[end - 1] == 0x202F)) --end;
+    if (end == 0 || value[end - 1] != L'W') return false;
+    size_t num = end - 1;
+    double scale = 1.0;
+    if (num > 0 && value[num - 1] == L'm') { scale = 0.001; --num; }
+    else if (num > 0 && value[num - 1] == L'k') { scale = 1000.0; --num; }
+    if (num == 0) return false;
+    const wchar_t before = value[num - 1];
+    if (!((before >= L'0' && before <= L'9') || before == L' ' || before == 0x00A0 || before == 0x202F)) return false;
+    // the shown number, and the bare one where it is that number before rounding (as ParseAmount); a space between
+    // digit groups ("1 234 W") is not a decimal sign, a comma is (watts never come in thousands of the grouping kind)
+    double shown = 0, bare = 0;
+    const bool haveShown = LeadingNumber(Ungrouped(value.substr(0, num), false), shown);
+    const bool haveBare = LeadingNumber(raw, bare);
+    if (!haveShown && !haveBare) return false;
+    double v = (haveBare && (!haveShown || std::fabs(bare - shown) <= 0.51) ? bare : shown) * scale;
+    if (!(v >= 0.0 && v <= 5000.0)) return false;
+    watts = (float)v;
+    return true;
+}
+
+int RankCpuPower(const std::wstring& sensor, const std::wstring& label) {
+    const std::wstring s = Lower(sensor), l = Lower(label);
+    if (s.rfind(L"cpu [", 0) != 0) return -1;                  // HWiNFO's own CPU sensors: "CPU [#0]: ..."
+    auto has = [&](const wchar_t* w) { return l.find(w) != std::wstring::npos; };
+    for (const wchar_t* w : { L"limit", L"한계", L"제한", L"tdc", L"edc",                          // a limit, a current
+                              L"ia core", L"gt core", L"graphics", L"그래픽", L"gfx", L"gpu",     // a part of the package
+                              L"soc", L"core", L"코어", L"dram", L"memory", L"메모리", L"system agent",
+                              L"rest-of-chip", L"rest of chip", L"uncore" })
+        if (has(w)) return -1;
+    if (l == L"cpu package power") return 0;
+    if (l == L"cpu ppt") return 1;
+    if ((has(L"package") || has(L"패키지")) && (has(L"power") || has(L"전력") || has(L"전원"))) return 2;
+    if (has(L"ppt")) return 3;
+    return -1;
+}
+
+int PickCpuPower(const std::vector<Entry>& entries, float& watts) {
+    int best = -1, bestRank = INT_MAX;
+    float bestW = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const Entry& e = entries[i];
+        const int rank = RankCpuPower(e.sensor, e.label);
+        if (rank < 0 || rank >= bestRank) continue;           // equal rank: the earlier reading stays
+        float w = 0;
+        if (!ParsePower(e.value, e.raw, w)) continue;
+        best = (int)i; bestRank = rank; bestW = w;
+    }
+    if (best >= 0) watts = bestW;
+    return best;
+}
+
 namespace {
 
 // HWiNFO's GPU sensors: "GPU [#0]: ...", or with one letter in front ("dGPU [#0]", "iGPU [#1]"). s: lower case.
@@ -474,24 +529,19 @@ CpuReading Reader::ReadCpu() {
     return c;
 }
 
-Reading Reader::Read(bool wantDimms) {
-    Reading r;
-    HKEY k = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kKey, 0, KEY_READ, &k) != ERROR_SUCCESS &&
-        RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKey, 0, KEY_READ, &k) != ERROR_SUCCESS) {
-        cachedIndex_ = -1;
-        dimmCache_.clear();
-        gpuCache_.clear();
-        nextScan_ = 0;
-        return r;   // HWiNFO never reported to the Gadget on this PC
-    }
-    DWORD count = 0;
-    FILETIME written{};
-    if (RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &count, nullptr, nullptr, nullptr, &written) != ERROR_SUCCESS)
-        count = 0;
-    FILETIME nowFt;
-    GetSystemTimeAsFileTime(&nowFt);
-    const ULONGLONG now = GetTickCount64();
+// What a key HWiNFO does not report to (none, or one a closed HWiNFO left) leaves behind: the picks and the
+// time of the next full scan, so that the first read that finds it reported to scans at once.
+void Reader::Forget() {
+    cachedIndex_ = -1;
+    dimmCache_.clear();
+    gpuCache_.clear();
+    powerCache_ = {};
+    powerPicked_ = false;
+    nextScan_ = 0;
+}
+
+// The key's age in seconds, for Judge (nowFt: the system time, now: the tick count, both read once by Read).
+double Reader::KeyAge(FILETIME nowFt, FILETIME written, ULONGLONG now) {
     // How long the key has been quiet. A clock set back since the last write (a time sync correcting a fast
     // clock, a manual change) puts that write ahead of it: how long ago is unknown, so 30 s - the process
     // check decides. And at least as long as this reader has seen the key unchanged, by the tick count,
@@ -501,78 +551,119 @@ Reading Reader::Read(bool wantDimms) {
     double age = nowT >= wroteT ? (nowT - wroteT) / 1e7 : (wroteT - nowT > 20000000ull ? 30.0 : 0.0);
     const double unchanged = (now - stampSeenAt_) / 1000.0;
     if (unchanged > age) age = unchanged;
+    return age;
+}
+
+// fast path: the readings picked at the last scan, by index, if they are still the same ones
+void Reader::ReadCached(HKEY k, bool wantDimms, bool wantPower, Reading& r, bool& cpuOk, bool& dimmsOk, bool& gpusOk, bool& powerOk) {
+    if (cachedIndex_ >= 0) {
+        Entry e;
+        if (ReadEntry(k, cachedIndex_, e) && e.label == cachedLabel_ && e.sensor == cachedSensor_)
+            cpuOk = ParseTemperature(e.value, e.raw, r.cpuCelsius);
+    }
+    // the CPU package power picked at the last scan (none picked: nothing read, the next scan looks again)
+    if (wantPower && powerCache_.index >= 0) {
+        Entry e;
+        powerOk = ReadEntry(k, powerCache_.index, e) && e.label == powerCache_.label && e.sensor == powerCache_.sensor &&
+                  ParsePower(e.value, e.raw, r.cpuPowerW);
+        r.cpuPowerFound = powerOk;
+        if (!powerOk) r.cpuPowerW = 0;
+    }
+    if (wantDimms) {
+        for (const Cached& c : dimmCache_) {
+            Entry e;
+            DimmPick p;
+            if (!ReadEntry(k, c.index, e) || e.label != c.label || e.sensor != c.sensor || !ParseTemperature(e.value, e.raw, p.celsius)) {
+                dimmsOk = false;
+                break;
+            }
+            p.entry = c.index; p.slot = c.slot; p.locator = c.locator;
+            r.dimms.push_back(p);
+        }
+        // the GPUs' memory readings found at the last scan, picked among again (the same rules)
+        std::vector<Entry> found;
+        for (const Cached& c : gpuCache_) {
+            Entry e;
+            if (!ReadEntry(k, c.index, e) || e.label != c.label || e.sensor != c.sensor) { gpusOk = false; break; }
+            found.push_back(std::move(e));
+        }
+        if (gpusOk && !found.empty()) r.gpus = PickGpuMemory(found);
+    }
+}
+
+// full scan, for the CPU, the memory and the GPU memory pickers alike: right away when a picked reading
+// went away, every 10 s otherwise (a better reading ticked later is picked up), and every 3 s while no
+// CPU temperature is reported - not for missing memory or GPU memory readings (most people never tick
+// them: a scan every 3 s for good)
+void Reader::FullScan(HKEY k, bool wantDimms, bool wantPower, ULONGLONG now, Reading& r, bool& cpuOk) {
+    std::vector<Entry> all = ReadAll(k);
+    const int i = PickCpu(all, prefer_, r.cpuCelsius);
+    cachedIndex_ = i >= 0 ? all[i].index : -1;
+    cpuOk = i >= 0;
+    if (i >= 0) { cachedSensor_ = all[i].sensor; cachedLabel_ = all[i].label; }
+    // the CPU package power: picked only when asked for (the power view off: nothing of it, not even the
+    // picking); a scan without it forgets the pick, and the next read that asks scans first (Read)
+    float watts = 0;
+    const int pw = wantPower ? PickCpuPower(all, watts) : -1;
+    powerCache_ = {};
+    powerPicked_ = wantPower;
+    if (pw >= 0) { powerCache_.index = all[pw].index; powerCache_.sensor = all[pw].sensor; powerCache_.label = all[pw].label; }
+    r.cpuPowerFound = pw >= 0;
+    r.cpuPowerW = r.cpuPowerFound ? watts : 0;
+    dimmCache_.clear();
+    r.dimms.clear();
+    for (DimmPick p : PickDimms(all)) {
+        const Entry& e = all[p.entry];
+        Cached c;
+        c.index = e.index; c.sensor = e.sensor; c.label = e.label; c.slot = p.slot; c.locator = p.locator;
+        dimmCache_.push_back(c);
+        p.entry = e.index;
+        if (wantDimms) r.dimms.push_back(p);
+    }
+    gpuCache_.clear();
+    r.gpus.clear();
+    std::vector<int> used;
+    std::vector<GpuMemPick> gpus = PickGpuMemory(all, &used);
+    for (int at : used) {
+        Cached c;
+        c.index = all[at].index; c.sensor = all[at].sensor; c.label = all[at].label;
+        gpuCache_.push_back(c);
+    }
+    if (wantDimms) r.gpus = std::move(gpus);
+    nextScan_ = now + (i >= 0 ? 10000 : 3000);
+}
+
+Reading Reader::Read(bool wantDimms, bool wantPower) {
+    Reading r;
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kKey, 0, KEY_READ, &k) != ERROR_SUCCESS &&
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, kKey, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+        Forget();
+        return r;   // HWiNFO never reported to the Gadget on this PC
+    }
+    DWORD count = 0;
+    FILETIME written{};
+    if (RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &count, nullptr, nullptr, nullptr, &written) != ERROR_SUCCESS)
+        count = 0;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const ULONGLONG now = GetTickCount64();
+    const double age = KeyAge(nowFt, written, now);
     Freshness f = Judge(count, age, [this] { return HWiNFOProcessRunning(); });
     r.running = f.running;
-    if (!f.usable) {
-        cachedIndex_ = -1;
-        dimmCache_.clear();
-        gpuCache_.clear();
-        nextScan_ = 0;   // look again as soon as HWiNFO is back
+    if (!f.running) {
+        Forget();   // look again as soon as HWiNFO is back
         RegCloseKey(k);
         return r;
     }
     const bool scanDue = now >= nextScan_;
-    bool cpuOk = false, dimmsOk = true, gpusOk = true;
-    // fast path: the readings picked at the last scan, by index, if they are still the same ones
-    if (!scanDue) {
-        if (cachedIndex_ >= 0) {
-            Entry e;
-            if (ReadEntry(k, cachedIndex_, e) && e.label == cachedLabel_ && e.sensor == cachedSensor_)
-                cpuOk = ParseTemperature(e.value, e.raw, r.cpuCelsius);
-        }
-        if (wantDimms) {
-            for (const Cached& c : dimmCache_) {
-                Entry e;
-                DimmPick p;
-                if (!ReadEntry(k, c.index, e) || e.label != c.label || e.sensor != c.sensor || !ParseTemperature(e.value, e.raw, p.celsius)) {
-                    dimmsOk = false;
-                    break;
-                }
-                p.entry = c.index; p.slot = c.slot; p.locator = c.locator;
-                r.dimms.push_back(p);
-            }
-            // the GPUs' memory readings found at the last scan, picked among again (the same rules)
-            std::vector<Entry> found;
-            for (const Cached& c : gpuCache_) {
-                Entry e;
-                if (!ReadEntry(k, c.index, e) || e.label != c.label || e.sensor != c.sensor) { gpusOk = false; break; }
-                found.push_back(std::move(e));
-            }
-            if (gpusOk && !found.empty()) r.gpus = PickGpuMemory(found);
-        }
-    }
-    // full scan, for the CPU, the memory and the GPU memory pickers alike: right away when a picked reading
-    // went away, every 10 s otherwise (a better reading ticked later is picked up), and every 3 s while no
-    // CPU temperature is reported - not for missing memory or GPU memory readings (most people never tick
-    // them: a scan every 3 s for good)
-    if (scanDue || (cachedIndex_ >= 0 && !cpuOk) || (wantDimms && (!dimmsOk || !gpusOk))) {
-        std::vector<Entry> all = ReadAll(k);
-        const int i = PickCpu(all, prefer_, r.cpuCelsius);
-        cachedIndex_ = i >= 0 ? all[i].index : -1;
-        cpuOk = i >= 0;
-        if (i >= 0) { cachedSensor_ = all[i].sensor; cachedLabel_ = all[i].label; }
-        dimmCache_.clear();
-        r.dimms.clear();
-        for (DimmPick p : PickDimms(all)) {
-            const Entry& e = all[p.entry];
-            Cached c;
-            c.index = e.index; c.sensor = e.sensor; c.label = e.label; c.slot = p.slot; c.locator = p.locator;
-            dimmCache_.push_back(c);
-            p.entry = e.index;
-            if (wantDimms) r.dimms.push_back(p);
-        }
-        gpuCache_.clear();
-        r.gpus.clear();
-        std::vector<int> used;
-        std::vector<GpuMemPick> gpus = PickGpuMemory(all, &used);
-        for (int at : used) {
-            Cached c;
-            c.index = all[at].index; c.sensor = all[at].sensor; c.label = all[at].label;
-            gpuCache_.push_back(c);
-        }
-        if (wantDimms) r.gpus = std::move(gpus);
-        nextScan_ = now + (i >= 0 ? 10000 : 3000);
-    }
+    bool cpuOk = false, dimmsOk = true, gpusOk = true, powerOk = true;
+    if (!scanDue) ReadCached(k, wantDimms, wantPower, r, cpuOk, dimmsOk, gpusOk, powerOk);
+    // full scan: right away when a picked reading went away, every 10 s otherwise, every 3 s while no CPU
+    // temperature (FullScan); asked for the power with no pick made for it (the view just turned on, or a scan
+    // without it since), at once; a power reading not reported does not pull the scans closer (most never tick it)
+    if (scanDue || (cachedIndex_ >= 0 && !cpuOk) || (wantDimms && (!dimmsOk || !gpusOk)) || (wantPower && (!powerOk || !powerPicked_)))
+        FullScan(k, wantDimms, wantPower, now, r, cpuOk);
     r.cpuFound = cpuOk;
     RegCloseKey(k);
     return r;

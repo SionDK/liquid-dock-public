@@ -18,9 +18,8 @@ struct State {
 
 // oled.cpp
 State Load();
-ComPtr<IDesktopWallpaper> Wallpaper(bool retry);   // its default (false): on the definition
+ComPtr<IDesktopWallpaper> Wallpaper(bool retry = false);
 // oled_covers.cpp
-extern bool g_coversDirty;
-void DestroyCovers();
+void DestroyCovers();   // also marks the covers for a rebuild on the next Tick
 
 }   // namespace oled

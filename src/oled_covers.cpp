@@ -17,6 +17,8 @@ namespace oled {
 constexpr wchar_t kCoverClass[] = L"LiquidDockOledCover";
 constexpr UINT kZFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
 
+namespace {
+
 std::vector<HWND> g_covers;
 bool g_coversDirty = true;     // (re)build on the next Tick
 double g_nextBuild = 0;        // nothing to cover (monitor unplugged): retry later, not every pass
@@ -32,8 +34,6 @@ std::vector<HMONITOR> g_coveredMonitors;   // the monitors the mode applies to, 
 bool g_coverageKnown = false;              // false until the first build after a change: every monitor counts
 int g_coversSaid = -1;                     // the cover count dock.log had last
 DWORD g_coverFailLast = 0;                 // the cover window error the last build met (0: none)
-
-namespace {
 
 LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
@@ -204,6 +204,7 @@ void DestroyCovers() {
     g_fixStreak = 0;
     g_raised = false;
     if (g_fgHook) { UnhookWinEvent(g_fgHook); g_fgHook = nullptr; }
+    g_coversDirty = true;   // built again by the next Tick that finds the mode on
 }
 
 namespace {

@@ -1,5 +1,5 @@
 #include "../src/common.h"
-#include "../src/system.h"
+#include "../src/native_taskbar.h"
 #include "../src/taskbar_visibility.h"
 #include <thread>
 #include <cstdio>

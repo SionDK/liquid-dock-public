@@ -3,7 +3,9 @@
 // table (type 17), which HWiNFO memory temperature belongs to which slot, the GPU's memory block (VRAM: when
 // it shows, where its amounts and temperature come from), the panel-open linger and the time-based periods
 // of the sensor thread, what the dock's sensor cell shows (its key and text), and what the sensor settings
-// show (the source, the six items) with the panel's layout that follows from them. Tested by
+// show (the source, the six items, the power view and its two switches) with the panel's layout that follows from
+// them. (The power draw's own rules - when it is read, its history, the graph's scale, its texts - are in
+// sensor_power.h: this file is compiled into the elevated helper too, and must not change its bytes.) Tested by
 // tests/sensor_logic_test.cpp (portable: g++/clang/cl).
 #include <cmath>
 #include <cstddef>
@@ -494,6 +496,12 @@ inline std::wstring CellText(const CellReading& r) {
 // VRAM temperature, DXGI's VRAM size, the drives' temperatures (IOCTL), names, the SMBIOS module count.
 enum : int { kSourceOff = 0, kSourceHWiNFO = 1, kSourcePawnIO = 2 };
 
+// The panel's power draw (settings powerView, the 센서 page's "전력 소비량"): 없음 (nothing read, the panel as
+// before), 그래프 (each card's last 60 s behind its text, read on every sampler pass), 요약 (the current watts in
+// the footer, read only while a panel is open). Under 그래프 and 요약 CPU and GPU each on or off (showCpuPower,
+// showGpuPower). None of it changes the panel's height.
+enum : int { kPowerOff = 0, kPowerGraph = 1, kPowerSummary = 2 };
+
 // A settings file from before sensorSource with "CPU 온도 직접 읽기 (PawnIO)" on (cpuTemp=1): that dock read
 // HWiNFO always and took the helper's CPU temperature only when HWiNFO gave none. Its first start with the
 // source keeps what it showed: PawnIO only if the PawnIO service is there and HWiNFO reports no CPU
@@ -517,6 +525,17 @@ struct ShowItems {
     bool DimmsShown() const { return ramTemp && source == kSourceHWiNFO; }
     // the VRAM block's temperature row: HWiNFO's, or NVML's on the GPUs that give one (nvmlTempSeen)
     bool VramTempShown(bool nvmlTempSeen) const { return vram && vramTemp && (source == kSourceHWiNFO || nvmlTempSeen); }
+
+    // the power draw (kPowerOff / kPowerGraph / kPowerSummary, settings powerView) and its two switches
+    int powerView = kPowerOff;
+    bool cpuPower = true, gpuPower = true;
+    bool PowerGraph() const { return powerView == kPowerGraph; }
+    bool PowerSummary() const { return powerView == kPowerSummary; }
+    // the CPU's: HWiNFO's package power only (the PawnIO helper reads no RAPL; off reads nothing), so only with
+    // the source HWiNFO - whether the CPU's temperature is shown does not matter (the card is always there)
+    bool CpuPowerShown() const { return powerView != kPowerOff && cpuPower && source == kSourceHWiNFO; }
+    // the GPU's: NVML's, on the GPU's card - none while the GPU is hidden
+    bool GpuPowerShown() const { return powerView != kPowerOff && gpuPower && gpu; }
 };
 
 // ---- the panel's layout (DIP at scale 1; Dock::DrawPanel in dock_sensors.cpp draws it) ---------------------

@@ -1,15 +1,8 @@
 #include "dock.h"
-#include "system.h"
 #include "sensors.h"
-#include "native_tray.h"
-#include "start_menu.h"
-#include <shellscalingapi.h>
-#include <thread>
 #include <shellapi.h>
 #include <d2d1effects.h>
-#include <dwmapi.h>
 #include "oled.h"
-#include "theme.h"
 #include "explorer_taskbar.h"
 
 static const wchar_t* kDockClass = L"LiquidDockBar";
@@ -80,7 +73,6 @@ void Dock::Metrics() {
     case Edge::Left:   winX = mon.left; winY = mon.top;        winW = t; winH = mon.bottom - mon.top; break;
     case Edge::Right:  winX = mon.right - t; winY = mon.top;   winW = t; winH = mon.bottom - mon.top; break;
     }
-    g_gfx.EnsureFonts(scale);
 }
 
 bool Dock::AlwaysShown() const {
@@ -88,12 +80,43 @@ bool Dock::AlwaysShown() const {
     return want && !oled::CoversMonitor(monitor);   // a monitor in OLED mode always hides its dock
 }
 
+void Dock::RemoveAppBar() {
+    APPBARDATA abd = { sizeof(abd) };
+    abd.hWnd = hwnd;
+    SHAppBarMessage(ABM_REMOVE, &abd);
+    appBar = false; appBarRect = {};
+}
+
+#ifndef LD_APPBAR_WORK_AREA
+// The monitor's work area now (the dock tests compute it from their fake shell's strips: dock_fixture_appbar.h)
+static bool AppBarWorkArea(HMONITOR m, const RECT&, RECT& work) {
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(m, &mi)) return false;
+    work = mi.rcWork;
+    return true;
+}
+#define LD_APPBAR_WORK_AREA AppBarWorkArea
+#endif
+
+// Whether a work area leaves out the strip the shell took on that edge (a strip of no size: nothing to judge)
+static bool LeavesOut(const RECT& work, const RECT& strip, UINT edge) {
+    if (IsRectEmpty(&strip)) return true;
+    switch (edge) {
+    case ABE_BOTTOM: return work.bottom <= strip.top;
+    case ABE_TOP:    return work.top >= strip.bottom;
+    case ABE_LEFT:   return work.left >= strip.right;
+    case ABE_RIGHT:  return work.right <= strip.left;
+    }
+    return true;
+}
+
 void Dock::UpdateAppBar(bool want, double now) {
     APPBARDATA abd = { sizeof(abd) };
     abd.hWnd = hwnd;
     if (!want || !hwnd) {
-        if (appBar) { SHAppBarMessage(ABM_REMOVE, &abd); appBar = false; appBarRect = {}; }
+        if (appBar) RemoveAppBar();
         nextAppBarTry = 0; appBarFailing = false;   // wanted again later: asked at once, a failure logged anew
+        appBarMisses = 0; appBarCheckAt = 0; workAreaChanged = false;
         return;
     }
     // the strip from the screen edge to the far side of the glass, in steps of 4 px so a crowded
@@ -107,7 +130,8 @@ void Dock::UpdateAppBar(bool want, double now) {
     case Edge::Left:   e = ABE_LEFT;   r.right = r.left + band; break;
     case Edge::Right:  e = ABE_RIGHT;  r.left = r.right - band; break;
     }
-    if (appBar && EqualRect(&r, &appBarRect)) return;
+    if (appBar && EqualRect(&r, &appBarRect)) { CheckAppBar(now); return; }
+    if (appBar && !IsRectEmpty(&appBarRect)) appBarMisses = 0;   // another strip (the glass, the edge): tried anew
     if (!appBar) {
         // No Explorer taskbar yet (early logon, Explorer restarting): asked again every 2 s, not on every
         // frame. dock.log gets the failure once and the registration that ends it once (when the strip was
@@ -127,15 +151,68 @@ void Dock::UpdateAppBar(bool want, double now) {
     }
     abd.uEdge = e;
     abd.rc = r;
-    SHAppBarMessage(ABM_QUERYPOS, &abd);
-    switch (e) {   // keep the dock's own thickness from whatever edge the shell returned
-    case ABE_BOTTOM: abd.rc.top = abd.rc.bottom - band; break;
-    case ABE_TOP:    abd.rc.bottom = abd.rc.top + band; break;
-    case ABE_LEFT:   abd.rc.right = abd.rc.left + band; break;
-    case ABE_RIGHT:  abd.rc.left = abd.rc.right - band; break;
-    }
-    SHAppBarMessage(ABM_SETPOS, &abd);
+    // Taken before asking: the shell's ABN_POSCHANGED, or a new Explorer's TaskbarCreated, can be sent to this window
+    // while it answers (WndProc runs inside SHAppBarMessage then). Either undoes this, and the strip is asked for again.
     appBarRect = r;
+    bool asked = false, set = false;
+    {
+        trayhost::OwnAppBar own(hwnd);   // through the tray host these two reach Explorer only so (tray_host.h)
+        asked = SHAppBarMessage(ABM_QUERYPOS, &abd) != 0;
+        switch (e) {   // keep the dock's own thickness from whatever edge the shell returned
+        case ABE_BOTTOM: abd.rc.top = abd.rc.bottom - band; break;
+        case ABE_TOP:    abd.rc.bottom = abd.rc.top + band; break;
+        case ABE_LEFT:   abd.rc.right = abd.rc.left + band; break;
+        case ABE_RIGHT:  abd.rc.left = abd.rc.right - band; break;
+        }
+        set = appBar && SHAppBarMessage(ABM_SETPOS, &abd) != 0;
+    }
+    if (!appBar) return;   // taken down meanwhile (a new Explorer): registered from the start
+    appBarGranted = abd.rc;
+    appBarEdge = e;
+    // The shell says TRUE to both while it has the app bar. FALSE: it has lost it, or the tray host could not pass the
+    // message on - CheckAppBar registers it again (it also finds a strip the shell took without leaving it out of the
+    // work area: that is how the dock's own messages through the tray host ended until mod.37, tray_host.cpp).
+    if (!asked || !set) { appBarGranted = r; appBarCheckAt = now; }
+    else appBarCheckAt = now + 1.0;
+}
+
+void Dock::CheckAppBar(double now) {
+    // WM_SETTINGCHANGE: Explorer worked the work area out again - it may have left the strip in. Looked at a second
+    // after the last change: a program's own SPI_SETWORKAREA is put back by Explorer within half a second.
+    if (workAreaChanged) { workAreaChanged = false; appBarCheckAt = now + 1.0; }
+    if (!appBar || appBarCheckAt == 0 || now < appBarCheckAt) return;
+    appBarCheckAt = 0;
+    RECT work{};
+    if (!LD_APPBAR_WORK_AREA(monitor, mon, work)) return;
+    const RECT& s = appBarGranted;
+    if (LeavesOut(work, s, appBarEdge)) {
+        if (appBarMisses) Log(L"appbar: dock %d - the work area leaves the strip out again (%ld,%ld-%ld,%ld)", index, work.left, work.top, work.right, work.bottom);
+        appBarMisses = 0;
+        return;
+    }
+    if (appBarMisses >= kAppBarRetries) return;   // given up (logged) until the strip is wanted anew or Explorer is new
+    ++appBarMisses;
+    Log(L"appbar: dock %d - the work area %ld,%ld-%ld,%ld reaches into the strip %ld,%ld-%ld,%ld: registering it again (%d of %d)%ls",
+        index, work.left, work.top, work.right, work.bottom, s.left, s.top, s.right, s.bottom, appBarMisses, kAppBarRetries,
+        appBarMisses == kAppBarRetries ? L" - the last try until the strip is wanted anew or Explorer is new" : L"");
+    // ABM_REMOVE and ABM_NEW: a SETPOS of the rectangle the shell already has makes it work nothing out again
+    RemoveAppBar();
+    nextAppBarTry = now + 2.0 * (appBarMisses - 1);   // at once, then 2 s and 4 s later
+}
+
+// Explorer's TaskbarCreated (WndProc). A new Explorer knows no app bars: an always-shown dock registers its strip
+// again on the next frame (or else maximised windows go under it). The tray host's own broadcast comes with the same
+// Explorer, which still holds the strip: nothing to ask then. ABM_REMOVE first, so a registration the shell still
+// has never turns the new ABM_NEW into a failure. (Not UpdateAppBar(false): that also forgets a failure being
+// logged, and dock.log would get "register failed" again.)
+void Dock::OnTaskbarCreated() {
+    const HWND shell = appBar ? ExplorerTaskbar() : nullptr;
+    if (appBar && shell != appBarShell) {
+        Log(L"appbar: dock %d - Explorer's taskbar is new (%p, was %p): registering the strip again", index, (void*)shell, (void*)appBarShell);
+        RemoveAppBar();
+        appBarMisses = 0;   // a new Explorer: the work area is given its tries anew
+    }
+    nextAppBarTry = 0;   // a failed registration is tried again at once
 }
 
 void Dock::BringToFront() {
@@ -163,7 +240,7 @@ void Dock::UpdateWidgetSlot() {
 // FluentFlyout keeps choosing it, and laid out for its size.
 void Dock::PlaceWidget(bool fullscreen) {
     if (!widgetHere) return;
-    const bool show = widgetShowing && !fullscreen && (reveal.x > 0.002f || reveal.target > 0.5f);
+    const bool show = widgetShowing && !fullscreen && RevealShown();
     const float off = show ? hideOff : 0;
     const auto r = RectUV(widgetU0, widgetU1, margin - off, margin + barThick - off);
     const int hostW = fluentflyout::HostWidth(scale), hostH = std::max(1, (int)std::lround(barThick));
@@ -210,7 +287,7 @@ bool Dock::Create() {
     if (!CreateDeviceResources()) return false;
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
-    reveal.snap(settingsOpen ? 1.0f : 0.0f);   // recreated while the shape settings are open: no pop-in
+    reveal.snap(g_settingsHold.open ? 1.0f : 0.0f);   // recreated while the shape settings are open: no pop-in
     magAmount.snap(0);
     trailingGap.snap(0);
     SyncSlots();

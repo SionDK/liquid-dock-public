@@ -8,12 +8,16 @@ namespace portable_check {
 inline int& Failures() { static int n = 0; return n; }
 inline int& Count() { static int n = 0; return n; }
 inline bool& Quiet() { static bool q = false; return q; }   // only failures are printed
+// stdout flushed after every check line (a test with threads or ExitProcess, so a line is out before a crash);
+// off unless a test sets it: static const bool kFlush = (portable_check::FlushEach() = true);
+inline bool& FlushEach() { static bool f = false; return f; }
 }
 
 inline bool Check(bool ok, const char* what) {
     ++portable_check::Count();
     if (!ok) ++portable_check::Failures();
     if (!ok || !portable_check::Quiet()) std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
+    if (portable_check::FlushEach()) std::fflush(stdout);
     return ok;
 }
 

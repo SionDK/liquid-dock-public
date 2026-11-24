@@ -2,6 +2,7 @@
 #include "common.h"
 #include "sensor_shared.h"
 #include "sensor_logic.h"
+#include "sensor_power.h"
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -31,6 +32,18 @@ public:
     bool HWiNFORunning() const { return live && (d.flags & LD_HWINFO); }
     const LDSensorBlock& Data() const { return d; }
     const PanelData& Panel() const { return panel; }
+    // The panel's power draw (UI thread; sensorlogic::PowerData): the view it was read for, the time of its last
+    // pass (atMs, GetTickCount64: the graph's right edge), and per device (cpu, gpu) whether it was asked for under
+    // the settings in force (read), its last watts (NAN unknown), the GPU's enforced limit, and in 그래프 the 60 s
+    // history with the graph's top. What the settings show goes by Items() (CpuPowerShown, GpuPowerShown,
+    // PowerGraph, PowerSummary), which take effect at once; what they no longer show is dropped here on the Tick
+    // they change (a pass read before it included). The sensor_power.h helpers draw from it: PowerSpark (the
+    // graph's points, 0..1 of the card's area), PowerText ("71 W"), PowerTotalText ("합계 358 W"),
+    // PowerSummaryItems (the 요약 footer's entries), CpuPowerHint (the 그래프 card's "HWiNFO 전력: 클릭").
+    const sensorlogic::PowerData& Power() const { return power; }
+    // bumps whenever Power() changed (a pass read it, or the settings dropped some): geometry built from it (the
+    // graph's paths) is built again only then, not every frame
+    int powerVersion = 0;
     // How many drives and memory rows a dock window should leave room for, and whether for the VRAM block
     // (Dock::Metrics, when the window is built: its thickness is fixed then). Before the first opening a
     // count made once (UI thread, at the dock's start): the drives the panel's list would hold
@@ -52,7 +65,7 @@ public:
     // ...NAN also when the settings hide it (Items: the CPU's temperature, the GPU, the drives): what the cell,
     // the cards, the overheat alert and the peek go by
     float ShownTemp(Metric m) const;
-    float Threshold(Metric m) const { return m == CPU ? 90.f : m == GPU ? 83.f : m == SSD ? 70.f : 1e9f; }
+    float Threshold(Metric m) const { return m == CPU ? 90.f : m == GPU ? 83.f : m == SSD ? kDriveHot : 1e9f; }
     int Severity(Metric m) const;           // of ShownTemp: 0 normal, 1 warm (within 10 °C), 2 hot
     // the panel's drives and memory modules: hot at 70 °C (every drive, as the system drive) and 85 °C,
     // warm 10 °C below (60, 75); SeverityOf(row.temp, kDriveHot) -> 0 normal, 1 warm, 2 hot (NAN: 0).
@@ -80,18 +93,14 @@ public:
     static bool PawnIOInstalled();
     // how to let HWiNFO report its CPU temperature to the dock (no driver, no admin rights)
     static void ShowHWiNFOGuide();
-
-    // The elevated helper (CPU temperature, windows of programs run as administrator: admin_helper.h).
-    static bool InstallHelper(HWND owner);   // one UAC prompt: copies it to the admin-only folder, registers its task
-    static void StartHelper();               // worker thread: runs its scheduled task (no prompt; silent)
-
-    // The helper's scheduled task is registered (schtasks /Query: a process, up to ~0.1 s - on a click only,
-    // adminhelper::NeedsInstall)
-    static bool HelperTaskRegistered();
+    // (the elevated helper's install and start: adminhelper::InstallHelper, StartHelper - admin_helper.h)
 
 private:
     void ReadHelper(double now);
+    void DropHelperView();                   // ReadHelper: the helper's view and mapping let go (those held)
+    void UpdateCellKey();                    // Tick: cellKey and cellVersion as of CellKeyNow
     bool DropUnread(const sensorlogic::ShowItems& show);   // Tick: drops what the source in force does not read
+    bool DropUnshownPower(const sensorlogic::ShowItems& show);   // Tick: drops the power the settings no longer show
 
     // local sampler
     std::thread sampler;
@@ -99,11 +108,16 @@ private:
     LDSensorBlock localBlk{};
     PanelData localPanel;                    // under mu
     bool localPanelNew = false;              // under mu
+    sensorlogic::PowerData localPower;       // under mu
+    bool localPowerNew = false;              // under mu
     std::atomic<bool> localNew{ false };
     HANDLE wake = nullptr;                   // auto-reset: wakes the sampler when a panel opens
     std::atomic<bool> panelOpen{ false };    // the sampler's view of SetPanelOpen
     // the sampler's view of the settings (Tick): read HWiNFO (it is the source), ask the drives' temperatures
     std::atomic<bool> readHWiNFO{ true }, readDrives{ true };
+    // ...and the power draw: the view (kPowerOff/Graph/Summary) and whether each device's is shown
+    std::atomic<int> powerView{ sensorlogic::kPowerOff };
+    std::atomic<bool> powerCpu{ false }, powerGpu{ false };
     bool vramNvmlTempSeen = false;           // VramNvmlTempSeen
     sensorlogic::PanelLinger linger;
 
@@ -120,6 +134,7 @@ private:
 
     LDSensorBlock d{};
     PanelData panel;
+    sensorlogic::PowerData power;
     bool live = false;
     sensorlogic::CellKey cellKey{};          // CellKeyNow as of the last cellVersion bump
     bool armed[Count] = { true, true, true, true };

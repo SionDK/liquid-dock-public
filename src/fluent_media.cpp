@@ -11,22 +11,24 @@ namespace fluentflyout {
 // FluentFlyout counts as "playing" any media session (Windows' media transport controls) its app
 // filter lets through; "hide completely" hides the widget when there is none. Only then does the slot
 // follow the sessions (WidgetState): otherwise the list is not kept and the media thread sleeps (WantMedia).
+std::atomic<bool> g_mediaWanted{ false };    // the UI thread uses the list (WantMedia)
+std::atomic<bool> g_namesWanted{ false };   // found, its app filter on: the media sessions' apps are named (PublishSessions)
+fluentlogic::Steady g_media;                 // UI thread: g_rawMedia without the flicker of sessions being replaced
+
+namespace {
+
 std::mutex g_mediaMu;
 std::vector<std::wstring> g_sessions;        // source app ids
 std::unordered_map<std::wstring, std::wstring> g_appNames;   // FluentFlyout's names for their apps (while its app filter is on)
 std::atomic<int> g_mediaVersion{ 0 };
 std::atomic<bool> g_mediaKnown{ false };
-std::atomic<bool> g_mediaWanted{ false };    // the UI thread uses the list (WantMedia)
 std::mutex g_publishMu;                      // the media thread and Windows' callbacks: one list at a time
 HANDLE g_mediaThread = nullptr, g_mediaStop = nullptr;
 HANDLE g_mediaWake = nullptr;                // g_mediaWanted changed: the media thread looks at once
 bool g_rawMedia = true;                      // UI thread: something plays (by the sessions as last listed)
-fluentlogic::Steady g_media;                 // ...without the flicker of sessions being replaced
-int g_hasMediaFor[2] = { -1, -1 };           // the session and settings versions g_rawMedia was worked out for
+struct { int sessions = -1, settings = -1; } g_rawMediaFor;   // the session and settings versions g_rawMedia was worked out for
 bool g_listSeen = false;                     // UI thread: g_mediaKnown when the sessions were last looked at
 double g_mediaWantedAt = -1;                 // UI thread: when the list was last wanted again (WantMedia)
-
-namespace {
 
 using fluentsettings::Trimmed;
 
@@ -140,9 +142,7 @@ std::vector<Program> RunningPrograms(const std::vector<std::wstring>& variants) 
         if (!p.window && !IsVariant(variants, p.name)) continue;
         // FluentFlyout reads its main module (query and read access): one it cannot open so is skipped
         if (HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID)) {
-            wchar_t path[MAX_PATH * 2];
-            DWORD n = ARRAYSIZE(path);
-            if (QueryFullProcessImageNameW(h, 0, path, &n)) p.path.assign(path, n);
+            p.path = ImagePath(h);
             CloseHandle(h);
         }
         if (!p.path.empty()) out.push_back(std::move(p));
@@ -293,6 +293,16 @@ void StartMedia() {
 
 }   // namespace
 
+// When the dock exits (Shutdown): the media thread is told to stop and waited for a moment.
+void StopMedia() {
+    if (g_mediaThread) {
+        SetEvent(g_mediaStop);
+        WaitForSingleObject(g_mediaThread, 1500);   // a media service that hangs does not hold up exit
+        CloseHandle(g_mediaThread);
+        g_mediaThread = nullptr;
+    }
+}
+
 // Whether the UI thread uses the session list (Tick). When it stops, the list is dropped: wanted again,
 // the next list is a first one again (UpdateHasMedia). What counted last (g_media) is kept until then.
 void WantMedia(bool on) {
@@ -307,7 +317,7 @@ void WantMedia(bool on) {
             g_mediaKnown = false;
         }
         g_rawMedia = true;
-        g_hasMediaFor[0] = g_hasMediaFor[1] = -1;
+        g_rawMediaFor.sessions = g_rawMediaFor.settings = -1;
         g_listSeen = false;
     }
     if (g_mediaWake) SetEvent(g_mediaWake);   // the media thread looks at once, or goes to sleep
@@ -346,8 +356,8 @@ bool SessionAllowed(const std::wstring& id, const std::wstring* name) {
 void UpdateHasMedia(double now) {
     int mv = g_mediaVersion, sv = g_ffVersion;
     double hold = 1.5;
-    if (mv != g_hasMediaFor[0] || sv != g_hasMediaFor[1]) {
-        g_hasMediaFor[0] = mv; g_hasMediaFor[1] = sv;
+    if (mv != g_rawMediaFor.sessions || sv != g_rawMediaFor.settings) {
+        g_rawMediaFor.sessions = mv; g_rawMediaFor.settings = sv;
         g_rawMedia = true;   // not known (yet): never hide what may be there
         const bool known = g_mediaKnown;
         if (known) {

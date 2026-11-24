@@ -47,6 +47,10 @@ struct Control {
     // group
     int count = 0;
     mutable bool open = false;
+    // drawn (with its hot areas and its room on the page) only while this says so; empty: always. An option that
+    // means something only under another one's choice (the 센서 page's "CPU 전력" / "GPU 전력" under "전력 소비량")
+    std::function<bool()> shown;
+    bool Shown() const { return !shown || shown(); }
 };
 
 struct Page { const wchar_t* title; const wchar_t* glyph; std::vector<Control> controls; std::function<void()> reset; };
@@ -76,7 +80,7 @@ extern std::vector<Hot> g_hots;
 D2D1_COLOR_F Text(float a = 1);
 D2D1_COLOR_F Muted();
 D2D1_COLOR_F Wash(float a);
-ComPtr<IDWriteTextFormat> Font(float size, DWRITE_FONT_WEIGHT w, const wchar_t* family);   // its default: on the definition
+ComPtr<IDWriteTextFormat> Font(float size, DWRITE_FONT_WEIGHT w, const wchar_t* family = L"Segoe UI Variable Text");
 void Fill(D2D1_RECT_F r, D2D1_COLOR_F c, float radius = 0);
 void Draw(const std::wstring& t, IDWriteTextFormat* f, D2D1_RECT_F r, D2D1_COLOR_F c);
 // settings_window_pages.cpp

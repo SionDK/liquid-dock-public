@@ -89,6 +89,21 @@ struct GpuMemPick {
 constexpr int kMaxGpuMemoryEntries = 24;
 std::vector<GpuMemPick> PickGpuMemory(const std::vector<Entry>& entries, std::vector<int>* used = nullptr);
 
+// Power in W from a reported value: "71.234 W", "71,2 W" (decimal comma), "850 mW", "71W"; the bare number (raw)
+// when it is the shown one before rounding. False for anything else (a temperature, a share in %, "Wh", MHz...)
+// or a figure outside 0 .. 5000 W.
+bool ParsePower(const std::wstring& value, const std::wstring& raw, float& watts);
+// How well a reading stands for the CPU's package power (the "PC 상태" panel's CPU power): 0 best, -1 not one.
+// HWiNFO's own CPU sensors only ("CPU [#0]: ..."; its sensor names stay English):
+//   0 "CPU Package Power" (Intel, AMD), 1 "CPU PPT" (AMD: the socket's power the PPT limit tracks),
+//   2 a translated label with package / 패키지 and power / 전력 / 전원 ("CPU 패키지 전력"),
+//   3 any other label with "PPT".
+// Never a limit or a current (limit / 한계 / 제한, TDC, EDC), a part of the package (IA / GT Cores, the graphics,
+// the SoC, the cores - per core or together -, the memory, System Agent, Rest-of-Chip, uncore).
+int RankCpuPower(const std::wstring& sensor, const std::wstring& label);
+// The best CPU package power among the entries: its position in `entries`, or -1.
+int PickCpuPower(const std::vector<Entry>& entries, float& watts);
+
 struct CpuReading {
     bool running = false;      // HWiNFO is running and reporting to the Gadget key
     bool found = false;        // a CPU temperature is among the reported readings
@@ -99,6 +114,9 @@ struct Reading {
     bool running = false;      // HWiNFO is running and reporting to the Gadget key
     bool cpuFound = false;     // a CPU temperature is among the reported readings
     float cpuCelsius = 0;
+    // the CPU's package power (asked for only: Read(..., true)): reported to the Gadget, and its watts
+    bool cpuPowerFound = false;
+    float cpuPowerW = 0;
     // the panel's readings (asked for only: Read(true))
     std::vector<DimmPick> dimms;   // memory temperatures; entry = Gadget index
     std::vector<GpuMemPick> gpus;  // the GPUs' own memory (VRAM): temperature, amount in use
@@ -108,12 +126,11 @@ struct Reading {
 // counts as HWiNFO's own; a quieter one only while the HWiNFO process runs - for as long as it does,
 // whatever the key's age: HWiNFO writes a value only when it changes, and switching its Gadget reporting
 // off empties the key (count 0) rather than leaving values to go stale (seen 10-28).
-struct Freshness { bool running = false, usable = false; };
+struct Freshness { bool running = false; };
 template <class IsProcessRunning>
 Freshness Judge(unsigned valueCount, double ageSeconds, IsProcessRunning&& processRunning) {
     Freshness f;
     f.running = valueCount > 0 && (ageSeconds < 20.0 || processRunning());
-    f.usable = f.running;
     return f;
 }
 
@@ -128,15 +145,24 @@ public:
     CpuReading ReadCpu();                // Read(false)
     // One open of the key: the picked CPU reading and (wantDimms: a panel is open) the picked memory
     // readings and the GPUs' memory readings, by their cached indices; a full scan, shared by the pickers,
-    // every 10 s (3 s while no CPU temperature is found - not for missing memory or GPU readings) or as
-    // soon as a cached reading changed.
-    Reading Read(bool wantDimms);
+    // every 10 s (3 s while no CPU temperature is found - not for missing memory, GPU or power readings) or as
+    // soon as a cached reading changed. wantCpuPower (the panel's power draw shown): the picked CPU package
+    // power too, by its cached index (one more reading, about 7 us); the first read that asks for it after one
+    // that did not (or after a scan without it) scans at once. Not asked: not even picked at the scans.
+    Reading Read(bool wantDimms, bool wantCpuPower = false);
 private:
     struct Cached { int index = -1; std::wstring sensor, label; int slot = 0; std::wstring locator; };
     bool HWiNFOProcessRunning();
+    // Read's parts, in its order: the key's age; the cached picks between scans; the full scan; forgetting
+    void Forget();
+    double KeyAge(FILETIME nowFt, FILETIME written, ULONGLONG now);
+    void ReadCached(HKEY k, bool wantDimms, bool wantPower, Reading& r, bool& cpuOk, bool& dimmsOk, bool& gpusOk, bool& powerOk);
+    void FullScan(HKEY k, bool wantDimms, bool wantPower, ULONGLONG now, Reading& r, bool& cpuOk);
     std::wstring prefer_;
     int cachedIndex_ = -1;               // the CPU reading picked at the last full scan
     std::wstring cachedSensor_, cachedLabel_;
+    Cached powerCache_;                  // the CPU package power picked at it (index -1: none reported)
+    bool powerPicked_ = false;           // ...and that scan was asked for it (false: the next read that asks scans)
     std::vector<Cached> dimmCache_;      // the memory readings picked at the last full scan
     std::vector<Cached> gpuCache_;       // the GPU memory readings found at it (index, sensor, label)
     ULONGLONG nextScan_ = 0;

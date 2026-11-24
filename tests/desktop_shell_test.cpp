@@ -1,7 +1,8 @@
 // Explicit interactive integration test. Uses the production Shell action,
 // creates only disposable fixture windows, and never injects keyboard input.
 #include "../src/native_tray.h"
-#include "../src/system.h"
+#include "../src/native_taskbar.h"
+#include "../src/shell_front.h"
 #include <cstdio>
 #include <cstdlib>
 #include <dwmapi.h>

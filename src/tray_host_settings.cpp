@@ -3,9 +3,10 @@
 namespace trayhost {
 
 std::vector<Entry> g_entries;             // host thread only
-bool g_haveSettings = false;              // false before Windows 11 22H2: every icon counts as shown
 
 namespace {
+
+bool g_haveSettings = false;              // false before Windows 11 22H2: every icon counts as shown
 
 bool ParseGuid(std::wstring s, GUID& g) {
     if (s.empty()) return false;
@@ -177,17 +178,9 @@ void LogMissing(const std::vector<std::wstring>& arrived) {
             if (FileName(exe) != file || std::find(reported.begin(), reported.end(), exe) != reported.end()) continue;
             HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
             if (!p) continue;
-            wchar_t path[MAX_PATH * 2];
-            DWORD n = ARRAYSIZE(path);
-            bool same = QueryFullProcessImageNameW(p, 0, path, &n) && Lower(std::wstring(path, n)) == exe;
-            bool elevated = false;
-            HANDLE token = nullptr;
-            if (same && OpenProcessToken(p, TOKEN_QUERY, &token)) {
-                TOKEN_ELEVATION te{};
-                DWORD got = 0;
-                elevated = GetTokenInformation(token, TokenElevation, &te, sizeof(te), &got) && te.TokenIsElevated;
-                CloseHandle(token);
-            }
+            // an unread path is empty: never `exe`, which is not (wanted)
+            bool same = Lower(ImagePath(p)) == exe;
+            bool elevated = same && TokenElevated(p);
             CloseHandle(p);
             if (!same) continue;
             reported.push_back(exe);

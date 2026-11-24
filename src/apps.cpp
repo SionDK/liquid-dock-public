@@ -1,12 +1,7 @@
 #include "apps.h"
 #include "apps_internal.h"
-#include "admin_helper.h"
-#include "admin_client.h"   // Elevated: the log names a window in front that runs as administrator
-#include "app_click.h"
-#include "system.h"         // TakeForegroundRight
-#include "taskbar_apps.h"   // a click through the app's button on the taskbar
-#include "explorer_taskbar.h"   // ExplorerTaskbar: asked whether it answers after a press
 #include "gfx.h"
+#include "icon_pixels.h"   // AnyAlpha, MakeOpaque
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -14,9 +9,6 @@
 #include <propvarutil.h>
 #include <dwmapi.h>
 #include <appmodel.h>
-#include <fstream>
-#include <sstream>
-#include <thread>
 
 AppModel g_apps;
 
@@ -44,21 +36,27 @@ static std::wstring ProcessAumid(DWORD pid) {
     return out;
 }
 
+// The AppUserModelID a property store holds (a window's, a shortcut's) put in out; out is left as it was when the
+// store holds none.
+void ReadAumid(IPropertyStore* ps, std::wstring& out) {
+    PROPVARIANT pv; PropVariantInit(&pv);
+    if (SUCCEEDED(ps->GetValue(PKEY_AppUserModel_ID, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) out = pv.pwszVal;
+    PropVariantClear(&pv);
+}
+
 static std::wstring WindowAumid(HWND h) {
     std::wstring out;
     ComPtr<IPropertyStore> ps;
-    if (SUCCEEDED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(&ps)))) {
-        PROPVARIANT pv; PropVariantInit(&pv);
-        if (SUCCEEDED(ps->GetValue(PKEY_AppUserModel_ID, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) out = pv.pwszVal;
-        PropVariantClear(&pv);
-    }
+    if (SUCCEEDED(SHGetPropertyStoreForWindow(h, IID_PPV_ARGS(&ps)))) ReadAumid(ps.Get(), out);
     return out;
 }
 
-bool IsCloaked(HWND h) {
+bool IsCloaked(HWND h) { return CloakOf(h) != 0; }
+
+DWORD CloakOf(HWND h) {
     DWORD cloaked = 0;
     DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    return cloaked != 0;
+    return cloaked;
 }
 
 // The same heuristic the shell uses to decide whether a window gets a taskbar button.
@@ -122,14 +120,23 @@ static std::wstring SpelledName(const std::wstring& exe, const std::wstring& lau
     return FileStem(!launch.empty() && ToLower(launch) == exe ? launch : exe);
 }
 
+// Straight alpha to premultiplied, every pixel: iconpx::Premultiply's arithmetic (icon_pixels.h) without its skipping
+// of opaque pixels - a loop with no branch, which the compiler vectorizes, for icons up to 256 x 256 (iconpx's took up
+// to about three times as long on an icon's mix of clear, opaque and edge pixels, measured on 2026-11-21).
+static void PremultiplyAll(std::vector<uint32_t>& px) {
+    for (auto& p : px) {
+        uint32_t a = p >> 24;
+        uint32_t r = ((p >> 16) & 255) * a / 255, g = ((p >> 8) & 255) * a / 255, b = (p & 255) * a / 255;
+        p = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+}
+
 static ComPtr<ID2D1Bitmap1> BitmapFromHBITMAP(HBITMAP hbm) {
     DIBSECTION ds = {};
     if (!GetObjectW(hbm, sizeof(ds), &ds) || !ds.dsBm.bmBits || ds.dsBm.bmBitsPixel != 32) {
         // not a DIB section: copy through GetDIBits
         BITMAP bm = {};
         if (!GetObjectW(hbm, sizeof(bm), &bm)) return nullptr;
-        ds.dsBm = bm;
-        ds.dsBmih.biHeight = -bm.bmHeight;
         std::vector<uint32_t> px(bm.bmWidth * bm.bmHeight);
         BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
         bi.bmiHeader.biWidth = bm.bmWidth; bi.bmiHeader.biHeight = -bm.bmHeight;
@@ -137,14 +144,8 @@ static ComPtr<ID2D1Bitmap1> BitmapFromHBITMAP(HBITMAP hbm) {
         HDC hdc = GetDC(nullptr);
         GetDIBits(hdc, hbm, 0, bm.bmHeight, px.data(), &bi, DIB_RGB_COLORS);
         ReleaseDC(nullptr, hdc);
-        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-        bool anyA = false;
-        for (auto p : px) if (p >> 24) { anyA = true; break; }
-        if (!anyA) for (auto& p : px) p |= 0xff000000;
-        ComPtr<ID2D1Bitmap1> b;
-        g_gfx.dc->CreateBitmap(D2D1::SizeU(bm.bmWidth, bm.bmHeight), px.data(), bm.bmWidth * 4, bp, &b);
-        return b;
+        if (!iconpx::AnyAlpha(px)) iconpx::MakeOpaque(px);   // (not premultiplied here)
+        return BitmapFromPixels(g_gfx.dc, px, bm.bmWidth, bm.bmHeight);
     }
     int w = ds.dsBm.bmWidth, h = ds.dsBm.bmHeight;
     bool bottomUp = ds.dsBmih.biHeight > 0;
@@ -159,19 +160,9 @@ static ComPtr<ID2D1Bitmap1> BitmapFromHBITMAP(HBITMAP hbm) {
         if (a) anyA = true;
         if (((p >> 16) & 255) > a || ((p >> 8) & 255) > a || (p & 255) > a) needPremul = true;
     }
-    if (!anyA) for (auto& p : px) p |= 0xff000000;
-    else if (needPremul) {
-        for (auto& p : px) {
-            uint32_t a = p >> 24;
-            uint32_t r = ((p >> 16) & 255) * a / 255, g = ((p >> 8) & 255) * a / 255, b = (p & 255) * a / 255;
-            p = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    ComPtr<ID2D1Bitmap1> b;
-    g_gfx.dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, bp, &b);
-    return b;
+    if (!anyA) iconpx::MakeOpaque(px);
+    else if (needPremul) PremultiplyAll(px);
+    return BitmapFromPixels(g_gfx.dc, px, w, h);
 }
 
 static ComPtr<ID2D1Bitmap1> IconFromShellItem(IShellItem* si) {
@@ -198,21 +189,13 @@ static ComPtr<ID2D1Bitmap1> IconFromHICON(HICON hi) {
         std::vector<uint32_t> px(w * h), mask(w * h);
         HDC hdc = GetDC(nullptr);
         GetDIBits(hdc, ii.hbmColor, 0, h, px.data(), &bi, DIB_RGB_COLORS);
-        bool anyA = false;
-        for (auto p : px) if (p >> 24) { anyA = true; break; }
-        if (!anyA && ii.hbmMask) {
+        if (!iconpx::AnyAlpha(px) && ii.hbmMask) {   // no alpha: the mask says (no mask: left as it is)
             GetDIBits(hdc, ii.hbmMask, 0, h, mask.data(), &bi, DIB_RGB_COLORS);
             for (int i = 0; i < w * h; ++i) px[i] = (px[i] & 0xffffff) | ((mask[i] & 0xffffff) ? 0 : 0xff000000u);
         }
         ReleaseDC(nullptr, hdc);
-        for (auto& p : px) {
-            uint32_t a = p >> 24;
-            uint32_t r = ((p >> 16) & 255) * a / 255, g = ((p >> 8) & 255) * a / 255, b = (p & 255) * a / 255;
-            p = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-        g_gfx.dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, bp, &result);
+        PremultiplyAll(px);   // always (its alpha taken as straight, as Windows icons have it)
+        result = BitmapFromPixels(g_gfx.dc, px, w, h);
     }
     if (ii.hbmColor) DeleteObject(ii.hbmColor);
     if (ii.hbmMask) DeleteObject(ii.hbmMask);
@@ -244,6 +227,10 @@ ComPtr<IShellItem> AppsFolderItem(const std::wstring& aumid, std::wstring* nameO
     return si;
 }
 
+// What starts an app by its id (a store app's pin, Launch with no launch): its Apps folder item. pins.txt keeps it as
+// the pin's launch, so its spelling must not change.
+std::wstring AppsFolderTarget(const std::wstring& aumid) { return L"shell:AppsFolder\\" + aumid; }
+
 // ---------------------------------------------------------------- model
 
 std::shared_ptr<AppItem> AppModel::NewItem() {
@@ -252,13 +239,19 @@ std::shared_ptr<AppItem> AppModel::NewItem() {
     return a;
 }
 
+// A shortcut (.lnk) read from its file: false when the shell's link object could not be made or the file not read.
+// As's answer is not looked at (the shell's link object has IPersistFile).
+bool OpenShortcut(const std::wstring& lnk, Shortcut& s) {
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&s.link)))) return false;
+    s.link.As(&s.file);
+    return SUCCEEDED(s.file->Load(lnk.c_str(), STGM_READ));
+}
+
 static bool LinkIconLocation(const std::wstring& lnk, std::wstring& path, int& index) {
-    ComPtr<IShellLinkW> sl;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) return false;
-    ComPtr<IPersistFile> pf; sl.As(&pf);
-    if (FAILED(pf->Load(lnk.c_str(), STGM_READ))) return false;
+    Shortcut s;
+    if (!OpenShortcut(lnk, s)) return false;
     wchar_t p[MAX_PATH * 2] = {};
-    if (FAILED(sl->GetIconLocation(p, ARRAYSIZE(p), &index)) || !p[0]) return false;
+    if (FAILED(s.link->GetIconLocation(p, ARRAYSIZE(p), &index)) || !p[0]) return false;
     path = p;
     return true;
 }
@@ -327,6 +320,64 @@ std::shared_ptr<AppItem> AppModel::FindByWindow(HWND h) {
     return nullptr;
 }
 
+// What a window is - its program, its id, its package - read when Refresh first sees it (winCache keeps it after).
+// false: not known yet, and not kept: a UWP frame whose app is suspended, looked at again at the next refresh.
+bool AppModel::IdentifyWindow(HWND h, WinCache& wc) {
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    wc.exe = ProcessExe(pid);
+    wc.aumid = WindowAumid(h);
+    std::wstring procAumid = ProcessAumid(pid);
+    if (wc.aumid.empty()) wc.aumid = procAumid;
+    // packaged apps may label their windows with their own AUMID; the package identifies them
+    wc.family = PackageFamily(!procAumid.empty() ? procAumid : wc.aumid);
+    if (EndsWithI(wc.exe, L"\\applicationframehost.exe")) {
+        // UWP: the real app lives in a child CoreWindow from another process
+        struct Ctx { DWORD host; DWORD found; } c{ pid, 0 };
+        EnumChildWindows(h, [](HWND ch, LPARAM lp) -> BOOL {
+            auto* c = (Ctx*)lp; DWORD p = 0; GetWindowThreadProcessId(ch, &p);
+            if (p != c->host) { c->found = p; return FALSE; }
+            return TRUE;
+        }, (LPARAM)&c);
+        if (c.found) {
+            wc.exe = ProcessExe(c.found);
+            std::wstring pa = ProcessAumid(c.found);
+            if (wc.aumid.empty()) wc.aumid = pa;
+            if (!pa.empty()) wc.family = PackageFamily(pa);
+        }
+        if (wc.aumid.empty()) return false;   // suspended frame we can't identify yet
+    }
+    return true;
+}
+
+// The same app, by its AppUserModelID: the ids alike but for case (an id given - no id is no app's).
+bool SameAppId(const std::wstring& itemId, const std::wstring& id) {
+    return !id.empty() && _wcsicmp(itemId.c_str(), id.c_str()) == 0;
+}
+
+// The same app, by its program while one of the two has no id (a program under another id - a browser profile's -
+// is an app of its own). The programs are lowercased paths (ProcessExe, PinFile).
+bool SameProgramOneIdless(const std::wstring& itemExe, const std::wstring& itemId, const std::wstring& exe, const std::wstring& id) {
+    return !exe.empty() && itemExe == exe && (itemId.empty() || id.empty());
+}
+
+// The dock's app a window belongs to: the first app with its id, else the first of its package, else the first of
+// its program while one of the two has no id - each asked of all the apps before the next (PinFile asks id and
+// program of each app at once, and not the package). None: an app new to the dock.
+std::shared_ptr<AppItem> AppModel::ItemFor(const WinCache& wc) const {
+    std::shared_ptr<AppItem> match;
+    if (!wc.aumid.empty())
+        for (auto& a : items) if (SameAppId(a->aumid, wc.aumid)) { match = a; break; }
+    if (!match && !wc.family.empty())
+        for (auto& a : items) if (!a->aumid.empty() && PackageFamily(a->aumid) == wc.family) { match = a; break; }
+    if (!match && !wc.exe.empty())
+        for (auto& a : items)
+            if (SameProgramOneIdless(a->exe, a->aumid, wc.exe, wc.aumid)) { match = a; break; }
+    return match;
+}
+
+// A launched app bounces until a new window of it shows, or this long at most (s).
+static constexpr double kLaunchBounceMax = 8.0;
+
 void AppModel::Refresh() {
     lastRefresh = NowSeconds();
     dirty = false;
@@ -345,42 +396,13 @@ void AppModel::Refresh() {
         auto f = winCache.find(h);
         if (f == winCache.end()) {
             WinCache wc;
-            DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
-            wc.exe = ProcessExe(pid);
-            wc.aumid = WindowAumid(h);
-            std::wstring procAumid = ProcessAumid(pid);
-            if (wc.aumid.empty()) wc.aumid = procAumid;
-            // packaged apps may label their windows with their own AUMID; the package identifies them
-            wc.family = PackageFamily(!procAumid.empty() ? procAumid : wc.aumid);
-            if (EndsWithI(wc.exe, L"\\applicationframehost.exe")) {
-                // UWP: the real app lives in a child CoreWindow from another process
-                struct Ctx { DWORD host; DWORD found; } c{ pid, 0 };
-                EnumChildWindows(h, [](HWND ch, LPARAM lp) -> BOOL {
-                    auto* c = (Ctx*)lp; DWORD p = 0; GetWindowThreadProcessId(ch, &p);
-                    if (p != c->host) { c->found = p; return FALSE; }
-                    return TRUE;
-                }, (LPARAM)&c);
-                if (c.found) {
-                    wc.exe = ProcessExe(c.found);
-                    std::wstring pa = ProcessAumid(c.found);
-                    if (wc.aumid.empty()) wc.aumid = pa;
-                    if (!pa.empty()) wc.family = PackageFamily(pa);
-                }
-                if (wc.aumid.empty()) continue;   // suspended frame we can't identify yet
-            }
+            if (!IdentifyWindow(h, wc)) continue;   // not known yet: not kept, asked again next time
             f = winCache.emplace(h, std::move(wc)).first;
         }
         // moved over to this refresh's cache, node and all: a window's facts are not copied every refresh
         const WinCache& wc = newCache.insert(winCache.extract(f)).position->second;
 
-        std::shared_ptr<AppItem> match;
-        if (!wc.aumid.empty())
-            for (auto& a : items) if (_wcsicmp(a->aumid.c_str(), wc.aumid.c_str()) == 0) { match = a; break; }
-        if (!match && !wc.family.empty())
-            for (auto& a : items) if (!a->aumid.empty() && PackageFamily(a->aumid) == wc.family) { match = a; break; }
-        if (!match && !wc.exe.empty())
-            for (auto& a : items)
-                if (a->exe == wc.exe && (a->aumid.empty() || wc.aumid.empty())) { match = a; break; }
+        std::shared_ptr<AppItem> match = ItemFor(wc);
         if (!match && g_demoMode) continue;
         if (!match) {
             match = NewItem();
@@ -395,14 +417,14 @@ void AppModel::Refresh() {
     }
     winCache.swap(newCache);
 
-    // drop unpinned apps whose windows are gone
     double now = NowSeconds();
     for (size_t i = 0; i < items.size(); ++i) {
         auto& a = items[i];
         if (a->launchStarted > 0) {
-            if (a->windows.size() > a->launchWindowCount || now - a->launchStarted > 8.0) a->launchStarted = 0;
+            if (a->windows.size() > a->launchWindowCount || now - a->launchStarted > kLaunchBounceMax) a->launchStarted = 0;
         }
     }
+    // drop unpinned apps whose windows are gone
     size_t before = items.size();
     items.erase(std::remove_if(items.begin(), items.end(), [this](auto& a) {
         if (a->pinned || a->Running()) return false;

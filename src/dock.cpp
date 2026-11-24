@@ -1,16 +1,7 @@
 #include "dock.h"
 #include "system.h"
 #include "sensors.h"
-#include "native_tray.h"
-#include "start_menu.h"
-#include <shellscalingapi.h>
-#include <thread>
-#include <shellapi.h>
-#include <d2d1effects.h>
 #include <dwmapi.h>
-#include "oled.h"
-#include "theme.h"
-#include "explorer_taskbar.h"
 
 void Dock::HotkeyReveal(double now) {
     if (reveal.target > 0.5f) { reveal.target = 0; hotkeyHoldUntil = 0; edgeSince = -1; return; }   // pressed again: away
@@ -81,13 +72,18 @@ void Dock::SyncSlots() {
 }
 
 namespace {
-// The shell's own pop-ups (system.h): the taskbar comes up with them, so the dock does too - one that shows: a closed
+// Not cloaked - shown, not put away by DWM (another virtual desktop, a closed shell pop-up) - or DWM cannot say.
+bool NotCloaked(HWND w) {
+    DWORD cloaked = 0;
+    return FAILED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || !cloaked;
+}
+
+// The shell's own pop-ups (shell_front.h): the taskbar comes up with them, so the dock does too - one that shows: a closed
 // one is a cloaked window of its program that can keep the front with nothing on the screen (SearchHost's after the
 // monitors came back on, a two-monitor PC 2026-10-30: both docks held up for it). The cloak asked only of a shell window.
 bool ShellPopupWindow(HWND w) {
     if (!IsShellPopupWindow(w)) return false;
-    DWORD cloaked = 0;
-    return FAILED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || !cloaked;
+    return NotCloaked(w);
 }
 }
 
@@ -98,12 +94,11 @@ namespace {
 // virtual desktop (or by however Win+D puts away a window without a minimize box), it held every dock up with
 // nothing on the screen to say why (2026-11-06). Asked only while it is open.
 bool SettingsHold() {
-    if (!Dock::settingsOpen) return false;
-    HWND w = Dock::settingsWnd;
+    if (!g_settingsHold.open) return false;
+    HWND w = g_settingsHold.wnd;
     if (!w) return true;
     if (!IsWindowVisible(w) || IsIconic(w)) return false;
-    DWORD cloaked = 0;
-    return FAILED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || !cloaked;
+    return NotCloaked(w);
 }
 }
 
@@ -189,8 +184,7 @@ void Dock::KeepInFront(double now, HWND front, bool fullscreen) {
     // a smaller one over part of it (a program's own pop-up opened from a tray icon, a picture-in-picture video
     // the user put there) stays over the dock, as before and as it would over the taskbar.
     const auto b = RectUV(barU0, barU1, margin, margin + barThick);
-    const RECT bar = { winX + (LONG)std::floor(b.left), winY + (LONG)std::floor(b.top),
-                       winX + (LONG)std::ceil(b.right), winY + (LONG)std::ceil(b.bottom) };
+    const RECT bar = ScreenRectOut(b);
     RECT r{};
     if (!GetWindowRect(front, &r) || !RectCovers(r, bar)) return;
     if (!AboveDock(front, hwnd) || !raiseOver(front) || isShellPopup(front)) return;
@@ -203,12 +197,23 @@ void Dock::KeepInFront(double now, HWND front, bool fullscreen) {
     }
 }
 
+namespace {
+// A bounce is ballistic hops of kHop seconds each (an app's and the sensor cell's): which hop it is in (the whole
+// part; the fraction: how far through it), and the height of the parabola there.
+constexpr double kHop = 0.56;
+double HopPhase(double now, double start) { return (now - start) / kHop; }
+float HopOffset(double phase, float height) {
+    float fr = float(phase - std::floor(phase));
+    return height * 4 * fr * (1 - fr);
+}
+}
+
 void Dock::StartBounce(Slot& s, int count, bool loop, bool hiddenMode, double now) {
     if (s.bounceCount > 0 || s.bounceLoop) {
         // already bouncing: extend
         if (loop) s.bounceLoop = true;
         else {
-            double phase = (now - s.bounceStart) / 0.56;
+            double phase = HopPhase(now, s.bounceStart);
             s.bounceCount = std::max(s.bounceCount, (int)std::ceil(phase) + count - 1);
         }
         s.bounceHiddenMode = s.bounceHiddenMode || hiddenMode;
@@ -222,7 +227,31 @@ void Dock::StartBounce(Slot& s, int count, bool loop, bool hiddenMode, double no
 
 // ---------------------------------------------------------------- per-frame update
 
+// One frame, in steps (dock.h FrameState), always all of them in this order. What a step works out is kept in
+// the frame for the steps after it, as it was then: keep, taken before the press safety (FramePressDrag) may let
+// the press go, still holds the capture on (FrameCapture); insideDock, taken before the dock is told to come up,
+// says the same to every step of the frame.
 void Dock::Update(double now, float dt, POINT cursor) {
+    FrameState f{ now, dt, cursor };
+    FrameStart(f);
+    FrameFullscreen(f);
+    FrameBounceStarts(f);
+    FrameShowHide(f);
+    FrameMagnify(f);
+    FramePressDrag(f);
+    FrameSprings(f);
+    FramePlace(f);
+    FrameHover(f);
+    FramePanel(f);
+    FrameTooltip(f);
+    FrameCapture(f);
+    UpdateRegion();
+}
+
+// fonts, the model, the fit, the pointer in u/v, what the system and the sensors changed
+void Dock::FrameStart(FrameState& f) {
+    const auto& now = f.now; const auto& dt = f.dt; const auto& cursor = f.cursor;
+    auto& wasVisible = f.wasVisible; auto& prevU = f.prevU; auto& prevV = f.prevV; auto& inMonitor = f.inMonitor;
     g_gfx.EnsureFonts(scale);   // text formats for this monitor's scale
     SyncSlots();
     SyncNotifyIcons(now);
@@ -231,10 +260,10 @@ void Dock::Update(double now, float dt, POINT cursor) {
         ApplyFit(dt);
         if (std::fabs(before - fit) > 0.0005f) dirty = true;
     }
-    bool wasVisible = reveal.x > 0.002f;
-    float prevU = cursorU, prevV = cursorV;
+    wasVisible = reveal.x > 0.002f;
+    prevU = cursorU; prevV = cursorV;
     ScreenToUV(cursor, cursorU, cursorV);
-    bool inMonitor = PtInRect(&mon, cursor) != 0;
+    inMonitor = PtInRect(&mon, cursor) != 0;
     if (!inMonitor) { cursorV = 1e9f; }
     if (g_sys.version != lastSysVersion) { lastSysVersion = g_sys.version; dirty = true; }
     // sensors: a sample every 2 s (every second while a panel is open) - the panel shows every one; the cell
@@ -243,19 +272,26 @@ void Dock::Update(double now, float dt, POINT cursor) {
     // for every sample, 1,800 times an hour, mostly for the same text.
     if (g_sensors.version != lastSensorVersion) {
         lastSensorVersion = g_sensors.version;
-        if (panelAlpha.x > 0.01f || panelAlpha.target > 0.5f) dirty = true;
+        if (PanelShown()) dirty = true;
     }
     if (g_sensors.cellVersion != lastCellVersion && !screenUnseen) { lastCellVersion = g_sensors.cellVersion; dirty = true; }
+}
 
-    // A fullscreen app (a game, a video) in front: on a monitor it covers the dock stays away (spanned
-    // across monitors, it covers more than the one Windows names for it); on another monitor an
-    // always-shown dock here pauses its glass (capture lifetime, below).
+// A fullscreen app (a game, a video) in front: on a monitor it covers the dock stays away (spanned
+// across monitors, it covers more than the one Windows names for it); on another monitor an
+// always-shown dock here pauses its glass (capture lifetime, below).
+void Dock::FrameFullscreen(FrameState& f) {
+    auto& front = f.front; auto& fsMonitor = f.fsMonitor; auto& fullscreen = f.fullscreen;
     RECT fsRect{};
-    const HWND front = GetForegroundWindow();
-    const HMONITOR fsMonitor = FullscreenMonitor(hwnd, front, &fsRect);
-    const bool fullscreen = monitor && fsMonitor && (fsMonitor == monitor || RectCovers(fsRect, mon));
+    front = GetForegroundWindow();
+    fsMonitor = FullscreenMonitor(hwnd, front, &fsRect);
+    fullscreen = monitor && fsMonitor && (fsMonitor == monitor || RectCovers(fsRect, mon));
     fullscreenHere = fullscreen;
+}
 
+// bounces that start this frame: overheat, notifications, launches
+void Dock::FrameBounceStarts(const FrameState& f) {
+    const auto& now = f.now; const auto& fullscreen = f.fullscreen;
     // the quiet button holds back notification and overheat bounces (launch hops still show)
     const bool quiet = features::Quiet(now);
 
@@ -284,30 +320,35 @@ void Dock::Update(double now, float dt, POINT cursor) {
         bool launching = s.app->launchStarted > 0 && s.app->launchDock == index;
         if (launching && !s.bounceLoop) StartBounce(s, 0, true, false, now);
         if (!launching && s.bounceLoop) {
-            double phase = (now - s.bounceStart) / 0.56;
+            double phase = HopPhase(now, s.bounceStart);
             s.bounceLoop = false;
             s.bounceCount = std::max(1, (int)std::ceil(phase));
         }
     }
+}
 
+void Dock::FrameShowHide(FrameState& f) {
+    const auto& now = f.now; const auto& cursor = f.cursor; const auto& inMonitor = f.inMonitor; const auto& front = f.front;
+    const auto& fullscreen = f.fullscreen;
+    auto& insideDock = f.insideDock; auto& wasUp = f.wasUp; auto& keep = f.keep; auto& inPreview = f.inPreview; auto& inFlyout = f.inFlyout;
+    auto& alwaysShown = f.alwaysShown;
     // ---- show / hide
     bool atEdge = inMonitor && cursorV < 2.0f;
     float magExtent = base * (mag - 1) * magAmount.x;
-    bool insideDock = inMonitor && reveal.target > 0.5f &&
+    insideDock = inMonitor && reveal.target > 0.5f &&
         ((cursorU >= barU0 - 14 * scale && cursorU <= barU1 + 14 * scale &&
           cursorV <= margin + barThick + std::max(magExtent, 0.0f) + 12 * scale) ||
          CursorInPanel() ||
-         (panelAlpha.target > 0.5f && cursorU >= cells[HitSensor].u0 - 4 * scale && cursorU <= cells[HitSensor].u1 + 4 * scale &&
-          cursorV <= margin + barThick + 16 * scale));   // bridge between cell and panel
-    const bool wasUp = reveal.target > 0.5f;   // the dock insideDock knows: one told to come up below is not "inside" until the next frame
+         (panelAlpha.target > 0.5f && NearSensorCell(cursorU) && cursorV <= margin + barThick + 16 * scale));   // bridge between cell and panel
+    wasUp = reveal.target > 0.5f;   // the dock insideDock knows: one told to come up below is not "inside" until the next frame
     // the Windows key (Start), Win+S, Win+A, Win+N: the dock comes up with them, like the taskbar would
     bool shellPopup = g_settings.showWithStart && ShellPopupOpen();
     const bool settingsHold = SettingsHold();
-    bool keep = menuOpen || dragging || pressSlot >= 0 || debugForceShow || settingsHold || now < hotkeyHoldUntil || shellPopup;
-    bool inPreview = windowPreview.Contains(cursor);
-    bool inFlyout = fluentflyout::FlyoutAt(monitor, cursor);   // FluentFlyout's flyout, settled next to this dock
+    keep = menuOpen || dragging || pressSlot >= 0 || debugForceShow || settingsHold || now < hotkeyHoldUntil || shellPopup;
+    inPreview = windowPreview.Contains(cursor);
+    inFlyout = fluentflyout::FlyoutAt(monitor, cursor);   // FluentFlyout's flyout, settled next to this dock
     if (debugForceShow || settingsHold) reveal.target = 1;
-    bool alwaysShown = AlwaysShown();
+    alwaysShown = AlwaysShown();
     UpdateAppBar(alwaysShown, now);
 
     if (alwaysShown) {
@@ -345,7 +386,11 @@ void Dock::Update(double now, float dt, POINT cursor) {
         }
     }
     KeepInFront(now, front, fullscreen);   // a window that came to the front over the dock while it is up
+}
 
+void Dock::FrameMagnify(const FrameState& f) {
+    const auto& insideDock = f.insideDock; const auto& inPreview = f.inPreview; const auto& inFlyout = f.inFlyout; const auto& fullscreen = f.fullscreen;
+    const auto& wasUp = f.wasUp;
     // ---- magnification
     float appEnd = sepU;
     bool overApps = insideDock && cursorU >= appsU0 && cursorU <= appEnd;
@@ -396,7 +441,10 @@ void Dock::Update(double now, float dt, POINT cursor) {
         } else if (onDock && !holding) { pinU = pinSide > 0 ? barU1 : barU0; pinBlend.snap(1); }   // easing back stops where it is: nothing slides under the pointer
         else if (easeBack) pinBlend.target = 0;
     }
+}
 
+void Dock::FramePressDrag(const FrameState& f) {
+    const auto& now = f.now; const auto& cursor = f.cursor;
     // ---- press and drag
     // The primary button, as the drag reads it: GetAsyncKeyState reports the physical buttons, and with
     // Windows' "swap buttons" setting (a left-handed mouse) the primary one is the physical right one.
@@ -441,7 +489,11 @@ void Dock::Update(double now, float dt, POINT cursor) {
         }
         trailingGap.target = (!dropRemove && k == count) ? 1.0f : 0.0f;
     }
+}
 
+void Dock::FrameSprings(FrameState& f) {
+    const auto& now = f.now; const auto& dt = f.dt;
+    auto& anim = f.anim;
     // ---- springs
     UpdateWidgetSlot();
     reveal.step(dt, 230, reveal.target > 0.5f ? 0.72f : 1.0f);
@@ -451,22 +503,21 @@ void Dock::Update(double now, float dt, POINT cursor) {
     trailingGap.step(dt, 320, 0.9f);
     widgetWidth.step(dt, 300, 0.92f);
     if (widgetWidth.target == 0 && widgetWidth.x < 0.5f) widgetWidth.snap(0);
-    bool anim = !reveal.settled() || !magAmount.settled() || !pinBlend.settled() || !trailingGap.settled() || !widgetWidth.settled(0.25f) || dragging;
+    anim = !reveal.settled() || !magAmount.settled() || !pinBlend.settled() || !trailingGap.settled() || !widgetWidth.settled(0.25f) || dragging;
     for (auto& s : slots) {
         s.appear.step(dt, 200, 0.72f);
         s.gapBefore.step(dt, 320, 0.9f);
         s.shrink.step(dt, 320, 0.9f);
         s.press.step(dt, 700, 1.0f);
         s.peek.step(dt, 170, 0.8f);
-        // bounce: ballistic hops, 0.56 s each
+        // bounce: ballistic hops, kHop (0.56 s) each
         if (s.bounceCount > 0 || s.bounceLoop) {
-            double phase = (now - s.bounceStart) / 0.56;
+            double phase = HopPhase(now, s.bounceStart);
             if (!s.bounceLoop && phase >= s.bounceCount) {
                 s.bounceCount = 0; s.bounceOff = 0; s.peek.target = 0; s.bounceHiddenMode = false;
             } else {
-                float fr = float(phase - std::floor(phase));
                 float hgt = base * (s.bounceLoop ? 0.5f : 0.9f);   // launch: small hops, notification: big ones
-                s.bounceOff = hgt * 4 * fr * (1 - fr);
+                s.bounceOff = HopOffset(phase, hgt);
                 s.peek.target = (s.bounceHiddenMode && reveal.target < 0.5f) ? 1.0f : 0.0f;
             }
             anim = true;
@@ -475,11 +526,10 @@ void Dock::Update(double now, float dt, POINT cursor) {
     }
     // sensor cell bounce
     if (sbCount > 0) {
-        double phase = (now - sbStart) / 0.56;
+        double phase = HopPhase(now, sbStart);
         if (phase >= sbCount) { sbCount = 0; sbOff = 0; sbPeek.target = 0; sbHidden = false; }
         else {
-            float fr = float(phase - std::floor(phase));
-            sbOff = base * 0.9f * 4 * fr * (1 - fr);
+            sbOff = HopOffset(phase, base * 0.9f);
             sbPeek.target = (sbHidden && reveal.target < 0.5f) ? 1.0f : 0.0f;
         }
         anim = true;
@@ -502,9 +552,13 @@ void Dock::Update(double now, float dt, POINT cursor) {
         if (std::fabs(nv - inkCol[i]) > 0.002f) anim = true;
         inkCol[i] = nv;
     }
+}
 
+// the layout of this frame (hideOff first: Layout and the rectangles after it read it), the widget, FluentFlyout's flyouts
+void Dock::FramePlace(const FrameState& f) {
+    const auto& now = f.now; const auto& fullscreen = f.fullscreen;
     hideOff = (1 - reveal.x) * (margin + barThick + 34 * scale);
-    Layout(now);
+    Layout();
     ComputePanelRect();
     PlaceWidget(fullscreen);
     {   // FluentFlyout's flyouts on this monitor settle next to the dock while it is up
@@ -514,40 +568,42 @@ void Dock::Update(double now, float dt, POINT cursor) {
         view.shown = reveal.target > 0.5f && !fullscreen;
         view.scale = scale;
         auto bar = RectUV(barU0, barU1, margin, margin + barThick);
-        view.bar = { winX + (LONG)bar.left, winY + (LONG)bar.top, winX + (LONG)bar.right, winY + (LONG)bar.bottom };
+        view.bar = ScreenRectTrunc(bar);
         view.slot = widgetShowing;
         auto slot = RectUV(widgetU0, widgetU1, margin, margin + barThick);
-        view.slotRect = { winX + (LONG)slot.left, winY + (LONG)slot.top, winX + (LONG)slot.right, winY + (LONG)slot.bottom };
+        view.slotRect = ScreenRectTrunc(slot);
         if (fluentflyout::PlaceFlyouts(view, now)) BringToFront();
     }
+}
 
-    // ---- hover + tooltip
-    hoverSlot = -1; hoverKind = HitNone; hoverButton = ButtonId::Count; hoverNotify = -1;
-    if (reveal.x > 0.9f && inMonitor && !dragging) {
-        Hit h = HitTestUV(cursorU, cursorV);
-        hoverKind = h.kind; hoverSlot = h.slot; hoverButton = h.button; hoverNotify = h.notify;
-    }
+void Dock::FrameHover(const FrameState& f) {
+    const auto& now = f.now; const auto& cursor = f.cursor; const auto& inMonitor = f.inMonitor; const auto& fullscreen = f.fullscreen;
+    // ---- hover + preview (the tooltip: FrameTooltip)
+    hover = Hit{};
+    if (reveal.x > 0.9f && inMonitor && !dragging) hover = HitTestUV(cursorU, cursorV);
 
     // DWM previews live in a separate, non-activating owned popup. Only the
     // hovered app is passed in; app discovery and activation remain in AppModel.
     std::shared_ptr<AppItem> previewApp;
     RECT previewAnchor{};
-    if (hoverKind == HitSlot && hoverSlot >= 0 && !slots[hoverSlot].ghost) {
-        auto& s = slots[hoverSlot];
+    if (hover.kind == HitSlot && hover.slot >= 0 && !slots[hover.slot].ghost) {
+        auto& s = slots[hover.slot];
         previewApp = s.app;
         float half = std::max(s.size * s.weight * 0.5f, 8 * scale);
         auto r = RectUV(s.u - half, s.u + half, 0,
             margin + pad + base * mag + 12 * scale);
-        previewAnchor = {winX + (LONG)std::floor(r.left), winY + (LONG)std::floor(r.top),
-            winX + (LONG)std::ceil(r.right), winY + (LONG)std::ceil(r.bottom)};
+        previewAnchor = ScreenRectOut(r);
     }
     windowPreview.Update(hwnd, previewApp, previewAnchor, mon, g_settings.edge, scale, cursor, now,
         reveal.x > 0.95f && reveal.target > 0.5f && !fullscreen && !menuOpen && !dragging && pressKind == HitNone);
+}
 
+void Dock::FramePanel(FrameState& f) {
+    const auto& now = f.now; const auto& dt = f.dt; const auto& insideDock = f.insideDock;
+    auto& anim = f.anim;
     // ---- system monitor panel: opens on hovering the sensor cell, stays while over cell/panel
     bool wantPanel = (debugForcePanel && reveal.target > 0.5f) || reveal.target > 0.5f && !menuOpen && !dragging &&
-        (hoverKind == HitSensor || hoverKind == HitPanel || (panelAlpha.target > 0.5f && insideDock &&
-         cursorU >= cells[HitSensor].u0 - 4 * scale && cursorU <= cells[HitSensor].u1 + 4 * scale));
+        (hover.kind == HitSensor || hover.kind == HitPanel || (panelAlpha.target > 0.5f && insideDock && NearSensorCell(cursorU)));
     if (wantPanel) { panelAlpha.target = 1; panelOutsideSince = -1; }
     else if (panelAlpha.target > 0.5f) {
         if (panelOutsideSince < 0) panelOutsideSince = now;
@@ -555,32 +611,38 @@ void Dock::Update(double now, float dt, POINT cursor) {
     }
     panelAlpha.step(dt, 320, 0.85f);
     if (!panelAlpha.settled()) anim = true;
+}
+
+// ---- tooltip
+void Dock::FrameTooltip(FrameState& f) {
+    const auto& now = f.now; const auto& dt = f.dt; const auto& cursor = f.cursor;
+    auto& anim = f.anim;
     std::wstring tip;
     const float barTip = margin + barThick + 8 * scale - hideOff;   // tooltips of the tray controls sit just above the bar
-    if (hoverKind == HitSlot && hoverSlot >= 0) {
-        auto& s = slots[hoverSlot];
+    if (hover.kind == HitSlot && hover.slot >= 0) {
+        auto& s = slots[hover.slot];
         tip = s.app ? s.app->name : L"시작";
         tooltipU = s.u;
         tooltipV = margin + pad + s.size * s.weight + s.bounceOff + 10 * scale - hideOff;
-    } else if (hoverKind == HitTray) {
+    } else if (hover.kind == HitTray) {
         tip = L"숨겨진 아이콘 표시";
         tooltipU = cells[HitTray].Mid(); tooltipV = barTip;
-    } else if (hoverKind == HitClock) {
+    } else if (hover.kind == HitClock) {
         SYSTEMTIME st; GetLocalTime(&st);
         wchar_t d[128] = {};
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, &st, nullptr, d, 128, nullptr);
         tip = d;
         tooltipU = cells[HitClock].Mid(); tooltipV = barTip;
-    } else if (hoverKind == HitBattery) {
+    } else if (hover.kind == HitBattery) {
         tip = battery::Tooltip(g_sys.Battery());
         tooltipU = cells[HitBattery].Mid(); tooltipV = barTip;
-    } else if (hoverKind == HitButton) {
-        tip = (this->*Button(hoverButton).tooltip)();
-        tooltipU = Cell_(hoverButton).Mid(); tooltipV = barTip;
-    } else if (hoverKind == HitNotify && NotifyKey(hoverNotify)) {
-        const auto& c = notifyCells[hoverNotify];
+    } else if (hover.kind == HitButton) {
+        tip = (this->*Button(hover.button).tooltip)();
+        tooltipU = Cell_(hover.button).Mid(); tooltipV = barTip;
+    } else if (hover.kind == HitNotify && NotifyKey(hover.notify)) {
+        const auto& c = notifyCells[hover.notify];
         tip = c.tip;   // empty for programs that open their own pop-up instead
-        tooltipU = (c.u0 + c.u1) * 0.5f; tooltipV = barTip;
+        tooltipU = c.Mid(); tooltipV = barTip;
     }
     if (windowPreview.Open()) { tip.clear(); tooltipAlpha.snap(0); }
     if (!tip.empty()) { tooltipText = tip; tooltipAlpha.target = 1; }
@@ -588,25 +650,30 @@ void Dock::Update(double now, float dt, POINT cursor) {
     tooltipAlpha.step(dt, 500, 1.0f);
     if (!tooltipAlpha.settled()) anim = true;
     NotifyHover(now, cursor);
+}
 
+void Dock::FrameCapture(const FrameState& f) {
+    const auto& now = f.now; const auto& wasVisible = f.wasVisible; const auto& prevU = f.prevU; const auto& prevV = f.prevV;
+    const auto& fsMonitor = f.fsMonitor; const auto& keep = f.keep; const auto& insideDock = f.insideDock; const auto& inPreview = f.inPreview;
+    const auto& alwaysShown = f.alwaysShown; const auto& anim = f.anim;
     // ---- pointer reach: what the pointer changes in the picture (hover, magnification, tooltips, the
     // panel) lies around the bar. Moves anywhere else need no redraw - an always-shown dock would
     // otherwise redraw on every move on any monitor, a game's mouse movement included.
     const float reach = margin + barThick + base * (mag - 1) + 32 * scale, side = 32 * scale;
     auto nearBar = [&](float u, float v) { return v < reach && u > barU0 - side && u < barU1 + side; };
-    const bool panelShown = panelAlpha.x > 0.01f || panelAlpha.target > 0.5f;
+    const bool panelShown = PanelShown();
     const bool pointerNear = nearBar(cursorU, cursorV) || insideDock || panelShown || dragging;
 
     // ---- capture lifetime
-    bool visibleNow = reveal.x > 0.002f || reveal.target > 0.5f;
+    bool visibleNow = RevealShown();
     // An always-shown dock nobody is using rests: no vsync-paced frames, its glass follows the screen at
     // the main loop's idle pace (~30 fps). While a fullscreen app (a game) is in front on another
     // monitor it also stops capturing and keeps its last glass: only the clock and sensor text update.
     bool engaged = keep || pointerNear || inPreview || windowPreview.Open() ||
                    tooltipAlpha.target > 0.5f || magAmount.target > 0.5f;
-    bool resting = alwaysShown && visibleNow && !engaged && !recording;
+    bool resting = alwaysShown && visibleNow && !engaged && !rec.recording;
     bool frozen = resting && fsMonitor && fsMonitor != monitor;
-    if ((visibleNow && !frozen) || recording) lastCaptureWanted = now;
+    if ((visibleNow && !frozen) || rec.recording) lastCaptureWanted = now;
     if (now - lastCaptureWanted < 0.05) {
         // a failing start (RDP, protected display...) is retried every few seconds, not every frame
         if (!capture.Active() && now >= nextCaptureTry && !capture.Start(monitor)) nextCaptureTry = now + 3.0;
@@ -618,7 +685,7 @@ void Dock::Update(double now, float dt, POINT cursor) {
     bool pollNow = !frozen && (!resting || now >= nextRestingPoll);
     if (capture.Active() && pollNow) {
         if (resting) nextRestingPoll = now + 0.028;
-        if (capture.Poll(backdrop.tex.Get(), winX - mon.left, winY - mon.top, winW, winH, recording ? fullTex.tex.Get() : nullptr)) {
+        if (capture.Poll(backdrop.tex.Get(), winX - mon.left, winY - mon.top, winW, winH, rec.recording ? rec.fullTex.tex.Get() : nullptr)) {
             backdropDirty = true;
             if (visibleNow) { dirty = true; glassKept = true; }
         }
@@ -630,15 +697,14 @@ void Dock::Update(double now, float dt, POINT cursor) {
     if (anim) dirty = true;
     if (visibleNow && (pointerNear || nearBar(prevU, prevV)) && (prevU != cursorU || prevV != cursorV)) dirty = true;
     if (wasVisible != (reveal.x > 0.002f)) dirty = true;
-    busy = anim || peeking || recording || (visibleNow && !resting);
+    busy = anim || peeking || rec.recording || (visibleNow && !resting);
     restingPrev = resting;
-    UpdateRegion();
 }
 
 float Dock::UnpinLine() const {
     const float q = 32 * scale;   // UpdateRegion's rounding
     const float regionTop = std::min(std::ceil(IconStripTop() / q) * q, T);
-    return std::max(regionTop + base / 2, margin + pad + base * mag + 10 * scale);
+    return std::max(regionTop + base / 2, MagnifiedTop());
 }
 
 void Dock::UpdateRegion() {
@@ -647,11 +713,11 @@ void Dock::UpdateRegion() {
         RECT q = { (LONG)std::floor(f.left), (LONG)std::floor(f.top), (LONG)std::ceil(f.right), (LONG)std::ceil(f.bottom) };
         if (IsRectEmpty(&r)) r = q; else UnionRect(&r, &r, &q);
     };
-    if (reveal.x > 0.002f || reveal.target > 0.5f) {
+    if (RevealShown()) {
         float q = 32 * scale;
         float u0 = std::floor((barU0 - 14 * scale) / q) * q, u1 = std::ceil((barU1 + 14 * scale) / q) * q;
         float vTop = IconStripTop();
-        if (magAmount.x > 0.01f || magAmount.target > 0.5f) vTop = margin + pad + base * mag + 10 * scale;
+        if (magAmount.x > 0.01f || magAmount.target > 0.5f) vTop = MagnifiedTop();
         for (auto& s : slots) if (s.bounceOff > 0 || s.bounceCount > 0 || s.bounceLoop) vTop = std::max(vTop, margin + pad + s.size + base * 0.95f + 4 * scale);
         if (sbCount > 0) vTop = std::max(vTop, margin + barThick + base * 0.95f);
         vTop = std::ceil(vTop / q) * q;
@@ -669,14 +735,14 @@ void Dock::UpdateRegion() {
             add(RectUV(s.u - sz / 2 - 6 * scale, s.u + sz / 2 + 6 * scale, 0, margin + pad + sz + base * 0.95f + 8 * scale));
         }
     }
-    if (panelAlpha.x > 0.01f || panelAlpha.target > 0.5f) {
+    if (PanelShown()) {
         D2D1_RECT_F pr = panelRect;
         pr.left -= 20 * scale; pr.top -= 20 * scale; pr.right += 20 * scale; pr.bottom += 24 * scale;
         add(pr);
     }
     if (sbPeek.x > 0.001f || sbPeek.target > 0) {
         bool vert = IsVertical(g_settings.edge);
-        float c = (cells[HitSensor].u0 + cells[HitSensor].u1) * 0.5f, a = vert ? 52 * scale : 112 * scale, depth = vert ? 84 * scale : 40 * scale;
+        float c = cells[HitSensor].Mid(), a = vert ? 52 * scale : 112 * scale, depth = vert ? 84 * scale : 40 * scale;
         add(RectUV(c - a / 2 - 6 * scale, c + a / 2 + 6 * scale, 0, margin + depth + base * 0.95f + 10 * scale));
     }
     RECT win = { 0, 0, winW, winH };

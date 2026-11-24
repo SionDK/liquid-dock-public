@@ -2,16 +2,10 @@
 #include "fluent_logic.h"
 #include "fluent_settings.h"
 #include "tray_host.h"
+#include "elevation.h"
 #include "explorer_taskbar.h"
 #include <shellapi.h>
-#include <shlobj.h>
-#include <tlhelp32.h>
-#include <atomic>
-#include <mutex>
-#include <optional>
 #include "fluent_internal.h"
-
-extern Settings g_settings;
 
 #ifndef LD_FLUENT_EXE
 #define LD_FLUENT_EXE L"FluentFlyout.exe"
@@ -32,6 +26,7 @@ std::wstring FileOf(const std::wstring& path) {
 std::vector<HMONITOR> g_monitorHandles;
 std::vector<fluentlogic::Monitor> g_monitorDescs;
 double g_monitorsAt = -1;
+int g_fileMonitor = -1;                     // g_fileSetting as a position among the monitors (UpdateMonitor)
 
 void RefreshMonitors(double now) {
     if (g_monitorsAt >= 0 && now - g_monitorsAt < 5.0) return;
@@ -74,10 +69,10 @@ double g_lostAt = -1;
 double g_adoptedAt = -1;                     // when the current widget window was found
 double g_nextScan = 0;
 HMONITOR g_monitor = nullptr;                // the monitor its widget goes to
-bool g_lastOpen = false;
+bool g_decidedOpen = false;                  // the slot's state as WidgetState last decided it (not while the first list is awaited)
 bool g_slotShown = false;                    // what WidgetState last answered (closed while the dock takes no widget)
 RECT g_lastBox{};                            // what it showed while its slot was open
-enum class ParentKind { None, Host, Explorer, Other };
+enum class ParentKind { None, Host, ExplorerMain, ExplorerSecondary, Other };
 HWND g_parent = (HWND)-1;                    // where its widget window is (looked at when that changes)
 ParentKind g_parentKind = ParentKind::None;
 bool g_parentTells = false;                  // ...one of Explorer's taskbars that tells FluentFlyout's monitor
@@ -94,9 +89,7 @@ bool IsFluentProcess(DWORD pid) {
     lastResult = false;
     HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!p) return false;
-    wchar_t path[MAX_PATH * 2];
-    DWORD n = ARRAYSIZE(path);
-    if (QueryFullProcessImageNameW(p, 0, path, &n)) lastResult = !_wcsicmp(FileOf(std::wstring(path, n)).c_str(), LD_FLUENT_EXE);
+    lastResult = !_wcsicmp(FileOf(ImagePath(p)).c_str(), LD_FLUENT_EXE);
     CloseHandle(p);
     return lastResult;
 }
@@ -139,8 +132,8 @@ ParentKind Classify(HWND parent) {
     if (parent == trayhost::Window()) return ParentKind::Host;
     wchar_t cls[64] = {};
     GetClassNameW(parent, cls, 64);
-    if (!wcscmp(cls, L"Shell_SecondaryTrayWnd")) return ParentKind::Explorer;
-    if (!wcscmp(cls, L"Shell_TrayWnd") && !GetPropW(parent, kTrayHostProp)) return ParentKind::Explorer;
+    if (!wcscmp(cls, L"Shell_SecondaryTrayWnd")) return ParentKind::ExplorerSecondary;
+    if (!wcscmp(cls, L"Shell_TrayWnd") && !GetPropW(parent, kTrayHostProp)) return ParentKind::ExplorerMain;
     return ParentKind::Other;
 }
 
@@ -181,18 +174,16 @@ void WatchWidgetParent(double now, bool hosting) {
     if (moved || g_choiceDirty) {
         const bool told = g_parentTells;
         g_parentTells = false;
-        if (g_parentKind == ParentKind::Explorer) {
-            wchar_t cls[64] = {};
-            GetClassNameW(parent, cls, 64);
+        if (g_parentKind == ParentKind::ExplorerMain || g_parentKind == ParentKind::ExplorerSecondary) {
             int secondaries = 0;
             for (HWND s = nullptr; (s = FindWindowExW(nullptr, s, L"Shell_SecondaryTrayWnd", nullptr)) != nullptr && secondaries < 16;) ++secondaries;
-            g_parentTells = fluentlogic::ShowsMonitor(!wcscmp(cls, L"Shell_SecondaryTrayWnd"), secondaries, (int)g_monitorHandles.size());
+            g_parentTells = fluentlogic::ShowsMonitor(g_parentKind == ParentKind::ExplorerSecondary, secondaries, (int)g_monitorHandles.size());
             if (!g_parentTells && (moved || told))
                 Log(L"fluentflyout: Explorer has no taskbar on every display (%d secondary, %d monitors): FluentFlyout puts its widget into the main one when its monitor has none - its settings decide",
                     secondaries, (int)g_monitorHandles.size());
         }
     }
-    if (g_parentKind == ParentKind::Explorer && g_parentTells) {
+    if ((g_parentKind == ParentKind::ExplorerMain || g_parentKind == ParentKind::ExplorerSecondary) && g_parentTells) {
         HMONITOR m = MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST);
         if (m != g_shownMonitor)
             Log(L"fluentflyout: FluentFlyout took that taskbar: its widget belongs on the %s", MonitorText(m).c_str());
@@ -205,8 +196,8 @@ void WatchWidgetParent(double now, bool hosting) {
     if (g_notInHostLogged || now - g_notInHostSince < 6) return;
     g_notInHostLogged = true;
     Log(L"fluentflyout: FluentFlyout has not moved its widget into the dock's window (it is in %s)%s", ParentName(parent).c_str(),
-        trayhost::ProcessElevated() ? L" - the dock runs as administrator, and Windows does not let an ordinary program put a window into an elevated one: start Liquid Dock normally"
-                                    : L" - is FluentFlyout's taskbar widget on, with Premium?");
+        ProcessElevated() ? L" - the dock runs as administrator, and Windows does not let an ordinary program put a window into an elevated one: start Liquid Dock normally"
+                          : L" - is FluentFlyout's taskbar widget on, with Premium?");
 }
 
 // The dock whose slot holds the widget (fluentlogic::WantedMonitor).
@@ -236,8 +227,7 @@ void ForgetProcess() {
     g_pid = 0;
     if (g_proc) { CloseHandle(g_proc); g_proc = nullptr; }
     Unhook();
-    g_flyouts.clear();
-    g_lift.clear();
+    ForgetFlyouts();
 }
 
 void Forget(const wchar_t* why) {
@@ -252,7 +242,7 @@ void Forget(const wchar_t* why) {
     g_lostAt = -1;
     g_shownMonitor = nullptr;
     g_shownAt = -1;
-    g_lastOpen = g_slotShown = false;
+    g_decidedOpen = g_slotShown = false;
     g_lastBox = {};
     g_namesWanted = false;   // no apps named for a filter nothing uses
     WantMedia(false);        // the media thread sleeps
@@ -329,8 +319,7 @@ void Tick(double now) {
     if (g_mediaWanted) UpdateHasMedia(now);
     if (g_widget) WatchWidgetParent(now, WantsHost() && trayhost::Window() != nullptr);
     UpdateMonitor();
-    for (size_t i = g_flyouts.size(); i-- > 0;)
-        if (!IsWindow(g_flyouts[i].h) || !IsWindowVisible(g_flyouts[i].h)) g_flyouts.erase(g_flyouts.begin() + i);
+    PruneFlyouts();
 }
 
 bool Present() { return g_settings.fluentFlyout && (g_widget != nullptr || g_lostWidget != nullptr); }
@@ -349,10 +338,10 @@ Widget WidgetState() {
     w.monitor = g_monitor;
     // Its widget window is being made again, or the new one has not reached the host window yet:
     // the slot keeps its place and size for that moment.
-    auto keep = [&] { w.open = g_slotShown = g_lastOpen; w.box = g_lastBox; w.fitted = true; return w; };
+    auto keep = [&] { w.open = g_slotShown = g_decidedOpen; w.box = g_lastBox; w.fitted = true; return w; };
     if (!g_widget) return keep();
     auto hosted = trayhost::HostedState();
-    if (hosted.window != g_widget && g_lastOpen && NowSeconds() - g_adoptedAt < 1.6) return keep();
+    if (hosted.window != g_widget && g_decidedOpen && NowSeconds() - g_adoptedAt < 1.6) return keep();
     w.box = hosted.box;
     w.fitted = hosted.fitted;
     const bool there = hosted.window == g_widget && !IsRectEmpty(&hosted.box);
@@ -361,8 +350,8 @@ Widget WidgetState() {
     } else {
         bool content = !g_ff.loaded || !g_ff.hideCompletely || g_media.value;
         w.open = there && content;
-        if (w.open != g_lastOpen) {
-            g_lastOpen = w.open;
+        if (w.open != g_decidedOpen) {
+            g_decidedOpen = w.open;
             Log(L"fluentflyout: widget slot %s (%s)", w.open ? L"open" : L"closed",
                 w.open ? L"showing" : hosted.window != g_widget ? L"widget hidden or not in the dock's window"
                        : !content ? L"nothing playing, hide completely" : L"empty");
@@ -411,11 +400,7 @@ bool OpenSettings() {
         wchar_t aumid[256] = {};
         UINT32 len = ARRAYSIZE(aumid);
         if (getAumid && getAumid(p, &len, aumid) == ERROR_SUCCESS && aumid[0]) target = std::wstring(L"shell:AppsFolder\\") + aumid;
-        else {
-            wchar_t path[MAX_PATH * 2];
-            DWORD n = ARRAYSIZE(path);
-            if (QueryFullProcessImageNameW(p, 0, path, &n)) target.assign(path, n);
-        }
+        else target = ImagePath(p);
         CloseHandle(p);
     }
     if (target.empty()) return false;
@@ -426,12 +411,7 @@ bool OpenSettings() {
 
 void Shutdown() {
     Forget(L"shutting down");
-    if (g_mediaThread) {
-        SetEvent(g_mediaStop);
-        WaitForSingleObject(g_mediaThread, 1500);   // a media service that hangs does not hold up exit
-        CloseHandle(g_mediaThread);
-        g_mediaThread = nullptr;
-    }
+    StopMedia();
 }
 
 }   // namespace fluentflyout

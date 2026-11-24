@@ -1,12 +1,9 @@
 #include "admin_helper.h"
 #include "admin_client.h"
-#include "sensors.h"
 #include <shlobj.h>
 #include <mutex>
 #include <thread>
 #include <vector>
-
-extern Settings g_settings;
 
 namespace adminhelper {
 namespace {
@@ -48,7 +45,7 @@ uint64_t InstalledVersion() {
 
 bool Installed() { return GetFileAttributesW(InstalledPath().c_str()) != INVALID_FILE_ATTRIBUTES; }
 
-// The copy shipped with the dock, next to it (what --install copies from: sensors.cpp InstallHelper).
+// The copy shipped with the dock, next to it (what --install copies from: admin_helper_process.cpp InstallHelper).
 std::wstring ShippedPath() {
     wchar_t p[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, p, MAX_PATH);
@@ -103,7 +100,7 @@ bool Queue(std::vector<Pending> requests, int seconds, bool start) {
     if (g_waiting) return true;
     g_waiting = true;
     const bool waits = TryDetach([seconds, start] {
-        if (start) SensorClient::StartHelper();
+        if (start) StartHelper();
         ULONGLONG until = GetTickCount64() + seconds * 1000ull;
         while (!PipeExists(Pipe()) && GetTickCount64() < until) Sleep(150);
         std::vector<Pending> todo;
@@ -143,7 +140,7 @@ bool Offer(const std::wstring& app, bool update) {
         Log(L"admin helper: declined (settings: adminWindows=2)");
         return false;
     }
-    if (!SensorClient::InstallHelper(nullptr)) return false;
+    if (!InstallHelper(nullptr)) return false;
     g_settings.adminWindows = 1;
     g_settings.Save();
     Log(L"admin helper: %ls", update ? L"updating the installed helper" : L"installing");
@@ -220,7 +217,7 @@ void Tick(double now) {
     if (PipeExists(Pipe())) { interval = 20.0; return; }
     if (!Installed() || !HelperCurrent(InstalledVersion())) return;   // the next click offers it
     interval = std::min(interval * 2.0, 600.0);
-    if (!TryDetach([] { SensorClient::StartHelper(); }))   // the next pass tries again
+    if (!TryDetach([] { StartHelper(); }))   // the next pass tries again
         Log(L"admin helper: no thread to start it on (tried again in %.0f s)", interval);
 }
 
@@ -230,7 +227,7 @@ bool NeedsInstall() {
     if (HelperNeedsInstall(haveInstalled, installed.data(), installed.size(), haveShipped, shipped.data(), shipped.size())) return true;
     // the same bytes, but its task gone (deleted, or a registration that failed after the copy): installed again,
     // which registers it - the only way back short of a new version. Asked only with a copy to install from.
-    return haveShipped && !SensorClient::HelperTaskRegistered();
+    return haveShipped && !HelperTaskRegistered();
 }
 
 void Enable(HWND owner) {
@@ -242,7 +239,7 @@ void Enable(HWND owner) {
         g_lastStart = -1e9;   // start it on the next pass
         return;
     }
-    if (SensorClient::InstallHelper(owner)) {
+    if (InstallHelper(owner)) {
         g_settings.adminWindows = 1;
         g_settings.Save();
         Log(L"admin helper: installing (settings)");

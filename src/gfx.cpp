@@ -251,6 +251,16 @@ bool Gfx::Init() {
     return true;
 }
 
+// The fmt* members in the order a FontSet keeps them (f[0] ... f[18]).
+static constexpr ComPtr<IDWriteTextFormat> Gfx::* kFontMembers[] = {
+    &Gfx::fmtTooltip, &Gfx::fmtClock, &Gfx::fmtClockSmall, &Gfx::fmtGlyph, &Gfx::fmtTiny,
+    &Gfx::fmtPanelTitle, &Gfx::fmtPanelSmall, &Gfx::fmtPanelSmallR, &Gfx::fmtPanelText,
+    &Gfx::fmtPanelTextR, &Gfx::fmtPanelTextBoldR, &Gfx::fmtPanelTemp,
+    &Gfx::fmtTime, &Gfx::fmtDate, &Gfx::fmtTimeLarge, &Gfx::fmtDateLarge,
+    &Gfx::fmtClockLg, &Gfx::fmtClockSmallLg, &Gfx::fmtTinyLg,
+};
+static_assert(std::size(kFontMembers) == std::extent_v<decltype(Gfx::FontSet::f)>);
+
 // Text formats per screen scale (monitors can differ). The current set is swapped into the fmt*
 // members, so each dock calls this before it lays out or draws.
 void Gfx::EnsureFonts(float scale) {
@@ -258,10 +268,7 @@ void Gfx::EnsureFonts(float scale) {
     for (auto& s : fontSets) {
         if (std::fabs(s.scale - scale) < 0.01f) {
             fontScale = scale;
-            fmtTooltip = s.f[0]; fmtClock = s.f[1]; fmtClockSmall = s.f[2]; fmtGlyph = s.f[3]; fmtTiny = s.f[4];
-            fmtPanelTitle = s.f[5]; fmtPanelSmall = s.f[6]; fmtPanelSmallR = s.f[7]; fmtPanelText = s.f[8];
-            fmtPanelTextR = s.f[9]; fmtPanelTextBoldR = s.f[10]; fmtPanelTemp = s.f[11];
-            fmtTime = s.f[12]; fmtDate = s.f[13]; fmtTimeLarge = s.f[14]; fmtDateLarge = s.f[15];
+            for (size_t n = 0; n < std::size(kFontMembers); ++n) this->*kFontMembers[n] = s.f[n];
             return;
         }
     }
@@ -309,10 +316,12 @@ void Gfx::EnsureFonts(float scale) {
     mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 12.0f, fmtDate);
     mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_SEMI_BOLD, 20.0f, fmtTimeLarge);
     mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 14.0f, fmtDateLarge);
-    fontSets.push_back({ scale, { fmtTooltip, fmtClock, fmtClockSmall, fmtGlyph, fmtTiny,
-                                  fmtPanelTitle, fmtPanelSmall, fmtPanelSmallR, fmtPanelText,
-                                  fmtPanelTextR, fmtPanelTextBoldR, fmtPanelTemp,
-                                  fmtTime, fmtDate, fmtTimeLarge, fmtDateLarge } });
+    mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0f, fmtClockLg);
+    mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 12.5f, fmtClockSmallLg);
+    mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_SEMI_BOLD, 10.5f, fmtTinyLg);
+    FontSet set{ scale };
+    for (size_t n = 0; n < std::size(kFontMembers); ++n) set.f[n] = this->*kFontMembers[n];
+    fontSets.push_back(std::move(set));
 }
 
 ID2D1LinearGradientBrush* Gfx::GradientBrush(const D2D1_GRADIENT_STOP* stops, UINT32 count, D2D1_POINT_2F from, D2D1_POINT_2F to) {

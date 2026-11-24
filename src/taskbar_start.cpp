@@ -1,6 +1,7 @@
 #include "taskbar_start.h"
 #include "explorer_taskbar.h"
 #include <uiautomation.h>
+#include "explorer_uia.h"
 #include <mutex>
 #include <thread>
 
@@ -10,14 +11,17 @@
 namespace taskbarstart {
 namespace {
 
+using exploreruia::kUiaTimeoutMs;        // per call into a busy Explorer (explorer_uia.h)
+using exploreruia::kUiaTimeout;
+using exploreruia::Gone;                 // what a failed call means (explorer_uia.h)
+using exploreruia::MayHaveRun;
+
 constexpr DWORD kRememberWaitMs = 800;   // the taskbar's vanishing waits this long for the lookup
-constexpr DWORD kUiaTimeoutMs = 500;     // per call into a busy Explorer (connection, transaction)
 constexpr double kLookAgain = 30.0;      // a lookup that found nothing is not repeated sooner for that taskbar,
 constexpr double kLookAgainMax = 1800.0; // ...and twice as long after each further miss, up to this
 constexpr double kLookupBudget = 1.0;    // a lookup tries no further root once this long has gone (a hung Explorer)
 constexpr double kCheckAgain = 10.0;     // a kept button is asked whether it is still there at most this often
 constexpr double kQuietWait = 5.0;       // after a wait for a lookup ran out, the UI thread does not wait again this long
-constexpr HRESULT kUiaTimeout = static_cast<HRESULT>(0x80131505);   // UIA_E_TIMEOUT (not in every SDK's headers)
 
 struct Entry {
     HWND taskbar = nullptr;
@@ -65,17 +69,6 @@ IUIAutomation* Uia() {
         }
     }
     return s.uia.Get();
-}
-
-// The element was surely not reached: it is gone (Explorer rebuilt its taskbar, or restarted). Look again.
-bool Gone(HRESULT hr) {
-    return hr == static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE) || hr == RPC_E_DISCONNECTED || hr == RPC_E_SERVER_DIED_DNE ||
-           hr == CO_E_OBJNOTCONNECTED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) || hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED_DNE);
-}
-// The call failed, and may have run all the same (the call timed out, or Explorer went away during it).
-bool MayHaveRun(HRESULT hr) {
-    return hr == kUiaTimeout || hr == RPC_E_TIMEOUT || hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT) || hr == RPC_E_SERVER_DIED ||
-           hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED);
 }
 
 const wchar_t* Name(HWND taskbar) { return taskbar == ExplorerTaskbar() ? L"the main taskbar" : L"a secondary taskbar"; }
@@ -227,7 +220,7 @@ Found Look(HWND taskbar, bool check) {
     if (button) Log(L"taskbar: kept the Start button of %ls (found %ls)", Name(taskbar), from);
     else if (sayNone)
         Log(L"taskbar: no Start button in the automation tree of %ls (not built yet, or hidden): looked for again after %.0f s at the "
-            L"earliest (longer after each miss); until found the start button asks the shell", Name(taskbar), again);
+            L"earliest (longer after each miss); until found the start button has no press: the shell's request, then the Windows key", Name(taskbar), again);
     return button ? Found::Now : Found::NoButton;
 }
 
@@ -245,15 +238,63 @@ After Classify(HRESULT hr, bool pressCall) {
     return After::NotDone;
 }
 
-After PressElement(IUIAutomationElement* e, HRESULT* hr, const wchar_t** how) {
+// The button's toggle state (ToggleState: 0 off, 1 on, 2 indeterminate; -1 not read) - for the log, and for a press
+// asked only of a button that is off. took: the read's seconds are added to it. timedOut: the read may have hung on
+// Explorer (nothing more is read then). readHr (when given): what the read answered.
+int StateOf(IUIAutomationTogglePattern* toggle, double* took, bool* timedOut, HRESULT* readHr = nullptr) {
+    const double t0 = NowSeconds();
+    ToggleState s = ToggleState_Off;
+    const HRESULT hr = toggle->get_CurrentToggleState(&s);
+    *took += NowSeconds() - t0;
+    if (MayHaveRun(hr)) *timedOut = true;
+    if (readHr) *readHr = hr;
+    return SUCCEEDED(hr) && s >= ToggleState_Off && s <= ToggleState_Indeterminate ? static_cast<int>(s) : -1;
+}
+
+// What a toggle press saw of the button's state: right before the press and right after it returned (-1: not
+// read). For the log - and, for a press asked only of a button that is off (onlyOff), before decides whether it goes
+// out at all (held: it did not). afterTook: the seconds the read after the press took - left
+// out of Pressed::took. The read before it is not left out: it goes to the same Explorer thread the press does, so
+// a stall it took over from the press must still count as Explorer busy (kBusyCall), as it would have on the press.
+struct ToggleSeen {
+    int before = -1, after = -1;
+    double afterTook = 0;
+    bool held = false;
+};
+
+// onlyOff (with seen): pressed by its Toggle pattern alone, and only when its state, read right before, is off.
+// Anything else - on, not to be read, no Toggle pattern - and nothing is pressed (seen->held); a button that is
+// gone answers After::Gone all the same, as a press of it would (it is looked up once more).
+After PressElement(IUIAutomationElement* e, HRESULT* hr, const wchar_t** how, ToggleSeen* seen = nullptr, bool onlyOff = false) {
+    onlyOff = onlyOff && seen;
     ComPtr<IUIAutomationInvokePattern> invoke;
     *hr = e->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke));
     if (FAILED(*hr)) { *how = L"its patterns could not be read"; return Classify(*hr, false); }
-    if (invoke) { *how = L"invoke"; *hr = invoke->Invoke(); return Classify(*hr, true); }
+    if (invoke && !onlyOff) { *how = L"invoke"; *hr = invoke->Invoke(); return Classify(*hr, true); }
     ComPtr<IUIAutomationTogglePattern> toggle;
     *hr = e->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&toggle));
     if (FAILED(*hr)) { *how = L"its patterns could not be read"; return Classify(*hr, false); }
-    if (toggle) { *how = L"toggle"; *hr = toggle->Toggle(); return Classify(*hr, true); }
+    if (toggle) {
+        *how = L"toggle";
+        bool timedOut = false;
+        double beforeTook = 0;
+        HRESULT readHr = S_OK;
+        if (seen) seen->before = StateOf(toggle.Get(), &beforeTook, &timedOut, &readHr);
+        if (onlyOff && seen->before != ToggleState_Off) {   // on (Explorer holds Start open), or not to be read
+            seen->held = true;
+            if (Gone(readHr)) { *hr = readHr; return After::Gone; }
+            return After::NotDone;
+        }
+        *hr = toggle->Toggle();
+        const After a = Classify(*hr, true);
+        if (seen && a == After::Done && !timedOut) seen->after = StateOf(toggle.Get(), &seen->afterTook, &timedOut);
+        return a;
+    }
+    if (onlyOff) {   // (*hr is S_OK, the pattern query's)
+        *how = L"no toggle state to read";
+        seen->held = true;
+        return After::NotDone;
+    }
     ComPtr<IUIAutomationLegacyIAccessiblePattern> acc;
     *hr = e->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&acc));
     if (FAILED(*hr)) { *how = L"its patterns could not be read"; return Classify(*hr, false); }
@@ -398,14 +439,20 @@ bool Kept(HMONITOR monitor) {
     return false;
 }
 
-Pressed Press(HMONITOR monitor) {
+Pressed Press(HMONITOR monitor, bool onlyWhenOff) {
     Pressed p;
     HWND taskbar = TaskbarOn(monitor);
     if (!taskbar) { p.hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND); p.how = L"no taskbar on this monitor"; return p; }
     KeepMta();
     for (int attempt = 0; attempt < 2; ++attempt) {
         const Found f = Find(monitor);
-        if (f != Found::Kept && f != Found::Now) { p.hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND); p.how = FoundText(f); return p; }
+        if (f != Found::Kept && f != Found::Now) {
+            p.hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+            // held by the first attempt (only when off: its state's read answered "gone"), not found again: still nothing
+            // pressed (held), and how says so - the lookup's answer alone would read as if no button had been there
+            p.how = p.held ? L"it went away as its state was read, and was not found again" : FoundText(f);
+            return p;
+        }
         ComPtr<IUIAutomationElement> button;
         {
             std::lock_guard<std::mutex> lk(S().book);
@@ -413,12 +460,16 @@ Pressed Press(HMONITOR monitor) {
         }
         if (!button) { p.how = L"the button went away meanwhile"; continue; }   // dropped by another thread: look again
         After a = After::NotDone;
+        ToggleSeen seen;
         {
             std::lock_guard<std::mutex> call(S().calls);
-            const double c0 = NowSeconds();   // the press itself, not the wait for the lock or a lookup
-            a = PressElement(button.Get(), &p.hr, &p.how);
-            p.took = NowSeconds() - c0;
+            const double c0 = NowSeconds();   // the press itself (with the state's read before it), not the wait for the
+            a = PressElement(button.Get(), &p.hr, &p.how, &seen, onlyWhenOff);   // lock, a lookup or the read after it
+            p.took = NowSeconds() - c0 - seen.afterTook;
         }
+        p.before = seen.before;
+        p.after = seen.after;
+        p.held = seen.held;
         p.ok = a == After::Done;
         p.unsure = a == After::Unsure || a == After::UnsureGone;
         if (a == After::Gone || a == After::UnsureGone) Drop(taskbar);

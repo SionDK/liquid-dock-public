@@ -24,7 +24,8 @@
 // looks for them.
 //   cl /std:c++20 /EHsc /utf-8 tests\tray_overflow_test.cpp user32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib uiautomationcore.lib
 #include "../src/common.h"
-#include "../src/system.h"
+#include "../src/native_taskbar.h"
+#include "../src/shell_front.h"
 #include "../src/explorer_taskbar.h"   // before the macro below: the real one keeps its name (and is never called)
 #include "../src/taskbar_visibility.h"
 #include <shellapi.h>
@@ -96,11 +97,8 @@ static std::wstring LogAfter(size_t from, const wchar_t* text, wchar_t end) {
     }
     return L"";
 }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
-}
+#define TEST_SUPPORT_QPC_NOW
+#include "test_support.h"
 
 // ---- a tray button as UI Automation sees it: a class, an automation id, Invoke for the chevron
 constexpr wchar_t kAccent[] = L"SystemTray.AccentButton", kOmni[] = L"SystemTray.OmniButton", kOmniRight[] = L"SystemTray.OmniButtonRight";
@@ -721,6 +719,42 @@ int main() {
               LogHas(log, L"tray button 2 cached (found from the taskbar window)") && g_appbarSets == 0,
               "an expanded taskbar: all three buttons are kept from its own window");
         bar.Quit();
+    }
+    {   // where the hidden-icons window goes next to the dock (OverflowPlacement, OpenOverflow's arithmetic): 12 px off
+        // the bar on the screen's side, centred on the anchor along it, 4 px inside the anchor's monitor. The gap and
+        // the margin are the same pixels at 150% (not scaled). Test monitors: 2560x1440 at 100% with
+        // an upright 1440x2560 at -1440,-560 to its left (a two-monitor desktop), 2880x1800 at 150% (a laptop's).
+        auto at = [](POINT anchor, Edge edge, RECT bar, int w, int h, RECT monitor) {
+            const RECT window{ 300, 200, 300 + w, 200 + h };   // where Windows showed it: only its size counts
+            return nativetray::OverflowPlacement(anchor, edge, bar, window, monitor);
+        };
+        auto is = [](POINT p, int x, int y) { return p.x == x && p.y == y; };
+        const RECT main100{ 0, 0, 2560, 1440 }, upright100{ -1440, -560, 0, 2000 }, laptop150{ 0, 0, 2880, 1800 };
+        // 100%: a 232x120 window
+        Check(is(at({ 1600, 1390 }, Edge::Bottom, { 780, 1352, 1780, 1428 }, 232, 120, main100), 1484, 1220),
+              "placement 100%, bottom: above the bar by 12 px, centred on the anchor");
+        Check(is(at({ 1600, 50 }, Edge::Top, { 780, 12, 1780, 88 }, 232, 120, main100), 1484, 100), "placement 100%, top: below the bar by 12 px");
+        Check(is(at({ -1390, 1100 }, Edge::Left, { -1428, 300, -1352, 1300 }, 232, 120, upright100), -1340, 1040),
+              "placement 100%, left (the upright monitor at -1440,-560): right of the bar by 12 px");
+        Check(is(at({ -50, 1100 }, Edge::Right, { -88, 300, -12, 1300 }, 232, 120, upright100), -332, 1040),
+              "placement 100%, right (the upright monitor): left of the bar by 12 px");
+        Check(is(at({ 2540, 1390 }, Edge::Bottom, { 1500, 1352, 2556, 1428 }, 232, 120, main100), 2324, 1220),
+              "placement 100%: kept 4 px inside the monitor's right edge");
+        Check(is(at({ -1390, -530 }, Edge::Left, { -1428, -548, -1352, 400 }, 232, 120, upright100), -1340, -556),
+              "placement 100%: kept 4 px inside the upright monitor's top (-560)");
+        Check(is(at({ 1600, 1390 }, Edge::Bottom, { 780, 1352, 1780, 1428 }, 233, 121, main100), 1484, 1219),
+              "placement: an odd width centred by w / 2 rounded down");
+        Check(is(at({ 100, 100 }, Edge::Bottom, { 0, 150, 200, 190 }, 232, 120, { 0, 0, 200, 200 }), 4, 18),
+              "placement: a window wider than its monitor stays at the left margin");
+        // 150%: a 348x180 window, the same 12 px and 4 px
+        Check(is(at({ 1800, 1725 }, Edge::Bottom, { 870, 1668, 2010, 1782 }, 348, 180, laptop150), 1626, 1476),
+              "placement 150%, bottom: above the bar by 12 px (not 18)");
+        Check(is(at({ 1800, 75 }, Edge::Top, { 870, 18, 2010, 132 }, 348, 180, laptop150), 1626, 144), "placement 150%, top: below the bar by 12 px");
+        Check(is(at({ 75, 1300 }, Edge::Left, { 18, 400, 132, 1400 }, 348, 180, laptop150), 144, 1210), "placement 150%, left: right of the bar by 12 px");
+        Check(is(at({ 2805, 1300 }, Edge::Right, { 2748, 400, 2862, 1400 }, 348, 180, laptop150), 2388, 1210),
+              "placement 150%, right: left of the bar by 12 px");
+        Check(is(at({ 2805, 1780 }, Edge::Right, { 2748, 800, 2862, 1790 }, 348, 180, laptop150), 2388, 1616),
+              "placement 150%: kept 4 px inside the monitor's bottom (not 6)");
     }
     g_explorerBar = nullptr;
     nativetray::g_uia.Reset();

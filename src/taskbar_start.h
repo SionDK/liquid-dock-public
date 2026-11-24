@@ -4,9 +4,10 @@
 // The Start button of Explorer's own taskbar, pressed through UI Automation: a click on the dock's start
 // button is then what a click on the taskbar's is - Explorer handles it, with all it does around it (which
 // monitor, the keyboard, the animation, a second press closing Start). start_menu.cpp decides when
-// (start_menu_logic.h): first, and checked; the shell's request and the Windows key stay the fallback.
+// (start_menu_logic.h): behind the shell's request, when that has not brought Start - and only while the
+// button's toggle state reads off (Press's onlyWhenOff); the Windows key is the last way.
 //
-// The taskbar stays while the dock runs, invisible (NativeTaskbar, system.h). On Windows 11 its buttons are
+// The taskbar stays while the dock runs, invisible (NativeTaskbar, native_taskbar.h). On Windows 11 its buttons are
 // XAML, reachable only through UI Automation - and perhaps only while the taskbar is expanded: native_tray.cpp
 // found the tray buttons gone from the automation tree once it auto-hides, an element found before still
 // working. So each taskbar's Start button is looked up just before the taskbar vanishes (Remember) and kept;
@@ -49,11 +50,21 @@ struct Pressed {
                                 // mid-call): never followed by another press, the shell or the key
     HRESULT hr = E_FAIL;
     const wchar_t* how = L"";   // "invoke", "toggle", "default action" - or why there was no press
-    double took = 0;            // seconds the press call itself took (slow: Explorer is busy)
+    double took = 0;            // seconds the press call itself took (slow: Explorer is busy), with the state's read
+                                // before it (a stall that read took over from the press still counts), not the one after
+    int before = -1, after = -1;   // a toggle press: the button's state (0 off, 1 on, 2 indeterminate; -1 not
+                                   // read) right before it and right after it went through - for the log, and
+                                   // before for onlyWhenOff
+    bool held = false;          // onlyWhenOff: nothing was pressed - the state did not read off (before), or the
+                                // button has no toggle state to read, or it went away as its state was read and was
+                                // not found again (how says so)
 };
 // Press the Start button of this monitor's taskbar (kept, or found now). A button that is gone (Explorer
 // rebuilt its taskbar) was surely not pressed: it is dropped and looked up once more. MTA threads only.
-Pressed Press(HMONITOR monitor);
+// onlyWhenOff (the start button's worker): by its Toggle pattern alone, and only when its state, read right
+// before, is off - on, Explorer holds Start open (the shell's request brought it, or is bringing it) and the
+// press would close it; a state not to be read is not pressed either (held).
+Pressed Press(HMONITOR monitor, bool onlyWhenOff = false);
 
 // Windows 10's taskbar (or ExplorerPatcher's classic one): no XAML Start button to press. Any thread.
 bool Classic();

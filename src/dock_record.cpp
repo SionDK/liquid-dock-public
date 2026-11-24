@@ -13,70 +13,70 @@ static void WriteRecordingInfo(int w, int h, int frames) {
 }
 
 void Dock::StartRecording(RECT crop, float outScale, bool append) {
-    if (recording) return;
+    if (rec.recording) return;
     RECT full = { 0, 0, mon.right - mon.left, mon.bottom - mon.top };
     IntersectRect(&crop, &crop, &full);
-    recCrop = crop;
-    recW = ((int)((crop.right - crop.left) * outScale)) & ~1;
-    recH = ((int)((crop.bottom - crop.top) * outScale)) & ~1;
-    if (recW < 16 || recH < 16) return;
+    rec.crop = crop;
+    rec.w = ((int)((crop.right - crop.left) * outScale)) & ~1;
+    rec.h = ((int)((crop.bottom - crop.top) * outScale)) & ~1;
+    if (rec.w < 16 || rec.h < 16) return;
     // The file first: when it cannot be opened (ffmpeg still reading the last one) nothing is recorded, no
     // monitor-sized texture is kept, and nothing is carried over to rebuilt docks to start later unasked.
     std::wstring dir = AppDataDir() + L"\\rec";
     CreateDirectoryW(dir.c_str(), nullptr);
-    errno_t err = _wfopen_s(&recFile, (dir + L"\\frames.raw").c_str(), append ? L"ab" : L"wb");
-    if (!recFile) {
+    errno_t err = _wfopen_s(&rec.file, (dir + L"\\frames.raw").c_str(), append ? L"ab" : L"wb");
+    if (!rec.file) {
         carryRecording = false;
         Log(L"recording: frames.raw cannot be opened (errno %d)%s", (int)err, append ? L" after the docks were rebuilt" : L" - not recording");
-        if (append) { WriteRecordingInfo(recW, recH, carryFrames); carryFrames = 0; }   // the frames written before the rebuild
+        if (append) { WriteRecordingInfo(rec.w, rec.h, carryFrames); carryFrames = 0; }   // the frames written before the rebuild
         return;
     }
-    dockFrame.Create(winW, winH, true);
-    fullTex.Create(mon.right - mon.left, mon.bottom - mon.top, false);
-    recRT.Create(recW, recH, true);
-    for (auto& st : recStage) {
-        D3D11_TEXTURE2D_DESC d; recRT.tex->GetDesc(&d);
+    rec.dockFrame.Create(winW, winH, true);
+    rec.fullTex.Create(mon.right - mon.left, mon.bottom - mon.top, false);
+    rec.rt.Create(rec.w, rec.h, true);
+    for (auto& st : rec.stage) {
+        D3D11_TEXTURE2D_DESC d; rec.rt.tex->GetDesc(&d);
         d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         st.Reset();
         g_gfx.d3d->CreateTexture2D(&d, nullptr, &st);
     }
-    ComPtr<IDXGISurface> surf; recRT.tex.As(&surf);
+    ComPtr<IDXGISurface> surf; rec.rt.tex.As(&surf);
     D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    recTarget.Reset();
-    g_gfx.dc->CreateBitmapFromDxgiSurface(surf.Get(), &bp, &recTarget);
+    rec.target.Reset();
+    g_gfx.dc->CreateBitmapFromDxgiSurface(surf.Get(), &bp, &rec.target);
 
     carryRecording = true; carryCrop = crop; carryScale = outScale;
     if (!append) carryFrames = 0;
     float zero[4] = {};
-    g_gfx.ctx->ClearRenderTargetView(dockFrame.rtv.Get(), zero);
-    recFrames = 0; recSlot = 0;
-    recNext = NowSeconds();
-    recording = true;
+    g_gfx.ctx->ClearRenderTargetView(rec.dockFrame.rtv.Get(), zero);
+    rec.frames = 0; rec.slot = 0;
+    rec.next = NowSeconds();
+    rec.recording = true;
     dirty = true;
-    Log(L"recording %dx%d from crop %d,%d %dx%d", recW, recH, crop.left, crop.top, crop.right - crop.left, crop.bottom - crop.top);
+    Log(L"recording %dx%d from crop %d,%d %dx%d", rec.w, rec.h, crop.left, crop.top, crop.right - crop.left, crop.bottom - crop.top);
 }
 
 void Dock::RecordTick(double now) {
-    if (!recording || now < recNext) return;
-    recNext += 1.0 / kRecFps;
-    if (now - recNext > 0.5) recNext = now;    // fell far behind: don't burst
+    if (!rec.recording || now < rec.next) return;
+    rec.next += 1.0 / kRecFps;
+    if (now - rec.next > 0.5) rec.next = now;    // fell far behind: don't burst
 
     GlassCB c = {};
-    c.rect[0] = (float)recCrop.left; c.rect[1] = (float)recCrop.top;
-    c.rect[2] = (float)(recCrop.right - recCrop.left); c.rect[3] = (float)(recCrop.bottom - recCrop.top);
-    c.shape[0] = (float)recW; c.shape[1] = (float)recH;
+    c.rect[0] = (float)rec.crop.left; c.rect[1] = (float)rec.crop.top;
+    c.rect[2] = (float)(rec.crop.right - rec.crop.left); c.rect[3] = (float)(rec.crop.bottom - rec.crop.top);
+    c.shape[0] = (float)rec.w; c.shape[1] = (float)rec.h;
     c.misc[0] = (float)(mon.right - mon.left); c.misc[1] = (float)(mon.bottom - mon.top);
     c.blur[0] = (float)(winX - mon.left); c.blur[1] = (float)(winY - mon.top); c.blur[2] = (float)winW; c.blur[3] = (float)winH;
     g_gfx.UpdateCB(c);
-    g_gfx.FullscreenPass(recRT.rtv.Get(), recW, recH, g_gfx.psRecord.Get(), fullTex.srv.Get(), dockFrame.srv.Get());
+    g_gfx.FullscreenPass(rec.rt.rtv.Get(), rec.w, rec.h, g_gfx.psRecord.Get(), rec.fullTex.srv.Get(), rec.dockFrame.srv.Get());
 
     // the dock hides the real cursor from capture; draw a classic arrow where it is
     POINT cp; GetCursorPos(&cp);
-    float sx = (float)recW / (recCrop.right - recCrop.left);
-    float px = (cp.x - mon.left - recCrop.left) * sx, py = (cp.y - mon.top - recCrop.top) * sx;
+    float sx = (float)rec.w / (rec.crop.right - rec.crop.left);
+    float px = (cp.x - mon.left - rec.crop.left) * sx, py = (cp.y - mon.top - rec.crop.top) * sx;
     auto* dc = g_gfx.dc.Get();
-    dc->SetTarget(recTarget.Get());
+    dc->SetTarget(rec.target.Get());
     dc->BeginDraw();
     {
         float k = 1.15f * scale * sx * 1.4f;
@@ -97,37 +97,37 @@ void Dock::RecordTick(double now) {
     dc->SetTarget(nullptr);
 
     // readback two frames late so the GPU never stalls us
-    g_gfx.ctx->CopyResource(recStage[recSlot % 3].Get(), recRT.tex.Get());
-    if (recSlot >= 2) {
-        auto* st = recStage[(recSlot - 2) % 3].Get();
+    g_gfx.ctx->CopyResource(rec.stage[rec.slot % 3].Get(), rec.rt.tex.Get());
+    if (rec.slot >= 2) {
+        auto* st = rec.stage[(rec.slot - 2) % 3].Get();
         D3D11_MAPPED_SUBRESOURCE m;
         if (SUCCEEDED(g_gfx.ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
-            for (int y = 0; y < recH; ++y) fwrite((BYTE*)m.pData + y * m.RowPitch, 4, recW, recFile);
+            for (int y = 0; y < rec.h; ++y) fwrite((BYTE*)m.pData + y * m.RowPitch, 4, rec.w, rec.file);
             g_gfx.ctx->Unmap(st, 0);
-            recFrames++;
+            rec.frames++;
         }
     }
-    recSlot++;
+    rec.slot++;
 }
 
 // The window is going away while recording (docks rebuilt): close the file, keep the count, and let
 // the new primary dock append (BuildDocks).
 void Dock::SuspendRecording() {
-    if (!recording) return;
-    recording = false;
-    if (recFile) { fclose(recFile); recFile = nullptr; }
-    carryFrames += recFrames;
-    dockFrame = {}; fullTex = {}; recRT = {}; recTarget.Reset();
-    for (auto& st : recStage) st.Reset();
+    if (!rec.recording) return;
+    rec.recording = false;
+    if (rec.file) { fclose(rec.file); rec.file = nullptr; }
+    carryFrames += rec.frames;
+    rec.dockFrame = {}; rec.fullTex = {}; rec.rt = {}; rec.target.Reset();
+    for (auto& st : rec.stage) st.Reset();
 }
 
 void Dock::StopRecording() {
     carryRecording = false;   // also one carried over that no rebuilt dock took up
-    if (!recording) return;
-    recording = false;
-    if (recFile) { fclose(recFile); recFile = nullptr; }
-    recFrames += carryFrames; carryFrames = 0;
-    WriteRecordingInfo(recW, recH, recFrames);
-    dockFrame = {}; fullTex = {}; recRT = {}; recTarget.Reset();
-    for (auto& st : recStage) st.Reset();
+    if (!rec.recording) return;
+    rec.recording = false;
+    if (rec.file) { fclose(rec.file); rec.file = nullptr; }
+    rec.frames += carryFrames; carryFrames = 0;
+    WriteRecordingInfo(rec.w, rec.h, rec.frames);
+    rec.dockFrame = {}; rec.fullTex = {}; rec.rt = {}; rec.target.Reset();
+    for (auto& st : rec.stage) st.Reset();
 }

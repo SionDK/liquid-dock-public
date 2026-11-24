@@ -20,14 +20,15 @@ namespace fluentflyout {
 
 using FfSettings = fluentsettings::Settings;
 
-struct Flyout {
-    HWND h = nullptr;
-    enum State { Waiting, Moving, Placed, Left } state = Waiting;
-    double shownAt = 0, movedAt = 0, settledAt = 0;
-    bool aligned = false, raised = false, nearShownDock = false;
-    RECT from{}, to{}, expect{};
-    double moveStart = 0;
-};
+// A process's program as Windows gives it, empty when it cannot be read (the caller opens the process with
+// the access it needs: fluent_flyout.cpp and fluent_media.cpp ask for different rights)
+inline std::wstring ImagePath(HANDLE process) {
+    wchar_t path[MAX_PATH * 2];
+    DWORD n = ARRAYSIZE(path);
+    std::wstring s;
+    if (QueryFullProcessImageNameW(process, 0, path, &n)) s.assign(path, n);
+    return s;
+}
 
 // fluent_settings_file.cpp
 extern FfSettings g_ff;
@@ -35,21 +36,20 @@ extern int g_ffVersion;
 extern int g_fileSetting;
 extern double g_fileAt;
 extern bool g_choiceDirty;
-extern int g_fileMonitor;
-extern std::atomic<bool> g_namesWanted;
 void LoadSettings(double now, bool force);
 // fluent_media.cpp
 extern std::atomic<bool> g_mediaWanted;
-extern HANDLE g_mediaThread, g_mediaStop;
+extern std::atomic<bool> g_namesWanted;
 extern fluentlogic::Steady g_media;
 void WantMedia(bool on);
+void StopMedia();
 bool FirstListPending(double now);
 void UpdateHasMedia(double now);
 // fluent_placement.cpp
-extern std::vector<Flyout> g_flyouts;
-extern std::unordered_map<HMONITOR, int> g_lift;
 void Unhook();
 void Hook();
+void ForgetFlyouts();
+void PruneFlyouts();
 // fluent_flyout.cpp
 extern DWORD g_pid;
 

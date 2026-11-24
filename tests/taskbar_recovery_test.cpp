@@ -2,7 +2,7 @@
 // No real taskbar, registry, desktop input, or running dock is changed by these tests.
 #include <winsock2.h>
 #include <ws2ipdef.h>
-#include "../src/system.h"
+#include "../src/native_taskbar.h"
 #include <shellapi.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
@@ -116,7 +116,8 @@ LSTATUS WINAPI TestDelete(HKEY,LPCWSTR,LPCWSTR) {
 #define GetLayeredWindowAttributes TestGetLayered
 #define SetLayeredWindowAttributes TestSetLayered
 #include "../src/system.cpp"
-#include "../src/system_taskbar.cpp"
+#include "../src/shell_front.cpp"   // the shell input helpers system.cpp calls
+#include "../src/native_taskbar.cpp"
 
 HWND g_mainWnd = nullptr;
 void Log(const wchar_t*, ...) {}
@@ -125,8 +126,10 @@ static int cacheCalls = 0;   // the kept tray buttons (native_tray.cpp: UI Autom
 namespace nativetray { void CacheTrayButtons(HWND) { ++cacheCalls; } }
 namespace taskbarstart { void Remember(HWND) {} }
 
+static int checks = 0;   // Check()s run (the last line's count; the "23" of the line before it counts the cases, Pass())
 static void Check(bool ok, const char* label) {
-    if (!ok) { std::printf("FAIL: %s\n",label); std::exit(1); }
+    ++checks;
+    if (!ok) { std::printf("FAIL: %s\n",label); std::printf("taskbar_recovery_test: FAILED (%d checks, 1 failure)\n",checks); std::exit(1); }
 }
 static void Pass(const char* label) { std::printf("PASS: %s\n", label); }
 int main() {
@@ -235,7 +238,8 @@ int main() {
     }
     {
         // The main loop while no dock replaces the taskbar (main.cpp: the watchdog is gone, or no dock on some monitor),
-        // a pass every 33 ms: Restore is tried every second until it works, then no more (taskbarvisibility::RestoreRetry).
+        // a pass every 33 ms: Restore is tried every second until it works, then no more (taskbarvisibility::RestoreRetry::TryWhenDue,
+        // which main.cpp's loop calls; everySecond keeps the rule before it as the loop had it).
         // Each try reaches into Explorer - both taskbars' regions (redrawn) and ShowWindow - and reads the registry.
         struct Reached { int tries; unsigned sets, shows, reads; };
         auto hour = [](bool everySecond, double explorerBackAt) {   // everySecond: the rule before (a try every second)
@@ -245,7 +249,11 @@ int main() {
             int tries = 0;
             for (double now = 0; now < 3600; now += 0.033) {
                 shell.explorer = now >= explorerBackAt;   // Explorer restarting before then: no taskbar to restore
-                if (everySecond ? now < retry.next : !retry.Due(bar.hidden, now)) continue;
+                if (!everySecond) {   // main.cpp's pass: the same function
+                    if (retry.TryWhenDue(bar.hidden, now, [&] { return bar.Restore(); })) ++tries;
+                    continue;
+                }
+                if (now < retry.next) continue;
                 retry.Tried(bar.Restore()); retry.next = now + 1.0; ++tries;
             }
             Check(!bar.hidden && !shell.backup && !shell.primaryEmpty && !shell.secondaryEmpty, "loop: restored");
@@ -288,4 +296,5 @@ int main() {
         Pass("only the UI thread looks up the tray buttons of a taskbar Explorer laid out again (the enforcer's thread only clips it)");
     }
     std::puts("23 recovery regression cases passed; real Windows taskbar and registry untouched.");
+    std::printf("taskbar_recovery_test: ALL PASSED (%d checks, 0 failures)\n", checks);
 }

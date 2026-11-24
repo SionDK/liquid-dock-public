@@ -5,18 +5,7 @@
 #include "app_click.h"
 #include "system.h"         // TakeForegroundRight
 #include "taskbar_apps.h"   // a click through the app's button on the taskbar
-#include "explorer_taskbar.h"   // ExplorerTaskbar: asked whether it answers after a press
-#include "gfx.h"
-#include <shlobj.h>
-#include <shobjidl.h>
 #include <shellapi.h>
-#include <propkey.h>
-#include <propvarutil.h>
-#include <dwmapi.h>
-#include <appmodel.h>
-#include <fstream>
-#include <sstream>
-#include <thread>
 
 // ---------------------------------------------------------------- actions
 
@@ -27,21 +16,36 @@ static std::wstring AppNameOf(AppModel& m, HWND h) {
     return a ? a->name : std::wstring(L"이 앱");
 }
 
+// A window minimized: by the admin helper when it takes it (above), else by the window's own minimize command
+// (ClickWith, and CheckPress after a press that did nothing).
+void MinimizeWindow(HWND h, const std::wstring& name) {
+    if (!adminhelper::Minimize(h, name)) PostMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+}
+
 // The calls that put a window in front, when Windows does not take SetForegroundWindow alone. None of
 // them waits for the window's program: BringWindowToTop did (it sends to the window and waits), so a
-// busy program held the dock up while it was clicked. Returns why attaching to the window in front
-// failed (GetLastError; 0: it was not needed, or it worked), for the log.
-static unsigned long ForceForeground(HWND h) {
-    if (SetForegroundWindow(h) && GetForegroundWindow() == h) return 0;
+// busy program held the dock up while it was clicked. Says, for the log, why attaching to the window in
+// front failed (GetLastError; 0: it was not needed, or it worked) and what SetForegroundWindow answered.
+struct Forced {
+    unsigned long attachError = 0;
+    int first = -1, second = -1;   // SetForegroundWindow's answers (-1: not called)
+    unsigned long error = 0;       // GetLastError after the second (0: none set)
+};
+static Forced ForceForeground(HWND h) {
+    Forced f;
+    f.first = SetForegroundWindow(h) ? 1 : 0;
+    if (f.first && GetForegroundWindow() == h) return f;
     HWND fg = GetForegroundWindow();
     DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
     DWORD me = GetCurrentThreadId();
     const bool attached = fgThread && fgThread != me && AttachThreadInput(me, fgThread, TRUE);
-    const unsigned long attachError = fgThread && fgThread != me && !attached ? GetLastError() : 0;
+    f.attachError = fgThread && fgThread != me && !attached ? GetLastError() : 0;
     SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-    SetForegroundWindow(h);
+    SetLastError(0);
+    f.second = SetForegroundWindow(h) ? 1 : 0;
+    f.error = GetLastError();
     if (attached) AttachThreadInput(me, fgThread, FALSE);
-    return attachError;
+    return f;
 }
 
 // A minimized window's restore command, as from Explorer's taskbar (its program restores it the way it
@@ -51,24 +55,23 @@ static unsigned long ForceForeground(HWND h) {
 // one restore all the same, and the click still brings the window up (its program's own way is skipped).
 static std::shared_ptr<RestoreJob> StartRestore(HWND h) {
     auto job = std::make_shared<RestoreJob>();
-    try {
-        std::thread([h, job] {
-            DWORD_PTR result = 0;
-            if (SendMessageTimeoutW(h, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_NORMAL, (UINT)(appclick::kBusyWait * 1000), &result)) {
-                for (int i = 0; i < 6 && IsIconic(h); ++i) Sleep(25);   // a program that restores a moment later
-                if (IsIconic(h)) {   // handled, still down; nothing of the dock's is queued for it now: no double restore
-                    job->ignored = true;
-                    ShowWindowAsync(h, SW_RESTORE);
-                }
-                job->handledAt = NowSeconds();
-                job->state = 1;
-            } else {
-                job->error = GetLastError();   // 1460: no answer in time; 5: refused (an elevated program)
-                job->handledAt = NowSeconds();
-                job->state = 2;
+    const bool sends = TryDetach([h, job] {
+        DWORD_PTR result = 0;
+        if (SendMessageTimeoutW(h, WM_SYSCOMMAND, SC_RESTORE, 0, SMTO_NORMAL, (UINT)(appclick::kBusyWait * 1000), &result)) {
+            for (int i = 0; i < 6 && IsIconic(h); ++i) Sleep(25);   // a program that restores a moment later
+            if (IsIconic(h)) {   // handled, still down; nothing of the dock's is queued for it now: no double restore
+                job->ignored = true;
+                ShowWindowAsync(h, SW_RESTORE);
             }
-        }).detach();
-    } catch (...) {
+            job->handledAt = NowSeconds();
+            job->state = 1;
+        } else {
+            job->error = GetLastError();   // 1460: no answer in time; 5: refused (an elevated program)
+            job->handledAt = NowSeconds();
+            job->state = 2;
+        }
+    });   // the lambda holds a handle and a shared_ptr: making it throws nothing, only the thread may fail (TryDetach)
+    if (!sends) {
         Log(L"app click: no thread to send the restore command on: the system's restore instead");
         ShowWindowAsync(h, SW_RESTORE);
         job->handledAt = NowSeconds();
@@ -121,6 +124,12 @@ std::wstring InFront() {
            (adminhelper::Elevated(fg) ? L" (administrator)" : L"");
 }
 
+// The window in front is h, or one h owns (its dialog): h came, as the watches see it (CheckWatch, CheckPress).
+bool IsItOrItsOwn(HWND fg, HWND h) { return fg && (fg == h || GetAncestor(fg, GA_ROOTOWNER) == h); }
+
+// LauncherVisible's answer (shell_front.h: 1 shown, 0 not, else unknown), for the log.
+static const wchar_t* YesNoText(int v) { return v == 1 ? L"yes" : v == 0 ? L"no" : L"?"; }
+
 std::shared_ptr<RestoreJob> AppModel::SendRestore(HWND h) {
     auto job = StartRestore(h);
     restores.push_back({ h, job });
@@ -151,6 +160,25 @@ void AppModel::ForgetHandledRestores(HWND h) {
                    restores.end());
 }
 
+// The watched window came up (CheckWatch, CheckPress): a click on it right after does not minimize it (lastUp), and
+// its handled restore commands are done with.
+void AppModel::SawCameUp(HWND h, double now) {
+    lastUp.window = h; lastUp.at = now;
+    ForgetHandledRestores(h);
+}
+
+// A new watch, from what every watch is started with (the dock's own way: BringUp; the taskbar's press:
+// PollPresses); the rest is each one's own. The arguments are never the watch's fields: it is cleared first.
+void AppModel::NewWatch(HWND h, HWND before, const std::wstring& name, const wchar_t* why, int windows, double clicked) {
+    watch = {};
+    watch.window = h;
+    watch.before = before;
+    watch.name = name;
+    watch.why = why;
+    watch.windows = windows;
+    watch.clicked = clicked;
+}
+
 void AppModel::ActivateWindow(HWND h) { BringUp(h, L"chosen from its window list", 0); }
 
 void AppModel::BringUp(HWND h, const wchar_t* why, int windows) {
@@ -175,24 +203,22 @@ void AppModel::BringUp(HWND h, const wchar_t* why, int windows) {
     if (watch.window == h && watch.popup) { ++watch.clicks; return; }   // clicked again while Start or Search closes: the same wait
     const std::wstring name = AppNameOf(*this, h);
     // The right to change the front window first: a click on the dock's own window does not always give
-    // it (system.h), and the admin helper below gets it from the dock.
+    // it (shell_front.h), and the admin helper below gets it from the dock.
     const ForegroundRight right = TakeForegroundRight();
     const double now = NowSeconds();
     QuietFlashes(h, now);
     // Start or Search in front: closed first; the rest once it has gone (app_click.h NextForPopup, CheckWatch). Only one
     // that shows: a closed one stays a cloaked window of its program, and can keep the front with nothing on the
     // screen - SearchHost's after the monitors came back on (2026-10-30: six clicks on Chrome
-    // dropped, no Esc ever sent to it). Nothing to close there: the window is brought up as usual.
+    // dropped, no Esc ever sent to it). Nothing to close there: the window is brought up as usual - though Windows
+    // may refuse the dock over it too (seen 2026-11-17: eight clicks on Terminal and Chrome right after Start,
+    // the right held, attaching refused (5)). An open Start's window in front is not cloaked (measured there:
+    // tests\run_start_ghost_live.bat). The log says what was seen: the cloak value and whether Start shows.
     const HWND front = GetForegroundWindow();
     const bool shellFront = front && front != h && IsShellPopupWindow(front);
-    if (shellFront && !IsCloaked(front)) {
-        watch = {};
-        watch.window = h;
-        watch.before = front;
-        watch.name = name;
-        watch.why = why;
-        watch.windows = windows;
-        watch.clicked = now;
+    const DWORD cloak = shellFront ? CloakOf(front) : 0;
+    if (shellFront && !cloak) {
+        NewWatch(h, front, name, why, windows, now);
         watch.restore = RestoreUnderWay(h, now);
         watch.right = watch.rightAtClick = (int)right;
         watch.popup = front;
@@ -205,19 +231,16 @@ void AppModel::BringUp(HWND h, const wchar_t* why, int windows) {
     if (watch.window == h) {
         ++watch.clicks;   // clicked again while it is coming: the same wait goes on
     } else {
-        watch = {};
-        watch.window = h;
-        watch.before = front;
-        watch.name = name;
-        watch.why = why;
-        watch.windows = windows;
-        watch.clicked = now;
+        NewWatch(h, front, name, why, windows, now);
         watch.restore = RestoreUnderWay(h, now);   // an earlier watch's command for it, its program busy still: waited for
         watch.rightAtClick = (int)right;
         if (shellFront) {
+            const int launcher = LauncherVisible();
             watch.ghostFront = true;
-            Log(L"app click: %ls - %ls is in front but not shown (a closed Start or Search keeping the front): no Esc, "
-                L"bringing the window up as usual", name.c_str(), InFront().c_str());
+            watch.launcherAtClick = launcher;
+            watch.cloakAtClick = cloak;
+            Log(L"app click: %ls - %ls is in front but not shown (a closed Start or Search keeping the front; cloak %lu, Start shown: %ls): "
+                L"no Esc, bringing the window up as usual", name.c_str(), InFront().c_str(), cloak, YesNoText(launcher));
         }
     }
     watch.right = (int)right;
@@ -237,6 +260,8 @@ void AppModel::BringUp(HWND h, const wchar_t* why, int windows) {
 void AppModel::Push(double now, bool atClick) {
     Watch& w = watch;
     const HWND h = w.window;
+    w.frontFirst = w.frontSecond = -1;   // this try's answers only (the admin helper's may stand in for them)
+    w.frontError = 0;
     if (atClick) {
         DWORD pid = 0;
         GetWindowThreadProcessId(h, &pid);
@@ -253,7 +278,11 @@ void AppModel::Push(double now, bool atClick) {
         const HWND front = GetForegroundWindow();
         if (front == h || (front && GetAncestor(front, GA_ROOTOWNER) == h)) return;
     }
-    w.attachError = ForceForeground(h);
+    const Forced f = ForceForeground(h);
+    w.attachError = f.attachError;
+    w.frontFirst = f.first;
+    w.frontSecond = f.second;
+    w.frontError = f.error;
 }
 
 // Esc to the shell pop-up in front at the click - only while it is still in front and shown (not on its way out): a
@@ -295,71 +324,12 @@ void AppModel::CheckWatch(double now) {
     if (watch.byTaskbar) { CheckPress(now); return; }
     Watch& w = watch;
     const HWND h = w.window;
-    if (w.popup) {   // Start or Search was in front at the click: closing (BringUp)
-        if (!IsWindow(h)) { watch = {}; return; }
-        const HWND fg = GetForegroundWindow();
-        // the shell may hand the front on through its own windows (Start's after Search's) or through none for a
-        // moment: that is not the window the pop-up goes back to. One not shown (cloaked: closed, or on its way
-        // out) has nothing to close: gone, as one out of the front (BringUp).
-        const bool shown = fg && !IsCloaked(fg);
-        if (fg && fg != w.popup && shown && IsShellPopupWindow(fg)) w.popup = fg;
-        if (!fg && now - w.popupClosedAt < appclick::kPopupGone) { w.next = now + appclick::kPopupLook; return; }
-        switch (appclick::NextForPopup(fg && fg == w.popup && shown, w.popupClosed, now - w.popupClosedAt)) {
-        case appclick::PopupStep::Wait:
-            w.next = now + appclick::kPopupLook;
-            return;
-        case appclick::PopupStep::Close:
-            ClosePopup(now);
-            w.next = now + appclick::kPopupLook;
-            return;
-        case appclick::PopupStep::GiveUp:
-            Log(L"app click: could not bring up %ls - %ls stayed in front after Esc %d times%ls (%.1f s after the click)",
-                w.name.c_str(), InFront().c_str(), w.popupEsc,
-                w.popupEsc < w.popupClosed ? L" (not sent at the other tries: it had gone from the front or was not shown by then)" : L"",
-                now - w.clicked);
-            watch = {};
-            return;
-        case appclick::PopupStep::Gone:
-            break;
-        }
-        // gone: the click goes on from here, the window the shell gave the front back to taken as the one in front
-        // at the click (that one staying is no sign it came, and its coming is not the user going elsewhere)
-        w.popup = nullptr;
-        w.before = fg;
-        if (adminhelper::Activate(h, w.name)) { watch = {}; return; }
-        w.right = (int)TakeForegroundRight();
-        QuietFlashes(h, now);
-        Push(now, true);
-        w.next = now + appclick::kLook;
-        return;
-    }
-    appclick::Look l;
-    l.since = now - w.clicked;
-    l.gone = !IsWindow(h);
-    HWND fg = GetForegroundWindow();
-    DWORD pid = 0, fgPid = 0;
-    if (!l.gone) GetWindowThreadProcessId(h, &pid);
-    if (fg) GetWindowThreadProcessId(fg, &fgPid);
-    l.shown = !l.gone && IsWindowVisible(h) && !IsCloaked(h);
-    l.minimized = !l.gone && IsIconic(h);
-    // a window of its program counts unless it was in front at the click already (another of the dock's icons may
-    // be the same program: a browser profile, a store app's frame - as CheckPress); one it owns always does
-    const bool isIt = fg && (fg == h || GetAncestor(fg, GA_ROOTOWNER) == h);
-    l.cameUp = !l.gone && appclick::CameUp(l.shown, l.minimized, isIt, fg && pid && fgPid == pid, fg == w.before);
-    l.elsewhere = fg && fg != w.before && fgPid != pid;
-    // the closed Start or Search in front at the click shown again: the user opened it (the shell keeps the one window)
-    if (w.ghostFront && fg && fg == w.before && !IsCloaked(fg)) l.elsewhere = true;
-    if (w.restore) {
-        const int state = w.restore->state;
-        l.restoring = state == 0;
-        l.failed = state == 2;
-        if (state == 1) l.sinceHandled = now - w.restore->handledAt;
-    }
-    l.refocused = w.refocused;
+    if (w.popup) { CheckPopupWatch(h, now); return; }   // Start or Search was in front at the click: closing (BringUp)
+    HWND fg = nullptr;
+    const appclick::Look l = LookAtWatch(h, now, fg);
     switch (appclick::Next(l)) {
     case appclick::Step::Done: {
-        lastUp.window = h; lastUp.at = now;
-        ForgetHandledRestores(h);
+        SawCameUp(h, now);
         const bool ignored = w.restore && w.restore->ignored;
         if (l.since > 1.0 || w.saidBusy || ignored || w.ghostFront)
             Log(L"app click: %ls came up after %.1f s%ls", w.name.c_str(), l.since,
@@ -391,36 +361,129 @@ void AppModel::CheckWatch(double now) {
         QuietFlashes(h, now);
         Push(now, false);
         break;
-    case appclick::Step::GiveUp: {
-        std::wstring what = l.restoring ? L"its program did not answer the restore command"
-                          : l.failed ? L"the restore command was not delivered (error " + std::to_wstring(w.restore->error.load()) + L")"
-                          : l.minimized ? L"still minimized after its program handled the restore command"
-                          : !l.shown ? L"hidden" : L"up, but another window stays in front";
-        wchar_t attach[64] = L"";
-        if (w.attachError) _snwprintf_s(attach, ARRAYSIZE(attach), _TRUNCATE, L"; attaching to it failed (%lu)", w.attachError);
-        std::wstring more;
-        if (w.rightAtClick != w.right) more += std::wstring(L" (at the click: ") + ForegroundRightText((ForegroundRight)w.rightAtClick) + L")";
-        more += attach;
-        if (w.hadPopup) more += L"; Start or Search was in front at the click: closed with Esc";
-        if (w.ghostFront) more += L"; a closed Start or Search kept the front at the click (not shown: no Esc)";
-        if (w.overAdmin) more += L"; handed to the admin helper " + std::to_wstring(w.overAdmin) + L" times (an administrator's window in front)";
-        else if (fg && fg != h && adminhelper::Elevated(fg))
-            more += L"; Windows does not let the dock take the front from a window that runs as administrator - the admin helper can "
-                    L"(settings: admin app windows)";
-        Log(L"app click: could not bring up %ls in %.1f s - %ls (window: %ls; clicked %d times; %ls; %d windows; in front: %ls; "
-            L"the dock's right to change the front window: %ls%ls)",
-            w.name.c_str(), l.since, what.c_str(), Describe(h).c_str(), w.clicks, w.why, w.windows, InFront().c_str(),
-            ForegroundRightText((ForegroundRight)w.right), more.c_str());
+    case appclick::Step::GiveUp:
+        SayWatchGaveUp(h, fg, l);
         watch = {};
         return;
-    }
     }
     w.next = now + appclick::kLook;
 }
 
+// CheckWatch while the shell pop-up in front at the click closes (BringUp): looked at every kPopupLook, Esc sent
+// again or given up (NextForPopup); once it has gone, the window is brought up from there.
+void AppModel::CheckPopupWatch(HWND h, double now) {
+    Watch& w = watch;
+    if (!IsWindow(h)) { watch = {}; return; }
+    const HWND fg = GetForegroundWindow();
+    // the shell may hand the front on through its own windows (Start's after Search's) or through none for a
+    // moment: that is not the window the pop-up goes back to. One not shown (cloaked: closed, or on its way
+    // out) has nothing to close: gone, as one out of the front (BringUp).
+    const bool shown = fg && !IsCloaked(fg);
+    if (fg && fg != w.popup && shown && IsShellPopupWindow(fg)) w.popup = fg;
+    if (!fg && now - w.popupClosedAt < appclick::kPopupGone) { w.next = now + appclick::kPopupLook; return; }
+    switch (appclick::NextForPopup(fg && fg == w.popup && shown, w.popupClosed, now - w.popupClosedAt)) {
+    case appclick::PopupStep::Wait:
+        w.next = now + appclick::kPopupLook;
+        return;
+    case appclick::PopupStep::Close:
+        ClosePopup(now);
+        w.next = now + appclick::kPopupLook;
+        return;
+    case appclick::PopupStep::GiveUp:
+        Log(L"app click: could not bring up %ls - %ls stayed in front after Esc %d times%ls (%.1f s after the click)",
+            w.name.c_str(), InFront().c_str(), w.popupEsc,
+            w.popupEsc < w.popupClosed ? L" (not sent at the other tries: it had gone from the front or was not shown by then)" : L"",
+            now - w.clicked);
+        watch = {};
+        return;
+    case appclick::PopupStep::Gone:
+        break;
+    }
+    // gone: the click goes on from here, the window the shell gave the front back to taken as the one in front
+    // at the click (that one staying is no sign it came, and its coming is not the user going elsewhere)
+    w.popup = nullptr;
+    w.before = fg;
+    if (adminhelper::Activate(h, w.name)) { watch = {}; return; }
+    w.right = (int)TakeForegroundRight();
+    QuietFlashes(h, now);
+    Push(now, true);
+    w.next = now + appclick::kLook;
+}
+
+// What CheckWatch sees of the watched window h now (appclick::Next decides on it); fg: the window in front, as read
+// for it (the give-up line names it).
+appclick::Look AppModel::LookAtWatch(HWND h, double now, HWND& fg) const {
+    const Watch& w = watch;
+    appclick::Look l;
+    l.since = now - w.clicked;
+    l.gone = !IsWindow(h);
+    fg = GetForegroundWindow();
+    DWORD pid = 0, fgPid = 0;
+    if (!l.gone) GetWindowThreadProcessId(h, &pid);
+    if (fg) GetWindowThreadProcessId(fg, &fgPid);
+    l.shown = !l.gone && IsWindowVisible(h) && !IsCloaked(h);
+    l.minimized = !l.gone && IsIconic(h);
+    // a window of its program counts unless it was in front at the click already (another of the dock's icons may
+    // be the same program: a browser profile, a store app's frame - as CheckPress); one it owns always does
+    const bool isIt = IsItOrItsOwn(fg, h);
+    l.cameUp = !l.gone && appclick::CameUp(l.shown, l.minimized, isIt, fg && pid && fgPid == pid, fg == w.before);
+    l.elsewhere = fg && fg != w.before && fgPid != pid;
+    // the closed Start or Search in front at the click shown again: the user opened it (the shell keeps the one window)
+    if (w.ghostFront && fg && fg == w.before && !IsCloaked(fg)) l.elsewhere = true;
+    if (w.restore) {
+        const int state = w.restore->state;
+        l.restoring = state == 0;
+        l.failed = state == 2;
+        if (state == 1) l.sinceHandled = now - w.restore->handledAt;
+    }
+    l.refocused = w.refocused;
+    return l;
+}
+
+// CheckWatch gave up on h: the line says what was seen (l), what the tries got, and what was in front (fg, as the
+// last look read it).
+void AppModel::SayWatchGaveUp(HWND h, HWND fg, const appclick::Look& l) const {
+    const Watch& w = watch;
+    std::wstring what = l.restoring ? L"its program did not answer the restore command"
+                      : l.failed ? L"the restore command was not delivered (error " + std::to_wstring(w.restore->error.load()) + L")"
+                      : l.minimized ? L"still minimized after its program handled the restore command"
+                      : !l.shown ? L"hidden" : L"up, but another window stays in front";
+    wchar_t attach[64] = L"";
+    if (w.attachError) _snwprintf_s(attach, ARRAYSIZE(attach), _TRUNCATE, L"; attaching to it failed (%lu)", w.attachError);
+    std::wstring more;
+    if (w.rightAtClick != w.right) more += std::wstring(L" (at the click: ") + ForegroundRightText((ForegroundRight)w.rightAtClick) + L")";
+    more += attach;
+    if (w.hadPopup)
+        more += std::wstring(L"; Start or Search was in front at the click: ") + (w.popupEsc ? L"closed with Esc" : L"it went before an Esc was sent");
+    if (w.ghostFront) more += L"; a closed Start or Search kept the front at the click (not shown: no Esc)";
+    if (w.ghostFront) {   // what tells an open Start from a closed one that keeps the front
+        const int nowShown = LauncherVisible();
+        wchar_t s[96];
+        _snwprintf_s(s, ARRAYSIZE(s), _TRUNCATE, L"; cloak %lu at the click, Start shown: %ls then, %ls now", w.cloakAtClick,
+                     YesNoText(w.launcherAtClick), YesNoText(nowShown));
+        more += s;
+    }
+    if (w.frontFirst >= 0) {
+        wchar_t s[96];
+        if (w.frontSecond >= 0)
+            _snwprintf_s(s, ARRAYSIZE(s), _TRUNCATE, L"; SetForegroundWindow said %d, then %d (error %lu)", w.frontFirst, w.frontSecond, w.frontError);
+        else
+            _snwprintf_s(s, ARRAYSIZE(s), _TRUNCATE, L"; SetForegroundWindow said %d", w.frontFirst);
+        more += s;
+    }
+    if (w.overAdmin) more += L"; handed to the admin helper " + std::to_wstring(w.overAdmin) + L" times (an administrator's window in front)";
+    else if (fg && fg != h && adminhelper::Elevated(fg))
+        more += L"; Windows does not let the dock take the front from a window that runs as administrator - the admin helper can "
+                L"(settings: admin app windows)";
+    Log(L"app click: could not bring up %ls in %.1f s - %ls (window: %ls; clicked %d times; %ls; %d windows; in front: %ls; "
+        L"the dock's right to change the front window: %ls%ls)",
+        w.name.c_str(), l.since, what.c_str(), Describe(h).c_str(), w.clicks, w.why, w.windows, InFront().c_str(),
+        ForegroundRightText((ForegroundRight)w.right), more.c_str());
+}
+
 void AppModel::Launch(AppItem& a, int dockIndex, bool elevated) {
     std::wstring target = a.launch;
-    if (target.empty()) target = !a.aumid.empty() ? L"shell:AppsFolder\\" + a.aumid : a.exe;
+    if (target.empty()) target = !a.aumid.empty() ? AppsFolderTarget(a.aumid) : a.exe;
     if (EndsWithI(target, L".lnk") && GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES && !a.exe.empty())
         target = a.exe;
     if (target.empty()) return;
@@ -504,9 +567,32 @@ void AppModel::ClickWith(AppItem& a, int dockIndex, HMONITOR monitor, bool taskb
     if (d.action == appclick::Action::Launch)
         for (const auto& l : launchChecks)
             if (l.item == a.id && l.maybe) { a.attention = false; return; }
-    // the log: the cases the old rules got wrong, the first click again while a window is coming, and
-    // which window came up when the app has several (once a minute an app: an unseen window of its
-    // own taken for the one to bring up shows there)
+    SayClickChoice(a, d, target, usable, pending, now);
+    // a restore command of the dock's own for that window still on its way (its program busy; the watch that sent it
+    // has ended): no press on top of it - the dock waits for that command (BringUp)
+    if (taskbar && target && RestoreUnderWay(target, now)) taskbar = false;
+    if (taskbar) {
+        const taskbarapps::Click c = TaskbarClickFacts(a, d, target, usable, now);
+        if (taskbarapps::ByTaskbar(c) && StartPress(a, d, dockIndex, monitor, usable, now)) { a.attention = false; return; }
+    }
+    switch (d.action) {
+    case appclick::Action::Launch:
+        Launch(a, dockIndex);
+        break;
+    case appclick::Action::Minimize:
+        MinimizeWindow(target, a.name);
+        break;
+    case appclick::Action::Activate:
+        BringUp(target, appclick::WhyText(d.why), usable);
+        break;
+    }
+    a.attention = false;
+}
+
+// The click in dock.log (ClickWith): the cases the old rules got wrong, the first click again while a window is
+// coming, and which window came up when the app has several (once a minute an app: an unseen window of its
+// own taken for the one to bring up shows there).
+void AppModel::SayClickChoice(AppItem& a, const appclick::Decision& d, HWND target, int usable, uint64_t pending, double now) const {
     const bool among = usable > 1 && d.action == appclick::Action::Activate && d.why != appclick::Why::Again && now - a.lastChoiceLog > 60;
     const bool againFirst = d.why == appclick::Why::Again && !(pending && watch.clicks > 1);
     if (d.why == appclick::Why::ActiveMinimized || d.skipped || d.overlays || (d.why == appclick::Why::NoWindow && !a.windows.empty()) ||
@@ -520,44 +606,31 @@ void AppModel::ClickWith(AppItem& a, int dockIndex, HMONITOR monitor, bool taskb
             d.skipped ? L" (passed over a window hidden meanwhile)" : L"", d.overlays ? L" (passed over a click-through overlay)" : L"",
             among && d.offScreen ? L" (passed over a window off the screens)" : L"", which.c_str());
     }
-    // a restore command of the dock's own for that window still on its way (its program busy; the watch that sent it
-    // has ended): no press on top of it - the dock waits for that command (BringUp)
-    if (taskbar && target && RestoreUnderWay(target, now)) taskbar = false;
-    if (taskbar) {
-        taskbarapps::Click c;
-        c.enabled = g_settings.taskbarAppButtons;
-        c.use = pressUse.use;
-        c.action = d.action;
-        c.why = d.why;
-        c.usable = usable;
-        c.windows = (int)a.windows.size();
-        c.pinned = a.pinned;
-        auto none = noButtonUntil.find(a.id);
-        c.noButton = none != noButtonUntil.end() && now < none->second;
-        c.slow = now < slowUntil;
-        c.launches = !launchUse.off;
-        if (d.action == appclick::Action::Activate && target) {
-            const HWND fg = GetForegroundWindow();
-            DWORD fgPid = 0, targetPid = 0;
-            if (fg) GetWindowThreadProcessId(fg, &fgPid);
-            GetWindowThreadProcessId(target, &targetPid);
-            c.frontIsItsOwn = fg && fg != target && !IsTaskbarWindow(fg) &&
-                              (GetAncestor(fg, GA_ROOTOWNER) == target || (targetPid && fgPid == targetPid));
-        }
-        if (taskbarapps::ByTaskbar(c) && StartPress(a, d, dockIndex, monitor, usable, now)) { a.attention = false; return; }
+}
+
+// What decides whether the click goes to the app's button on the taskbar (taskbar_apps_logic.h ByTaskbar).
+taskbarapps::Click AppModel::TaskbarClickFacts(const AppItem& a, const appclick::Decision& d, HWND target, int usable, double now) const {
+    taskbarapps::Click c;
+    c.enabled = g_settings.taskbarAppButtons;
+    c.use = pressUse.use;
+    c.action = d.action;
+    c.why = d.why;
+    c.usable = usable;
+    c.windows = (int)a.windows.size();
+    c.pinned = a.pinned;
+    auto none = noButtonUntil.find(a.id);
+    c.noButton = none != noButtonUntil.end() && now < none->second;
+    c.slow = now < slowUntil;
+    c.launches = !launchUse.off;
+    if (d.action == appclick::Action::Activate && target) {
+        const HWND fg = GetForegroundWindow();
+        DWORD fgPid = 0, targetPid = 0;
+        if (fg) GetWindowThreadProcessId(fg, &fgPid);
+        GetWindowThreadProcessId(target, &targetPid);
+        c.frontIsItsOwn = fg && fg != target && !IsTaskbarWindow(fg) &&
+                          (GetAncestor(fg, GA_ROOTOWNER) == target || (targetPid && fgPid == targetPid));
     }
-    switch (d.action) {
-    case appclick::Action::Launch:
-        Launch(a, dockIndex);
-        break;
-    case appclick::Action::Minimize:
-        if (!adminhelper::Minimize(target, a.name)) PostMessageW(target, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-        break;
-    case appclick::Action::Activate:
-        BringUp(target, appclick::WhyText(d.why), usable);
-        break;
-    }
-    a.attention = false;
+    return c;
 }
 
 // The windows the app had at the click, each asked once: the helper may first ask the user whether to install it

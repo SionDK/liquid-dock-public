@@ -11,12 +11,10 @@ struct ButtonInfo {
     ButtonId id;
     const char* key;            // in settings.ini
     const wchar_t* name;        // in the settings window
-    const wchar_t* description;
     bool fixed;                 // always shown, cannot be moved (network, volume, settings)
     float iconFactor = 0.55f, minWidth = 24;   // cell width = max(icon * factor, minWidth * scale)
 };
 const ButtonInfo& Info(ButtonId id);
-const ButtonInfo* FindButton(const std::string& key);
 
 // "desktop,theme" <-> ordered ids. Unknown keys, duplicates and fixed buttons are dropped.
 std::vector<ButtonId> ParseButtons(const std::string& list);

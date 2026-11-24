@@ -2,7 +2,7 @@
 // dock's real code reads a "HKCU\Software\HWiNFO64\VSB" that lives in a hive file of this test
 // (RegLoadAppKey: no other program sees it, HKCU is not written). The clock, the tick count and the
 // HWiNFO process check (its process list and snapshot) are the test's. What it shows: no key and an
-// empty key report nothing; a laptop's Korean HWiNFO reading is picked; between full scans only the
+// empty key report nothing (an HKLM key is read when HKCU has none); a laptop's Korean HWiNFO reading is picked; between full scans only the
 // picked reading is read (no enumeration); a better reading ticked later is taken at the next scan, a
 // picked reading that goes away at once; values a closed HWiNFO left behind are not shown - also after the
 // clock was set back - while a quiet key of a running HWiNFO is (it writes a value only when it changes);
@@ -29,7 +29,8 @@ namespace {
 
 HKEY g_hive = nullptr;                    // the root of the test's hive
 bool g_keyThere = true;                   // HKCU\Software\HWiNFO64\VSB exists
-bool g_hwinfoRuns = false;                // what the process list says
+bool g_keyInHklm = false;                 // HKLM\Software\HWiNFO64\VSB exists (the same hive key stands for it)
+bool g_hwinfoRuns = false;               // what the process list says
 LONGLONG g_clockShift = 0;                // added to the system time (100 ns units)
 ULONGLONG g_tick = 1000000;               // GetTickCount64
 bool g_deleteAfterInfo = false;           // HWiNFO deletes the key right after the reader asked about it
@@ -39,7 +40,9 @@ std::atomic<bool> g_park{ false };        // a runaway enumeration stops burning
 LSTATUS WINAPI FakeRegOpenKeyExW(HKEY root, LPCWSTR sub, DWORD, REGSAM sam, PHKEY out) {
     if (root == HKEY_CURRENT_USER && sub && wcscmp(sub, L"Software\\HWiNFO64\\VSB") == 0 && g_keyThere)
         return RegOpenKeyExW(g_hive, L"VSB", 0, sam, out);
-    return ERROR_FILE_NOT_FOUND;   // HKLM: nothing either
+    if (root == HKEY_LOCAL_MACHINE && sub && wcscmp(sub, L"Software\\HWiNFO64\\VSB") == 0 && g_keyInHklm)
+        return RegOpenKeyExW(g_hive, L"VSB", 0, sam, out);
+    return ERROR_FILE_NOT_FOUND;   // HKLM: nothing either, unless a test says so
 }
 LSTATUS WINAPI FakeRegQueryInfoKeyW(HKEY k, LPWSTR a, LPDWORD b, LPDWORD c, LPDWORD d, LPDWORD e, LPDWORD f, LPDWORD g,
                                     LPDWORD h, LPDWORD i, LPDWORD j, PFILETIME written) {
@@ -596,6 +599,71 @@ int main() {
         Check(r.gpus.empty() && scans == 3, "30 s of panel reads without GPU memory readings: 3 full scans (every 10 s, not pulled closer)");
     }
 
+    // ---- the CPU's package power (the panel's power draw): read with the others by cached index when asked for
+    {
+        const wchar_t* cpu = L"CPU [#0]: AMD Ryzen 7 9800X3D: Enhanced";
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"46.0 °C", L"46.0");
+        Put(1, cpu, L"CPU PPT Limit", L"44.1 %", L"44.1");
+        Put(2, cpu, L"CPU PPT", L"71.5 W", L"71.512");
+        hwinfo::Reader reader;
+        g_tick += 6000; g_enumCalls = 0;
+        hwinfo::Reading r = reader.Read(false, true);
+        Check(r.cpuFound && r.cpuPowerFound && Near(r.cpuPowerW, 71.512f) && g_enumCalls > 0, "CPU PPT 71.5 W (its limit in % left alone): found by the full scan");
+        Put(2, cpu, L"CPU PPT", L"88.0 W", L"88.04");
+        g_tick += 1000; g_enumCalls = 0;
+        r = reader.Read(false, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 88.04f) && g_enumCalls == 0, "a second later: read by its cached index, nothing enumerated");
+        g_tick += 1000;
+        r = reader.Read(true, false);
+        Check(r.cpuFound && !r.cpuPowerFound && r.cpuPowerW == 0, "not asked for (the power view off, or 요약 with the panel closed): no power");
+        g_tick += 1000; g_enumCalls = 0;
+        r = reader.Read(true, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 88.04f) && g_enumCalls == 0, "...asked again: there at once from the last scan's pick, with the panel's readings");
+        Put(3, cpu, L"CPU Package Power", L"86.9 W", L"86.9");   // a better one ticked later
+        g_tick += 1000;
+        r = reader.Read(false, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 88.04f), "CPU Package Power ticked later: not looked for between scans");
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"46.4 °C", L"46.4");   // the key written meanwhile
+        g_tick += 10000;
+        r = reader.Read(false, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 86.9f), "...taken at the next full scan (10 s): CPU Package Power before CPU PPT");
+        Drop(3);
+        g_tick += 1000; g_enumCalls = 0;
+        r = reader.Read(false, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 88.04f) && g_enumCalls > 0, "the picked one unticked: a full scan at once, CPU PPT again");
+        Drop(2);
+        g_tick += 1000;
+        r = reader.Read(false, true);
+        Check(r.cpuFound && !r.cpuPowerFound, "no power left: none (the card's hint), the CPU temperature as before");
+        // no power reported (a test PC's key on 11-22, and most): the scans stay 10 s apart while it is asked for
+        int scans = 0;
+        for (int i = 0; i < 60; ++i) {
+            Put(0, cpu, L"CPU (Tctl/Tdie)", i % 2 ? L"46.0 °C" : L"46.2 °C", i % 2 ? L"46.0" : L"46.2");
+            g_tick += 1000; g_enumCalls = 0;
+            r = reader.Read(false, true);
+            scans += g_enumCalls > 0;
+        }
+        Check(!r.cpuPowerFound && r.cpuFound && scans == 6, "a minute of power reads with none reported: 6 full scans (every 10 s, not pulled closer)");
+        // a Korean HWiNFO's translated label
+        Put(4, L"CPU [#0]: Intel Core Ultra 7 155H: Enhanced", L"CPU 패키지 전력", L"6.4 W", L"6.42");
+        g_tick += 10000;
+        r = reader.Read(false, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 6.42f), "a translated label (\"CPU 패키지 전력\"): taken at the next scan");
+        // a full scan with the power not asked for (없음, or 요약 with the panel closed): not even picked; the next read
+        // that asks for it scans at once
+        Put(5, cpu, L"CPU Package Power", L"90.0 W", L"90.0");
+        g_tick += 10000; g_enumCalls = 0;
+        r = reader.Read(false, false);
+        Check(g_enumCalls > 0 && !r.cpuPowerFound && r.cpuFound, "a full scan with the power not asked for: no power handed out");
+        g_tick += 1000; g_enumCalls = 0;
+        r = reader.Read(true, true);
+        Check(r.cpuPowerFound && Near(r.cpuPowerW, 90.0f) && g_enumCalls > 0, "...the panel opens (요약) a second later: a full scan at once, CPU Package Power 90 W");
+        g_tick += 1000; g_enumCalls = 0;
+        r = reader.Read(true, true);
+        Check(r.cpuPowerFound && g_enumCalls == 0, "...and from then on by its cached index");
+    }
+
     // ---- many readings, gaps, values that are not ours
     {
         Clear();
@@ -613,6 +681,213 @@ int main() {
         g_tick += 6000;
         hwinfo::CpuReading r = reader.ReadCpu();
         Check(r.found && Near(r.celsius, 61), "400 readings with gaps, a number value, an oversized label: the CPU Package at 377 is found");
+    }
+
+    // ---- characterization: Read's ages, its forgetting, a sensor name at the read buffers' edge
+    {
+        const wchar_t* cpu = L"CPU [#0]: AMD Ryzen 7 9800X3D: Enhanced";
+        g_processes.clear();
+        g_listFails = false;
+        g_hwinfoRuns = false;
+        // the key's age by the clock: under 20 s it counts as written by a running HWiNFO, without the process check
+        auto fresh = [&](LONGLONG shift, int& lists) {
+            Clear();
+            Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+            hwinfo::Reader reader;   // a reader of its own: no process check of before held
+            g_clockShift = shift; g_tick += 6000;
+            const int before = g_lists;
+            hwinfo::CpuReading r = reader.ReadCpu();
+            lists = g_lists - before;
+            return r;
+        };
+        int lists = -1;
+        hwinfo::CpuReading r = fresh(19 * kSecond, lists);
+        Check(r.running && r.found && lists == 0, "char: written 19 s ago by the clock, HWiNFO closed: running (under 20 s), the process not asked");
+        r = fresh(21 * kSecond, lists);
+        Check(!r.running && !r.found && lists == 1, "char: ...21 s ago: the process asked (one list), not running - nothing");
+        // a write time ahead of the clock: up to 2 s is the clock's own step (age 0), more is a clock set back (30 s)
+        r = fresh(-1 * kSecond, lists);
+        Check(r.running && r.found && lists == 0, "char: written 1 s ahead of the clock, HWiNFO closed: age 0 - running, the process not asked");
+        r = fresh(-3 * kSecond, lists);
+        Check(!r.running && !r.found && lists == 1, "char: ...3 s ahead: taken as 30 s old - the process asked, not running");
+        g_clockShift = 0;
+
+        // ...and at least as long as this reader has seen it unchanged, by the tick count
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        {
+            hwinfo::Reader reader;
+            g_tick += 6000;
+            r = reader.ReadCpu();
+            const bool first = r.running && r.found;
+            g_tick += 19000;
+            r = reader.ReadCpu();
+            const bool at19 = r.running && r.found;
+            g_tick += 2000;
+            r = reader.ReadCpu();
+            Check(first && at19 && !r.running && !r.found,
+                  "char: the key unchanged for 19 s by the tick count (the clock says fresh): running; 21 s: not (HWiNFO closed)");
+        }
+
+        // forgotten when unusable: the picks and the scan time, so the first usable read scans at once
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        {
+            hwinfo::Reader reader;
+            g_hwinfoRuns = true;
+            g_tick += 6000;
+            r = reader.ReadCpu();                       // a full scan; the next one due in 10 s
+            g_tick += 1000; g_enumCalls = 0;
+            r = reader.ReadCpu();
+            const bool fast = r.found && g_enumCalls == 0;
+            g_hwinfoRuns = false; g_clockShift = 30 * kSecond; g_tick += 1000;
+            r = reader.ReadCpu();                       // HWiNFO closed, the key 30 s quiet: unusable
+            const bool gone = !r.running && !r.found;
+            g_hwinfoRuns = true; g_tick += 5500; g_enumCalls = 0;   // 7.5 s after the scan: not due by its time
+            r = reader.ReadCpu();
+            Check(fast && gone && r.running && r.found && Near(r.celsius, 50) && g_enumCalls > 0,
+                  "char: unusable (HWiNFO closed) between two scans: the picks forgotten, the next usable read scans at once (before its 10 s)");
+            g_clockShift = 0;
+        }
+
+        // the picked reading's sensor name at the edge of the reads: the scan reads names up to 510 characters
+        // (a 1022-byte buffer), the fast path up to 511 (512 with its terminator): a name of exactly 511 is
+        // empty to the scan and whole to the fast path - they never agree, and every read is a full scan
+        int scans[3] = { -1, -1, -1 };
+        bool found = true;
+        const size_t lengths[3] = { 510, 511, 512 };
+        for (int i = 0; i < 3; ++i) {
+            Clear();
+            std::wstring sensor = cpu;
+            sensor += std::wstring(lengths[i] - sensor.size(), L'x');
+            Put(0, sensor.c_str(), L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+            hwinfo::Reader reader;
+            g_tick += 6000;
+            r = reader.ReadCpu();
+            scans[i] = 0;
+            for (int n = 0; n < 4; ++n) {
+                g_tick += 1000; g_enumCalls = 0;
+                r = reader.ReadCpu();
+                if (!r.found) found = false;
+                if (g_enumCalls > 0) ++scans[i];
+            }
+        }
+        std::printf("  full scans in 4 reads a second apart, the sensor name 510 / 511 / 512 characters: %d / %d / %d\n", scans[0], scans[1], scans[2]);
+        Check(found && scans[0] == 0, "char: the picked reading's sensor name 510 characters: found, read by its index (no scan)");
+        Check(found && scans[1] == 4, "char: ...511 characters: found, but every read a full scan (the scan and the fast path read it differently)");
+        Check(found && scans[2] == 0, "char: ...512 characters: neither reads it (empty to both): no scan");
+        g_hwinfoRuns = false;
+    }
+
+    // ---- characterization: what Read forgets when the key is gone, the HKLM key, and what its
+    // cached picks hand over between scans (Gadget indices with gaps, the slot and (Bank/Device) kept from the
+    // scan, a reading of another sensor at a cached index)
+    {
+        const wchar_t* cpu = L"CPU [#0]: AMD Ryzen 7 9800X3D: Enhanced";
+        g_processes.clear();
+        g_listFails = false;
+        g_hwinfoRuns = false;
+        g_clockShift = 0;
+
+        // the key gone between two scans (a settings reset, HWiNFO uninstalled): the scan time forgotten too,
+        // so the read that finds the key again scans at once (before its 10 s)
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        hwinfo::CpuReading r;
+        {
+            hwinfo::Reader reader;
+            g_tick += 6000;
+            r = reader.ReadCpu();                       // a full scan; the next one due in 10 s
+            const bool first = r.running && r.found;
+            g_tick += 1000; g_keyThere = false;
+            r = reader.ReadCpu();
+            const bool none = !r.running && !r.found;
+            g_keyThere = true; g_tick += 1000; g_enumCalls = 0;
+            r = reader.ReadCpu();
+            Check(first && none && r.running && r.found && Near(r.celsius, 50) && g_enumCalls > 0,
+                  "char3: the key gone between two scans: nothing; back a second later: a full scan at once (before its 10 s)");
+        }
+
+        // another reading of the same sensor now at the cached index (the label changed): not the cached one -
+        // a full scan at once, which picks the better reading elsewhere
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        Put(1, cpu, L"CPU Die (average)", L"48 °C", L"48");
+        {
+            hwinfo::Reader reader;
+            g_tick += 6000;
+            r = reader.ReadCpu();
+            const bool first = r.found && Near(r.celsius, 50);
+            Put(0, cpu, L"CPU CCD1 (Tdie)", L"55 °C", L"55");
+            g_tick += 1000; g_enumCalls = 0;
+            r = reader.ReadCpu();
+            Check(first && r.found && Near(r.celsius, 48) && g_enumCalls > 0,
+                  "char3: another label at the CPU reading's cached index (same sensor): a full scan at once, the better reading taken (48, not 55)");
+        }
+
+        // no key under HKCU, one under HKLM: read from there
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        {
+            g_keyThere = false; g_keyInHklm = true;
+            hwinfo::Reader reader;
+            g_tick += 6000;
+            r = reader.ReadCpu();
+            Check(r.running && r.found && Near(r.celsius, 50), "char3: no Gadget key under HKCU, one under HKLM: read from HKLM");
+            g_keyThere = true; g_keyInHklm = false;
+        }
+
+        // memory readings at Gadget indices with gaps (5, 9: not their positions 1, 2 among the readings)
+        const wchar_t* b1 = L"DDR5 DIMM [#3]: A-DATA Technology AX5U6000C3032G-BLARWH (P0 CHANNEL B/DIMM 1)";
+        const wchar_t* a1 = L"DDR5 DIMM [#1]: A-DATA Technology AX5U6000C3032G-BLARWH (P0 CHANNEL A/DIMM 1)";
+        const wchar_t* a2 = L"DDR5 DIMM [#2]: A-DATA Technology AX5U6000C3032G-BLARWH (P0 CHANNEL A/DIMM 2)";
+        auto dimm = [](const hwinfo::Reading& m, size_t i, int entry, int slot, const wchar_t* locator, float celsius) {
+            return m.dimms.size() > i && m.dimms[i].entry == entry && m.dimms[i].slot == slot && m.dimms[i].locator == locator &&
+                   Near(m.dimms[i].celsius, celsius);
+        };
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        Put(5, b1, L"SPD Hub Temperature", L"36.0 °C", L"36.0");
+        Put(9, a1, L"SPD Hub Temperature", L"35.0 °C", L"35.0");
+        {
+            hwinfo::Reader reader;
+            g_tick += 6000; g_enumCalls = 0;
+            hwinfo::Reading m = reader.Read(true);
+            Check(g_enumCalls > 0 && m.dimms.size() == 2 && dimm(m, 0, 9, 1, L"P0 CHANNEL A/DIMM 1", 35.0f) &&
+                  dimm(m, 1, 5, 3, L"P0 CHANNEL B/DIMM 1", 36.0f),
+                  "char3: memory readings at Gadget indices 5 and 9: the full scan hands the Gadget index as entry, with slot and (Bank/Device)");
+            Put(9, a1, L"SPD Hub Temperature", L"35.5 °C", L"35.5");
+            g_tick += 1000; g_enumCalls = 0;
+            m = reader.Read(true);
+            Check(g_enumCalls == 0 && m.dimms.size() == 2 && dimm(m, 0, 9, 1, L"P0 CHANNEL A/DIMM 1", 35.5f) &&
+                  dimm(m, 1, 5, 3, L"P0 CHANNEL B/DIMM 1", 36.0f),
+                  "char3: ...a second later, by their cached indices: the same entry, slot and (Bank/Device), the new temperature");
+            // another module's reading now at index 9, under the same label: not the cached one
+            Put(9, a2, L"SPD Hub Temperature", L"37.0 °C", L"37.0");
+            g_tick += 1000; g_enumCalls = 0;
+            m = reader.Read(true);
+            Check(g_enumCalls > 0 && m.dimms.size() == 2 && dimm(m, 0, 9, 2, L"P0 CHANNEL A/DIMM 2", 37.0f) &&
+                  dimm(m, 1, 5, 3, L"P0 CHANNEL B/DIMM 1", 36.0f),
+                  "char3: another module's reading at a cached index (same label, another sensor): a full scan at once, that module's slot and (Bank/Device)");
+        }
+
+        // a GPU memory reading of another GPU at the cached index, under the same label: not the cached one
+        const wchar_t* gpu0 = L"dGPU [#0]: NVIDIA GeForce RTX 4060 Ti: ASUS Dual GeForce RTX 4060 Ti OC 8G (DUAL-RTX4060TI-O8G)";
+        const wchar_t* gpu1 = L"dGPU [#1]: AMD Radeon RX 7600";
+        Clear();
+        Put(0, cpu, L"CPU (Tctl/Tdie)", L"50 °C", L"50");
+        Put(3, gpu0, L"GPU Memory Junction Temperature", L"44.0 °C", L"44.0");
+        {
+            hwinfo::Reader reader;
+            g_tick += 6000;
+            hwinfo::Reading m = reader.Read(true);
+            const bool first = m.gpus.size() == 1 && m.gpus[0].gpu == 0 && m.gpus[0].sensor == gpu0;
+            Put(3, gpu1, L"GPU Memory Junction Temperature", L"45.0 °C", L"45.0");
+            g_tick += 1000; g_enumCalls = 0;
+            m = reader.Read(true);
+            Check(first && g_enumCalls > 0 && m.gpus.size() == 1 && m.gpus[0].gpu == 1 && m.gpus[0].sensor == gpu1 && Near(m.gpus[0].celsius, 45.0f),
+                  "char3: another GPU's memory reading at the cached index (same label, another sensor): a full scan at once");
+        }
     }
 
     // ---- the key deleted while it is read

@@ -58,14 +58,8 @@ std::wstring PipeOf(const wchar_t* what) {
     return L"\\\\.\\pipe\\LiquidDockTest.hunt-admin." + std::to_wstring(GetCurrentProcessId()) + L"." + what;
 }
 
-template <class F> bool WaitFor(F&& ok, DWORD ms = 3000) {
-    ULONGLONG until = GetTickCount64() + ms;
-    while (!ok()) {
-        if (GetTickCount64() > until) return false;
-        Sleep(20);
-    }
-    return true;
-}
+#define TEST_SUPPORT_WAIT_TICKS
+#include "test_support.h"
 
 // A program on the helper's pipe that is not the helper's window service: it takes one client, reads its
 // request and answers as told (or not at all), then waits until the client is gone.

@@ -32,10 +32,7 @@ static bool g_testElevated = false;
 static HWND g_fakeExplorer = nullptr;
 static HWND TestExplorerTaskbar() { return g_fakeExplorer; }
 #define ExplorerTaskbar TestExplorerTaskbar
-#include "../src/tray_host.cpp"
-#include "../src/tray_host_icons.cpp"
-#include "../src/tray_host_settings.cpp"
-#include "../src/tray_host_widget.cpp"
+#include "parts_tray_host.inc"
 #undef ExplorerTaskbar
 
 static std::mutex g_logMu;
@@ -63,18 +60,10 @@ static int LoggedCount(const wchar_t* part) {
     return n;
 }
 static bool Logged(const wchar_t* part) { return LoggedCount(part) > 0; }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
-}
+#define TEST_SUPPORT_QPC_NOW
+#include "test_support.h"
 
-static int g_failures = 0, g_checks = 0;
-static void Check(bool ok, const char* what) {
-    ++g_checks;
-    std::printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++g_failures;
-}
+#include "portable_check.h"
 
 // ---------------------------------------------------------------- fake Explorer taskbar
 static std::mutex g_recMu;
@@ -118,109 +107,7 @@ static LRESULT CALLBACK OwnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-struct WindowThread {
-    HWND hwnd = nullptr;
-    std::thread t;
-    DWORD tid = 0;
-    void Run(const wchar_t* cls, WNDPROC proc) {
-        HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        t = std::thread([this, cls, proc, ready] {
-            tid = GetCurrentThreadId();
-            WNDCLASSEXW wc = { sizeof(wc) }; wc.lpfnWndProc = proc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = cls;
-            RegisterClassExW(&wc);
-            hwnd = CreateWindowExW(0, cls, L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr);
-            SetEvent(ready);
-            MSG m;
-            while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
-        });
-        WaitForSingleObject(ready, 5000);
-        CloseHandle(ready);
-    }
-    void Quit() {
-        if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        PostThreadMessageW(tid, WM_QUIT, 0, 0);
-        if (t.joinable()) t.join();
-        hwnd = nullptr;
-    }
-};
-
-// colour bitmap: 32 bpp (top-down) or 24 bpp; mask: 1 bit per pixel, a set bit = transparent
-static HICON MakeIcon(int w, int h, int bpp, const std::function<uint32_t(int, int)>& px, const std::function<bool(int, int)>& masked) {
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = (WORD)bpp; bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC dc = GetDC(nullptr);
-    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    ReleaseDC(nullptr, dc);
-    const int stride = ((w * bpp + 31) / 32) * 4;
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-            uint32_t v = px(x, y);
-            BYTE* row = (BYTE*)bits + (size_t)y * stride;
-            if (bpp == 32) ((uint32_t*)row)[x] = v;
-            else { row[x * 3] = (BYTE)v; row[x * 3 + 1] = (BYTE)(v >> 8); row[x * 3 + 2] = (BYTE)(v >> 16); }
-        }
-    const int mstride = ((w + 15) / 16) * 2;
-    std::vector<BYTE> mbits((size_t)mstride * h, 0);
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x)
-            if (masked(x, y)) mbits[(size_t)y * mstride + x / 8] |= (BYTE)(0x80 >> (x % 8));
-    HBITMAP mask = CreateBitmap(w, h, 1, 1, mbits.data());
-    ICONINFO ii{ TRUE, 0, 0, mask, color };
-    HICON icon = CreateIconIndirect(&ii);
-    DeleteObject(color); DeleteObject(mask);
-    return icon;
-}
-
-static LRESULT SendTray(ULONG_PTR dwData, const void* data, DWORD size, HWND from) {
-    COPYDATASTRUCT cds{ dwData, size, (void*)data };
-    DWORD_PTR r = 0;
-    SendMessageTimeoutW(trayhost::g_wnd, WM_COPYDATA, (WPARAM)from, (LPARAM)&cds, SMTO_NORMAL, 5000, &r);
-    return (LRESULT)r;
-}
-static trayhost::TrayNotifyData Notify(DWORD message, HWND app, UINT uid, UINT flags) {
-    trayhost::TrayNotifyData d{};
-    d.signature = 0x34753423; d.message = message;
-    d.nid.cbSize = sizeof(d.nid);
-    d.nid.hWnd = (DWORD)(ULONG_PTR)app; d.nid.uID = uid; d.nid.uFlags = flags;
-    d.nid.uCallbackMessage = kCallback;
-    return d;
-}
-static LRESULT SendNotify(const trayhost::TrayNotifyData& d, HWND from) { return SendTray(1, &d, sizeof(d), from); }
-
-static std::vector<std::pair<WPARAM, LPARAM>> AppMessages(size_t want) {
-    for (int i = 0; i < 200; ++i) {
-        { std::lock_guard<std::mutex> lk(g_recMu); if (g_appGot.size() >= want) break; }
-        Sleep(10);
-    }
-    Sleep(50);   // anything extra would have arrived by now
-    std::lock_guard<std::mutex> lk(g_recMu);
-    auto out = g_appGot;
-    g_appGot.clear();
-    return out;
-}
-static uint64_t KeyOf(HWND app, UINT uid) {
-    std::lock_guard<std::mutex> lk(trayhost::g_mu);
-    for (auto& ic : trayhost::g_icons) if (ic.hwnd == app && ic.uid == uid) return ic.key;
-    return 0;
-}
-static const trayhost::IconView* FindShown(const std::vector<trayhost::IconView>& v, uint64_t key) {
-    for (auto& i : v) if (i.key == key) return &i;
-    return nullptr;
-}
-static bool WaitFor(const std::function<bool()>& cond, int ms) {
-    for (int i = 0; i < ms / 20; ++i) { if (cond()) return true; Sleep(20); }
-    return cond();
-}
-static void SetEntry(HKEY root, const wchar_t* name, const std::wstring& exe, DWORD uid, DWORD promoted) {
-    HKEY k = nullptr;
-    RegCreateKeyExW(root, name, 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr);
-    RegSetValueExW(k, L"ExecutablePath", 0, REG_SZ, (const BYTE*)exe.c_str(), DWORD((exe.size() + 1) * 2));
-    RegSetValueExW(k, L"UID", 0, REG_DWORD, (const BYTE*)&uid, 4);
-    RegSetValueExW(k, L"IsPromoted", 0, REG_DWORD, (const BYTE*)&promoted, 4);
-    RegCloseKey(k);
-}
+#include "tray_host_harness.h"
 static bool Picture(uint64_t key, int& w, int& h, std::vector<uint32_t>& px) {
     uint32_t ver = 0;
     return trayhost::Image(key, ver, w, h, px);
@@ -340,7 +227,7 @@ int main(int argc, char** argv) {
         g_explorerReply[1] = TRUE;
         RECT anchor{};
         trayhost::Send(KeyOf(app.hwnd, 2), trayhost::Mouse::LeftClick, POINT{ 1, 1 }, anchor);
-        auto msgs = AppMessages(2);
+        auto msgs = AppMessages(2, 50);
         Check(msgs.size() == 2 && msgs[0].first == 2 && msgs[0].second == WM_LBUTTONDOWN, "...and the icon keeps talking version 0");
     }
     {   // version 3 (Windows 2000): wParam = id, lParam = event; NIN_SELECT and WM_CONTEXTMENU after the clicks
@@ -350,15 +237,15 @@ int main(int argc, char** argv) {
         uint64_t k = KeyOf(app.hwnd, 2);
         RECT anchor{};
         trayhost::Send(k, trayhost::Mouse::LeftClick, POINT{ 7, 8 }, anchor);
-        auto msgs = AppMessages(3);
+        auto msgs = AppMessages(3, 50);
         Check(msgs.size() == 3 && msgs[0].first == 2 && msgs[0].second == WM_LBUTTONDOWN && msgs[1].second == WM_LBUTTONUP &&
               msgs[2].first == 2 && msgs[2].second == NIN_SELECT, "v3 left click: down, up, NIN_SELECT, the id in wParam");
         trayhost::Send(k, trayhost::Mouse::RightClick, POINT{ 7, 8 }, anchor);
-        msgs = AppMessages(3);
+        msgs = AppMessages(3, 50);
         Check(msgs.size() == 3 && msgs[2].second == WM_CONTEXTMENU, "v3 right click ends with WM_CONTEXTMENU");
         trayhost::Send(k, trayhost::Mouse::Enter, POINT{ 7, 8 }, anchor);
         trayhost::Send(k, trayhost::Mouse::Leave, POINT{ 7, 8 }, anchor);
-        msgs = AppMessages(2);
+        msgs = AppMessages(2, 50);
         bool popup = false;
         for (auto& m : msgs) if (m.second == NIN_POPUPOPEN || m.second == NIN_POPUPCLOSE) popup = true;
         Check(msgs.size() == 2 && !popup, "v3 hover: no NIN_POPUPOPEN / NIN_POPUPCLOSE (version 4 only)");
@@ -370,7 +257,7 @@ int main(int argc, char** argv) {
         uint64_t k = KeyOf(app.hwnd, 2);
         RECT anchor{ -1440, -300, -1404, -264 };
         trayhost::Send(k, trayhost::Mouse::RightClick, POINT{ -1420, -280 }, anchor);
-        auto msgs = AppMessages(3);
+        auto msgs = AppMessages(3, 50);
         Check(msgs.size() == 3 && GET_X_LPARAM(msgs[2].first) == -1420 && GET_Y_LPARAM(msgs[2].first) == -280 &&
               LOWORD(msgs[2].second) == WM_CONTEXTMENU && HIWORD(msgs[2].second) == 2,
               "v4 WM_CONTEXTMENU on a monitor left of / above the primary: signed x, y in wParam");
@@ -624,6 +511,5 @@ int main(int argc, char** argv) {
     RegDeleteTreeW(HKEY_CURRENT_USER, LD_TRAY_SETTINGS_PARENT);
     DestroyIcon(opaque);
     app.Quit(); explorer.Quit();
-    std::printf("tray_host_edge_test: %s (%d checks, %d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_checks, g_failures, g_failures == 1 ? "" : "s");
-    return g_failures;
+    return Summary("tray_host_edge_test");
 }

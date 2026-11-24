@@ -9,25 +9,25 @@
 // ---------------------------------------------------------------- catalogue
 
 static const ButtonInfo kInfo[kButtonCount] = {
-    { ButtonId::Network,    "network",    L"네트워크",          L"Wi-Fi와 빠른 설정",                          true },
-    { ButtonId::Volume,     "volume",     L"볼륨",              L"볼륨 조절, 휠로 바로 조절",                  true },
-    { ButtonId::Desktop,    "desktop",    L"바탕화면 보기",     L"모든 창을 내리고 다시 누르면 되돌립니다",    false },
-    { ButtonId::Theme,      "theme",      L"다크/라이트",       L"Windows와 앱의 모드를 한 번에 바꿉니다",     false },
-    { ButtonId::Oled,       "oled",       L"OLED 모드",         L"검은 배경과 바탕화면 아이콘 숨김(번인 방지)", false },
-    { ButtonId::Awake,      "awake",      L"화면 꺼짐 방지",    L"켜 둔 동안 화면이 꺼지거나 절전되지 않습니다", false },
-    { ButtonId::Screenshot, "screenshot", L"스크린샷",          L"Windows 캡처 도구를 엽니다",                 false },
-    { ButtonId::Quiet,      "quiet",      L"알림 튐 끄기",      L"켜 둔 동안 알림이 와도 아이콘이 튀지 않습니다", false },
-    { ButtonId::Trash,      "trash",      L"휴지통",            L"파일을 끌어다 놓으면 휴지통으로, 우클릭으로 비우기", false },
-    { ButtonId::Downloads,  "downloads",  L"다운로드",          L"최근 받은 파일 목록",                        false },
-    { ButtonId::Audio,      "audio",      L"오디오 장치",       L"스피커와 헤드셋 사이를 바로 바꿉니다",       false },
-    { ButtonId::Sff,        "sff",        L"SFF 갤러리",        L"디시인사이드 SFF 마이너 갤러리를 엽니다",    false },
+    { ButtonId::Network,    "network",    L"네트워크",          true },    // Wi-Fi와 빠른 설정
+    { ButtonId::Volume,     "volume",     L"볼륨",              true },    // 볼륨 조절, 휠로 바로 조절
+    { ButtonId::Desktop,    "desktop",    L"바탕화면 보기",     false },   // 모든 창을 내리고 다시 누르면 되돌립니다
+    { ButtonId::Theme,      "theme",      L"다크/라이트",       false },   // Windows와 앱의 모드를 한 번에 바꿉니다
+    { ButtonId::Oled,       "oled",       L"OLED 모드",         false },   // 검은 배경과 바탕화면 아이콘 숨김(번인 방지)
+    { ButtonId::Awake,      "awake",      L"화면 꺼짐 방지",    false },   // 켜 둔 동안 화면이 꺼지거나 절전되지 않습니다
+    { ButtonId::Screenshot, "screenshot", L"스크린샷",          false },   // Windows 캡처 도구를 엽니다
+    { ButtonId::Quiet,      "quiet",      L"알림 튐 끄기",      false },   // 켜 둔 동안 알림이 와도 아이콘이 튀지 않습니다
+    { ButtonId::Trash,      "trash",      L"휴지통",            false },   // 파일을 끌어다 놓으면 휴지통으로, 우클릭으로 비우기
+    { ButtonId::Downloads,  "downloads",  L"다운로드",          false },   // 최근 받은 파일 목록
+    { ButtonId::Audio,      "audio",      L"오디오 장치",       false },   // 스피커와 헤드셋 사이를 바로 바꿉니다
+    { ButtonId::Sff,        "sff",        L"SFF 갤러리",        false },   // 디시인사이드 SFF 마이너 갤러리를 엽니다
     // always available, with a generous cell independent of crowded app icons
-    { ButtonId::Settings,   "settings",   L"설정",              L"Liquid Dock 설정",                           true, 0.65f, 32 },
+    { ButtonId::Settings,   "settings",   L"설정",              true, 0.65f, 32 },   // Liquid Dock 설정
 };
 
 const ButtonInfo& Info(ButtonId id) { return kInfo[std::clamp((int)id, 0, kButtonCount - 1)]; }
 
-const ButtonInfo* FindButton(const std::string& key) {
+static const ButtonInfo* FindButton(const std::string& key) {   // by its settings.ini key
     for (auto& i : kInfo) if (key == i.key) return &i;
     return nullptr;
 }
@@ -52,8 +52,6 @@ std::string FormatButtons(const std::vector<ButtonId>& ids) {
     for (auto id : ids) { if (!s.empty()) s += ','; s += Info(id).key; }
     return s;
 }
-
-extern Settings g_settings;
 
 const std::vector<ButtonId>& ChosenButtons() {
     static std::string parsedFrom = "\x01";
@@ -239,6 +237,108 @@ void Glyph(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, IDWriteTextForma
     dc->DrawTextW(g, n, f, r, brush);
     dc->SetTransform(old);
 }
+
+// A path geometry opened for its figures (the icons drawn as paths); false: none, and nothing is drawn.
+bool OpenPath(ComPtr<ID2D1PathGeometry>& path, ComPtr<ID2D1GeometrySink>& sink) {
+    return SUCCEEDED(g_gfx.d2dFactory->CreatePathGeometry(&path)) && SUCCEEDED(path->Open(&sink));
+}
+
+// a cup; steam rises while the screen is kept on
+void DrawAwake(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, D2D1_POINT_2F c, float s, const IconState& st) {
+    Pen p{ dc, brush, c, s };
+    float w = 1.5f;
+    ComPtr<ID2D1PathGeometry> cup; ComPtr<ID2D1GeometrySink> sink;
+    if (!OpenPath(cup, sink)) return;
+    sink->BeginFigure(p.P(-6, -1), D2D1_FIGURE_BEGIN_HOLLOW);
+    sink->AddLine(p.P(-5.2f, 5.5f));
+    sink->AddQuadraticBezier({ p.P(-4.8f, 7.5f), p.P(-2.8f, 7.5f) });
+    sink->AddLine(p.P(2.8f, 7.5f));
+    sink->AddQuadraticBezier({ p.P(4.8f, 7.5f), p.P(5.2f, 5.5f) });
+    sink->AddLine(p.P(6, -1));
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    sink->Close();
+    dc->DrawGeometry(cup.Get(), brush, w * s);
+    dc->DrawEllipse({ p.P(7.6f, 2.6f), 2.4f * s, 2.6f * s }, brush, w * s);   // handle
+    if (st.awake) {
+        dc->FillGeometry(cup.Get(), brush);
+        for (float x : { -2.5f, 1.5f }) {
+            ComPtr<ID2D1PathGeometry> steam; ComPtr<ID2D1GeometrySink> ss;
+            if (!OpenPath(steam, ss)) continue;
+            ss->BeginFigure(p.P(x, -3.5f), D2D1_FIGURE_BEGIN_HOLLOW);
+            ss->AddBezier({ p.P(x - 1.8f, -5.5f), p.P(x + 1.8f, -7.5f), p.P(x, -9.5f) });
+            ss->EndFigure(D2D1_FIGURE_END_OPEN);
+            ss->Close();
+            dc->DrawGeometry(steam.Get(), brush, w * s);
+        }
+    }
+}
+
+// a monitor outline
+void DrawDesktop(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, D2D1_POINT_2F c, float s) {
+    auto screen = D2D1::RectF(c.x - 8 * s, c.y - 6 * s, c.x + 8 * s, c.y + 4 * s);
+    dc->DrawRoundedRectangle({ screen, 1.5f * s, 1.5f * s }, brush, 1.4f * s);
+    dc->DrawLine({ c.x, c.y + 4 * s }, { c.x, c.y + 7 * s }, brush, 1.4f * s);
+    dc->DrawLine({ c.x - 4 * s, c.y + 7 * s }, { c.x + 4 * s, c.y + 7 * s }, brush, 1.4f * s);
+}
+
+// three bars (an OLED subpixel: red, green, blue) leaning 35 degrees in one rounded outline; ink while off
+void DrawOled(ID2D1DeviceContext* dc, D2D1_POINT_2F c, float s, D2D1_COLOR_F ink, const IconState& st) {
+    float w = 13 * s, h = 15 * s;
+    D2D1_RECT_F b = { c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2 };
+    ComPtr<ID2D1RoundedRectangleGeometry> shape;
+    if (FAILED(g_gfx.d2dFactory->CreateRoundedRectangleGeometry({ b, 2.6f * s, 2.6f * s }, &shape))) return;
+    D2D1_COLOR_F col[3];
+    if (st.oled) { col[0] = D2D1::ColorF(0xFF3B30, ink.a); col[1] = D2D1::ColorF(0x5BC22A, ink.a); col[2] = D2D1::ColorF(0x4459F0, ink.a); }
+    else { const float a[3] = { 0.55f, 0.75f, 0.95f }; for (int i = 0; i < 3; ++i) { col[i] = ink; col[i].a *= a[i]; } }
+    D2D1_GRADIENT_STOP stops[6] = { { 0, col[0] }, { 1 / 3.0f, col[0] }, { 1 / 3.0f, col[1] }, { 2 / 3.0f, col[1] }, { 2 / 3.0f, col[2] }, { 1, col[2] } };
+    ID2D1LinearGradientBrush* fill = g_gfx.GradientBrush(stops, 6, { b.left, c.y }, { b.right, c.y });   // kept while the ink stays
+    if (!fill) return;
+    D2D1_MATRIX_3X2_F old; dc->GetTransform(&old);
+    dc->SetTransform(D2D1::Matrix3x2F::Skew(-35, 0, c) * old);
+    dc->FillGeometry(shape.Get(), fill);
+    dc->SetTransform(old);
+}
+
+// the gallery's cube mark, as tall as the other icons
+void DrawSff(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, D2D1_POINT_2F c, float s) {
+    float k = 8.6f * s;
+    ComPtr<ID2D1PathGeometry> mark; ComPtr<ID2D1GeometrySink> sink;
+    if (!OpenPath(mark, sink)) return;
+    sink->SetFillMode(D2D1_FILL_MODE_ALTERNATE);
+    for (auto& o : kSffMark) {
+        sink->BeginFigure({ c.x + o.p[0].x * k, c.y + o.p[0].y * k }, D2D1_FIGURE_BEGIN_FILLED);
+        for (size_t i = 1; i < o.n; ++i) sink->AddLine({ c.x + o.p[i].x * k, c.y + o.p[i].y * k });
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+    if (FAILED(sink->Close())) return;
+    dc->FillGeometry(mark.Get(), brush);
+}
+
+// a bulb hung upside down: outline in dark mode, lit with rays in light mode
+void DrawTheme(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, D2D1_POINT_2F c, float s, D2D1_COLOR_F ink, const IconState& st) {
+    float k = 0.55f * s;
+    auto pt = [&](float x, float y) { return D2D1::Point2F(c.x + x * k, c.y + y * k); };
+    auto inkT = ink; if (!st.light) inkT.a *= 0.8f;
+    float line = 1.8f * k;
+    ComPtr<ID2D1PathGeometry> glass; ComPtr<ID2D1GeometrySink> sink;
+    if (!OpenPath(glass, sink)) return;
+    sink->BeginFigure(pt(-4.5f, -7), D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddLine(pt(-4.5f, -4.61f));
+    sink->AddArc({ pt(4.5f, -4.61f), { 8 * k, 8 * k }, 0, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_LARGE });
+    sink->AddLine(pt(4.5f, -7));
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    if (FAILED(sink->Close())) return;
+    brush->SetColor(inkT);
+    dc->DrawLine(pt(0, -10.5f), pt(0, -19), brush, line);
+    dc->DrawLine(pt(-3.5f, -10.5f), pt(3.5f, -10.5f), brush, line);
+    if (st.light) {
+        dc->FillGeometry(glass.Get(), brush);
+        const float rays[5][4] = { { 0, 15, 0, 19 }, { -9.2f, 11.2f, -12, 14 }, { 9.2f, 11.2f, 12, 14 }, { -12, 2, -16, 2 }, { 12, 2, 16, 2 } };
+        for (auto& ray : rays) dc->DrawLine(pt(ray[0], ray[1]), pt(ray[2], ray[3]), brush, line);
+    } else {
+        dc->DrawGeometry(glass.Get(), brush, line);
+    }
+}
 }
 
 void DrawButtonIcon(ButtonId id, ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, IDWriteTextFormat* glyphFont,
@@ -273,103 +373,11 @@ void DrawButtonIcon(ButtonId id, ID2D1DeviceContext* dc, ID2D1SolidColorBrush* b
         }
         break;
     }
-    case ButtonId::Awake: {
-        // a cup; steam rises while the screen is kept on
-        Pen p{ dc, brush, c, s };
-        float w = 1.5f;
-        ComPtr<ID2D1PathGeometry> cup; ComPtr<ID2D1GeometrySink> sink;
-        if (FAILED(g_gfx.d2dFactory->CreatePathGeometry(&cup)) || FAILED(cup->Open(&sink))) break;
-        sink->BeginFigure(p.P(-6, -1), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddLine(p.P(-5.2f, 5.5f));
-        sink->AddQuadraticBezier({ p.P(-4.8f, 7.5f), p.P(-2.8f, 7.5f) });
-        sink->AddLine(p.P(2.8f, 7.5f));
-        sink->AddQuadraticBezier({ p.P(4.8f, 7.5f), p.P(5.2f, 5.5f) });
-        sink->AddLine(p.P(6, -1));
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        sink->Close();
-        dc->DrawGeometry(cup.Get(), brush, w * s);
-        dc->DrawEllipse({ p.P(7.6f, 2.6f), 2.4f * s, 2.6f * s }, brush, w * s);   // handle
-        if (st.awake) {
-            dc->FillGeometry(cup.Get(), brush);
-            for (float x : { -2.5f, 1.5f }) {
-                ComPtr<ID2D1PathGeometry> steam; ComPtr<ID2D1GeometrySink> ss;
-                if (FAILED(g_gfx.d2dFactory->CreatePathGeometry(&steam)) || FAILED(steam->Open(&ss))) continue;
-                ss->BeginFigure(p.P(x, -3.5f), D2D1_FIGURE_BEGIN_HOLLOW);
-                ss->AddBezier({ p.P(x - 1.8f, -5.5f), p.P(x + 1.8f, -7.5f), p.P(x, -9.5f) });
-                ss->EndFigure(D2D1_FIGURE_END_OPEN);
-                ss->Close();
-                dc->DrawGeometry(steam.Get(), brush, w * s);
-            }
-        }
-        break;
-    }
-    case ButtonId::Desktop: {
-        // a monitor outline
-        auto screen = D2D1::RectF(c.x - 8 * s, c.y - 6 * s, c.x + 8 * s, c.y + 4 * s);
-        dc->DrawRoundedRectangle({ screen, 1.5f * s, 1.5f * s }, brush, 1.4f * s);
-        dc->DrawLine({ c.x, c.y + 4 * s }, { c.x, c.y + 7 * s }, brush, 1.4f * s);
-        dc->DrawLine({ c.x - 4 * s, c.y + 7 * s }, { c.x + 4 * s, c.y + 7 * s }, brush, 1.4f * s);
-        break;
-    }
-    case ButtonId::Oled: {
-        // three bars (an OLED subpixel: red, green, blue) leaning 35 degrees in one rounded outline; ink while off
-        float w = 13 * s, h = 15 * s;
-        D2D1_RECT_F b = { c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2 };
-        ComPtr<ID2D1RoundedRectangleGeometry> shape;
-        if (FAILED(g_gfx.d2dFactory->CreateRoundedRectangleGeometry({ b, 2.6f * s, 2.6f * s }, &shape))) break;
-        D2D1_COLOR_F col[3];
-        if (st.oled) { col[0] = D2D1::ColorF(0xFF3B30, ink.a); col[1] = D2D1::ColorF(0x5BC22A, ink.a); col[2] = D2D1::ColorF(0x4459F0, ink.a); }
-        else { const float a[3] = { 0.55f, 0.75f, 0.95f }; for (int i = 0; i < 3; ++i) { col[i] = ink; col[i].a *= a[i]; } }
-        D2D1_GRADIENT_STOP stops[6] = { { 0, col[0] }, { 1 / 3.0f, col[0] }, { 1 / 3.0f, col[1] }, { 2 / 3.0f, col[1] }, { 2 / 3.0f, col[2] }, { 1, col[2] } };
-        ID2D1LinearGradientBrush* fill = g_gfx.GradientBrush(stops, 6, { b.left, c.y }, { b.right, c.y });   // kept while the ink stays
-        if (!fill) break;
-        D2D1_MATRIX_3X2_F old; dc->GetTransform(&old);
-        dc->SetTransform(D2D1::Matrix3x2F::Skew(-35, 0, c) * old);
-        dc->FillGeometry(shape.Get(), fill);
-        dc->SetTransform(old);
-        break;
-    }
-    case ButtonId::Sff: {
-        // the gallery's cube mark, as tall as the other icons
-        float k = 8.6f * s;
-        ComPtr<ID2D1PathGeometry> mark; ComPtr<ID2D1GeometrySink> sink;
-        if (FAILED(g_gfx.d2dFactory->CreatePathGeometry(&mark)) || FAILED(mark->Open(&sink))) break;
-        sink->SetFillMode(D2D1_FILL_MODE_ALTERNATE);
-        for (auto& o : kSffMark) {
-            sink->BeginFigure({ c.x + o.p[0].x * k, c.y + o.p[0].y * k }, D2D1_FIGURE_BEGIN_FILLED);
-            for (size_t i = 1; i < o.n; ++i) sink->AddLine({ c.x + o.p[i].x * k, c.y + o.p[i].y * k });
-            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        }
-        if (FAILED(sink->Close())) break;
-        dc->FillGeometry(mark.Get(), brush);
-        break;
-    }
-    case ButtonId::Theme: {
-        // a bulb hung upside down: outline in dark mode, lit with rays in light mode
-        float k = 0.55f * s;
-        auto pt = [&](float x, float y) { return D2D1::Point2F(c.x + x * k, c.y + y * k); };
-        auto inkT = ink; if (!st.light) inkT.a *= 0.8f;
-        float line = 1.8f * k;
-        ComPtr<ID2D1PathGeometry> glass; ComPtr<ID2D1GeometrySink> sink;
-        if (FAILED(g_gfx.d2dFactory->CreatePathGeometry(&glass)) || FAILED(glass->Open(&sink))) break;
-        sink->BeginFigure(pt(-4.5f, -7), D2D1_FIGURE_BEGIN_FILLED);
-        sink->AddLine(pt(-4.5f, -4.61f));
-        sink->AddArc({ pt(4.5f, -4.61f), { 8 * k, 8 * k }, 0, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_LARGE });
-        sink->AddLine(pt(4.5f, -7));
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        if (FAILED(sink->Close())) break;
-        brush->SetColor(inkT);
-        dc->DrawLine(pt(0, -10.5f), pt(0, -19), brush, line);
-        dc->DrawLine(pt(-3.5f, -10.5f), pt(3.5f, -10.5f), brush, line);
-        if (st.light) {
-            dc->FillGeometry(glass.Get(), brush);
-            const float rays[5][4] = { { 0, 15, 0, 19 }, { -9.2f, 11.2f, -12, 14 }, { 9.2f, 11.2f, 12, 14 }, { -12, 2, -16, 2 }, { 12, 2, 16, 2 } };
-            for (auto& ray : rays) dc->DrawLine(pt(ray[0], ray[1]), pt(ray[2], ray[3]), brush, line);
-        } else {
-            dc->DrawGeometry(glass.Get(), brush, line);
-        }
-        break;
-    }
+    case ButtonId::Awake: DrawAwake(dc, brush, c, s, st); break;
+    case ButtonId::Desktop: DrawDesktop(dc, brush, c, s); break;
+    case ButtonId::Oled: DrawOled(dc, c, s, ink, st); break;
+    case ButtonId::Sff: DrawSff(dc, brush, c, s); break;
+    case ButtonId::Theme: DrawTheme(dc, brush, c, s, ink, st); break;
     default: break;
     }
 }
@@ -408,7 +416,7 @@ void DrawBatteryIcon(ID2D1DeviceContext* dc, ID2D1SolidColorBrush* brush, D2D1_R
         const float bh = (body.bottom - body.top) * 1.08f, bw = bh * 0.62f;
         const D2D1_POINT_2F pts[] = { { 0.12f, -0.50f }, { -0.42f, 0.08f }, { -0.04f, 0.08f },
                                       { -0.14f, 0.50f }, { 0.42f, -0.10f }, { 0.04f, -0.10f } };
-        if (SUCCEEDED(g_gfx.d2dFactory->CreatePathGeometry(&bolt)) && SUCCEEDED(bolt->Open(&sink))) {
+        if (OpenPath(bolt, sink)) {
             sink->BeginFigure({ cx + pts[0].x * bw, cy + pts[0].y * bh }, D2D1_FIGURE_BEGIN_FILLED);
             for (int i = 1; i < 6; ++i) sink->AddLine({ cx + pts[i].x * bw, cy + pts[i].y * bh });
             sink->EndFigure(D2D1_FIGURE_END_CLOSED);

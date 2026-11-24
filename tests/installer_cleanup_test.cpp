@@ -21,8 +21,13 @@ static BOOL WINAPI TestMoveFileEx(LPCWSTR from, LPCWSTR to, DWORD flags) {
 #include <vector>
 namespace fs = std::filesystem;
 
+static int checks = 0;   // Check()s run, Write's too (the last line's count)
 static void Check(bool ok, const char* label) {
-    if (!ok) { std::printf("FAIL: %s (Windows error %lu)\n",label,GetLastError()); std::exit(1); }
+    ++checks;
+    if (!ok) {
+        std::printf("FAIL: %s (Windows error %lu)\n",label,GetLastError());
+        std::printf("installer_cleanup_test: FAILED (%d checks, 1 failure)\n",checks); std::exit(1);
+    }
 }
 static void Write(const fs::path& path, const char* contents) {
     std::ofstream file(path, std::ios::binary); file << contents; file.close(); Check(!file.fail(), "write fixture");
@@ -153,4 +158,5 @@ int wmain(int argc, wchar_t** argv) {
     // Leave fixtures for inspection; only the production cleanup above deletes its exact retired directory.
     CoUninitialize();
     std::puts("Installer cleanup regression passed; actual user installation was not accessed.");
+    std::printf("installer_cleanup_test: ALL PASSED (%d checks, 0 failures)\n", checks);
 }

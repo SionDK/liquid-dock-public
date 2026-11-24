@@ -47,7 +47,6 @@ bool MonitorCapture::Start(HMONITOR mon) {
         gdiMon = mi.rcMonitor;
         gdiActive = true;
         gdiLast = 0;
-        startedAt = NowSeconds();
         gotFirstFrame = false;
         return true;
     }
@@ -60,7 +59,6 @@ bool MonitorCapture::Start(HMONITOR mon) {
         try { session.IsCursorCaptureEnabled(false); } catch (...) {}
         try { session.IsBorderRequired(false); } catch (...) {}
         session.StartCapture();
-        startedAt = NowSeconds();
         gotFirstFrame = false;
         return true;
     } catch (hresult_error const& e) {

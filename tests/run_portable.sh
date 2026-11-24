@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 CXX=${CXX:-g++}
 out=build/tests-portable
 mkdir -p "$out"
-for t in fluent_logic fluent_settings icon_pixels admin_protocol app_click taskbar_apps tray_buttons battery start_menu sys_poll idle_wait refreshed sensor_logic; do
+for t in fluent_logic fluent_settings icon_pixels admin_protocol app_click taskbar_apps tray_buttons battery start_menu sys_poll idle_wait refreshed sensor_logic main_args logon_task; do
   $CXX -std=c++20 -O1 -Wall -Wextra "tests/${t}_test.cpp" -o "$out/${t}_test"
   "$out/${t}_test" >"$out/${t}_test.txt" || { cat "$out/${t}_test.txt"; echo "FAILED: ${t}_test"; exit 1; }
   tail -n 1 "$out/${t}_test.txt"

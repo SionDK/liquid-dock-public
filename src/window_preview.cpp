@@ -12,6 +12,10 @@ constexpr BYTE kClosingOpacity = 110;   // the image of a window asked to close
 constexpr wchar_t kClass[] = L"LiquidDockWindowPreview";
 int Px(float value, float scale) { return std::max(1, (int)std::lround(value * scale)); }
 bool SameRect(RECT a, RECT b) { return EqualRect(&a, &b) != FALSE; }
+// Lets go of a card's DWM relationship, if it holds one.
+void Unthumb(HTHUMBNAIL& thumbnail) {
+    if (thumbnail) { DwmUnregisterThumbnail(thumbnail); thumbnail = nullptr; }
+}
 void Fill(HDC dc, RECT r, COLORREF color) {
     HBRUSH brush = CreateSolidBrush(color); FillRect(dc, &r, brush); DeleteObject(brush);
 }
@@ -87,9 +91,7 @@ bool WindowPreview::Create(HWND owner) {
 }
 
 void WindowPreview::ReleaseThumbnails() {
-    for (auto& e : entries) if (e.thumbnail) {
-        DwmUnregisterThumbnail(e.thumbnail); e.thumbnail = nullptr;
-    }
+    for (auto& e : entries) Unthumb(e.thumbnail);
 }
 
 void WindowPreview::Hide() {
@@ -206,7 +208,7 @@ void WindowPreview::Refresh() {
     bool changed = false;
     for (auto it = entries.begin(); it != entries.end();) {
         if (!Valid(*it)) {
-            if (it->thumbnail) DwmUnregisterThumbnail(it->thumbnail);
+            Unthumb(it->thumbnail);
             it = entries.erase(it); changed = true;
         } else ++it;
     }
@@ -234,7 +236,51 @@ void WindowPreview::Refresh() {
 void WindowPreview::Arrange(bool follow) {
     if (entries.empty()) return;
     const int wasCapacity = capacity, wasFirst = first;
-    const int pad = Px(8, scale), gap = Px(8, scale), header = Px(30, scale);
+    const Metrics m = Measure();
+    const int pad = m.pad, header = m.header, nav = m.nav;
+    Placement at;
+    if (!PlacePopup(m, at)) {   // no room for it next to the icon
+        Hide(); suppressed = true; return;
+    }
+    const int x = at.x, y = at.y, w = at.w, h = at.h;
+    RECT nextBounds{x, y, x + w, y + h};
+    bool moved = !SameRect(bounds, nextBounds);
+    // the same size, page and cards a page: every card where it was (count, cw and ch follow from them)
+    const bool sameCards = w == bounds.right - bounds.left && h == bounds.bottom - bounds.top &&
+                           capacity == wasCapacity && first == wasFirst;
+    bounds = nextBounds;
+    bridge = anchor;
+    if (edge == Edge::Left) bridge.right = bounds.left;
+    if (edge == Edge::Right) bridge.left = bounds.right;
+    if (edge == Edge::Top) bridge.bottom = bounds.top;
+    if (edge == Edge::Bottom) bridge.top = bounds.bottom;
+    // Small padding avoids a dead seam at either end of the crossing.
+    InflateRect(&bridge, 2, 2);
+    next = {w - pad - nav, pad, w - pad, pad + header};
+    previous = {next.left - nav, pad, next.left, pad + header};
+    if (follow && sameCards) {   // a move: the window's region and picture stay as they are
+        if (moved && !SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)) Dismiss();
+        return;
+    }
+    PlaceCards(m, at, moved);
+    if (moved) {
+        if (!SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)) {
+            Dismiss(); return;
+        }
+        HRGN rounded = CreateRoundRectRgn(0, 0, w + 1, h + 1, Px(14, scale), Px(14, scale));
+        if (!SetWindowRgn(hwnd, rounded, TRUE)) DeleteObject(rounded);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+}
+
+WindowPreview::Metrics WindowPreview::Measure() const {
+    return {Px(8, scale), Px(8, scale), Px(30, scale), Px(28, scale)};
+}
+
+// Arrange's popup: its place next to the icon on the monitor, its size and the page it shows (capacity and first
+// are set). false: no room for it there, and nothing changed.
+bool WindowPreview::PlacePopup(const Metrics& m, Placement& at) {
+    const int pad = m.pad, gap = m.gap, header = m.header;
     const bool vertical = IsVertical(edge);
     RECT available = monitor;
     InflateRect(&available, -pad, -pad);
@@ -246,9 +292,7 @@ void WindowPreview::Arrange(bool follow) {
     }
     int aw = available.right - available.left, ah = available.bottom - available.top;
     // Do not overlap the dock to make a preview fit on an unusably small area.
-    if (aw < 2 * pad + Px(80, scale) || ah < header + 2 * pad + Px(60, scale)) {
-        Hide(); suppressed = true; return;
-    }
+    if (aw < 2 * pad + Px(80, scale) || ah < header + 2 * pad + Px(60, scale)) return false;
     int cw = std::min(Px(220, scale), aw - 2 * pad);
     int ch = std::min(Px(156, scale), ah - header - 2 * pad);
     capacity = std::max(1, vertical ? (ah - header - pad) / (ch + pad) : (aw - pad) / (cw + pad));
@@ -264,26 +308,16 @@ void WindowPreview::Arrange(bool follow) {
     if (edge == Edge::Bottom) y = available.bottom - h;
     x = std::clamp<int>(x, available.left, available.right - w);
     y = std::clamp<int>(y, available.top, available.bottom - h);
-    RECT nextBounds{x, y, x + w, y + h};
-    bool moved = !SameRect(bounds, nextBounds);
-    // the same size, page and cards a page: every card where it was (count, cw and ch follow from them)
-    const bool sameCards = w == bounds.right - bounds.left && h == bounds.bottom - bounds.top &&
-                           capacity == wasCapacity && first == wasFirst;
-    bounds = nextBounds;
-    bridge = anchor;
-    if (edge == Edge::Left) bridge.right = bounds.left;
-    if (edge == Edge::Right) bridge.left = bounds.right;
-    if (edge == Edge::Top) bridge.bottom = bounds.top;
-    if (edge == Edge::Bottom) bridge.top = bounds.bottom;
-    // Small padding avoids a dead seam at either end of the crossing.
-    InflateRect(&bridge, 2, 2);
-    int nav = Px(28, scale);
-    next = {w - pad - nav, pad, w - pad, pad + header};
-    previous = {next.left - nav, pad, next.left, pad + header};
-    if (follow && sameCards) {   // a move: the window's region and picture stay as they are
-        if (moved && !SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)) Dismiss();
-        return;
-    }
+    at = {vertical, cw, ch, count, x, y, w, h};
+    return true;
+}
+
+// Arrange's cards: each card of the page shown, in the popup's own coordinates, with its window's picture or the
+// words in its place; the cards of other pages let go of theirs. moved: set when a picture's place or words changed.
+void WindowPreview::PlaceCards(const Metrics& m, const Placement& at, bool& moved) {
+    const int pad = m.pad, header = m.header;
+    const bool vertical = at.vertical;
+    const int cw = at.cw, ch = at.ch, count = at.count;
     for (int i = 0; i < (int)entries.size(); ++i) {
         auto& e = entries[i];
         // Minimized windows show the image DWM kept of them, like the taskbar's previews
@@ -291,7 +325,7 @@ void WindowPreview::Arrange(bool follow) {
         const bool minimized = IsIconic(e.source) != FALSE;
         if (!minimized) e.noImage = false;   // shown again since: asked anew, on whatever page
         if (i < first || i >= first + count) {
-            if (e.thumbnail) { DwmUnregisterThumbnail(e.thumbnail); e.thumbnail = nullptr; }
+            Unthumb(e.thumbnail);
             e.card = {}; continue;
         }
         int j = i - first;
@@ -305,76 +339,84 @@ void WindowPreview::Arrange(bool follow) {
         if (GetWindowDisplayAffinity(e.source, &affinity) && affinity != WDA_NONE)
             fallback = minimized ? none : L"미리보기가 제한된 창";
         else if (e.noImage) fallback = none;   // no new image comes while it stays minimized: not asked again
-        if (!fallback.empty()) {
-            if (e.thumbnail) { DwmUnregisterThumbnail(e.thumbnail); e.thumbnail = nullptr; }
-        } else {
-            HRESULT hr = S_OK;
-            if (!e.thumbnail) {
-                e.sentDestination = {};   // a new relationship: DWM has no properties for it yet
-                if (FAILED(hr = DwmRegisterThumbnail(hwnd, e.source, &e.thumbnail))) e.thumbnail = nullptr;
-            }
-            SIZE size{};
-            if (e.thumbnail && FAILED(hr = DwmQueryThumbnailSourceSize(e.thumbnail, &size))) size = {};
-            bool usable = e.thumbnail && size.cx > 0 && size.cy > 0 && (!minimized || KeptImage(e.source, size));
-            // Only DWM's own answer that it has no image is kept; a failed call is tried again, as for a live window.
-            if (minimized) e.noImage = e.thumbnail && SUCCEEDED(hr) && !usable;
-            HRESULT drawn = S_OK;
-            if (!usable) fallback = none;
-            else {
-                double fit = std::min(double(image.right - image.left) / size.cx, double(image.bottom - image.top) / size.cy);
-                int iw = std::max(1, (int)(size.cx * fit)), ih = std::max(1, (int)(size.cy * fit));
-                int ix = (image.left + image.right - iw) / 2, iy = (image.top + image.bottom - ih) / 2;
-                const RECT destination{ix, iy, ix + iw, iy + ih};
-                const BYTE opacity = e.closing ? kClosingOpacity : 255;
-                // DWM keeps a thumbnail's properties: sent when they change, not again on every Refresh
-                if (!SameRect(destination, e.sentDestination) || opacity != e.sentOpacity) {
-                    DWM_THUMBNAIL_PROPERTIES props{};
-                    props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-                    props.rcDestination = destination;
-                    props.fVisible = TRUE; props.opacity = opacity; props.fSourceClientAreaOnly = FALSE;
-                    if (FAILED(drawn = DwmUpdateThumbnailProperties(e.thumbnail, &props))) fallback = none;
-                    else { e.sentDestination = destination; e.sentOpacity = opacity; }
-                }
-            }
-            if (minimized) {
-                if (usable) NoteMinimized(e.source, app->name, SUCCEEDED(drawn) ? Kept::Shown : Kept::NotShown, drawn, size);
-                else NoteMinimized(e.source, app->name, FAILED(hr) ? Kept::NoAnswer : Kept::NoImage, hr, size);
-            }
-            if (!fallback.empty() && e.thumbnail) { DwmUnregisterThumbnail(e.thumbnail); e.thumbnail = nullptr; }
-        }
+        if (!fallback.empty()) Unthumb(e.thumbnail);
+        else ShowThumbnail(e, image, minimized, none, fallback);
         if (fallback != e.fallback || !SameRect(image, e.image)) moved = true;
         e.image = image; e.fallback = std::move(fallback);
     }
-    if (moved) {
-        if (!SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)) {
-            Dismiss(); return;
-        }
-        HRGN rounded = CreateRoundRectRgn(0, 0, w + 1, h + 1, Px(14, scale), Px(14, scale));
-        if (!SetWindowRgn(hwnd, rounded, TRUE)) DeleteObject(rounded);
-        InvalidateRect(hwnd, nullptr, FALSE);
-    }
 }
+
+// A card's DWM thumbnail fitted into its picture's place (image): registered when it holds none, its properties sent
+// when they change, a minimized window's outcome noted. Without a picture to show, fallback gets the words (none)
+// and the relationship is let go.
+void WindowPreview::ShowThumbnail(Entry& e, const RECT& image, bool minimized, const wchar_t* none, std::wstring& fallback) {
+    HRESULT hr = S_OK;
+    if (!e.thumbnail) {
+        e.sentDestination = {};   // a new relationship: DWM has no properties for it yet
+        if (FAILED(hr = DwmRegisterThumbnail(hwnd, e.source, &e.thumbnail))) e.thumbnail = nullptr;
+    }
+    SIZE size{};
+    if (e.thumbnail && FAILED(hr = DwmQueryThumbnailSourceSize(e.thumbnail, &size))) size = {};
+    bool usable = e.thumbnail && size.cx > 0 && size.cy > 0 && (!minimized || KeptImage(e.source, size));
+    // Only DWM's own answer that it has no image is kept; a failed call is tried again, as for a live window.
+    if (minimized) e.noImage = e.thumbnail && SUCCEEDED(hr) && !usable;
+    HRESULT drawn = S_OK;
+    if (!usable) fallback = none;
+    else {
+        double fit = std::min(double(image.right - image.left) / size.cx, double(image.bottom - image.top) / size.cy);
+        int iw = std::max(1, (int)(size.cx * fit)), ih = std::max(1, (int)(size.cy * fit));
+        int ix = (image.left + image.right - iw) / 2, iy = (image.top + image.bottom - ih) / 2;
+        const RECT destination{ix, iy, ix + iw, iy + ih};
+        const BYTE opacity = e.closing ? kClosingOpacity : 255;
+        // DWM keeps a thumbnail's properties: sent when they change, not again on every Refresh
+        if (!SameRect(destination, e.sentDestination) || opacity != e.sentOpacity) {
+            DWM_THUMBNAIL_PROPERTIES props{};
+            props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+            props.rcDestination = destination;
+            props.fVisible = TRUE; props.opacity = opacity; props.fSourceClientAreaOnly = FALSE;
+            if (FAILED(drawn = DwmUpdateThumbnailProperties(e.thumbnail, &props))) fallback = none;
+            else { e.sentDestination = destination; e.sentOpacity = opacity; }
+        }
+    }
+    if (minimized) {
+        if (usable) NoteMinimized(e.source, app->name, SUCCEEDED(drawn) ? Kept::Shown : Kept::NotShown, drawn, size);
+        else NoteMinimized(e.source, app->name, FAILED(hr) ? Kept::NoAnswer : Kept::NoImage, hr, size);
+    }
+    if (!fallback.empty()) Unthumb(e.thumbnail);
+}
+
+// The last card of the page shown, plus one.
+int WindowPreview::PageEnd() const { return std::min(first + capacity, (int)entries.size()); }
 
 int WindowPreview::Hit(POINT p) const {
     if (first > 0 && PtInRect(&previous, p)) return -2;
     if (first + capacity < (int)entries.size() && PtInRect(&next, p)) return -3;
-    for (int i = first; i < std::min(first + capacity, (int)entries.size()); ++i)
+    for (int i = first; i < PageEnd(); ++i)
         if (PtInRect(&entries[i].card, p)) return i;
     return -1;
 }
 
 // The close button: a square at the right end of a card's title row, as on the taskbar's previews.
-RECT WindowPreview::CloseRect(const Entry& e) const {
-    const int header = Px(30, scale), size = Px(24, scale), margin = (header - size) / 2;
+RECT WindowPreview::CloseRect(const Entry& e) const { return CloseRect(e, Measure()); }
+
+RECT WindowPreview::CloseRect(const Entry& e, const Metrics& m) const {
+    const int header = m.header, size = Px(24, scale), margin = (header - size) / 2;
     return {e.card.right - margin - size, e.card.top + margin, e.card.right - margin, e.card.top + margin + size};
 }
 
 int WindowPreview::HitClose(POINT p) const {
-    for (int i = first; i < std::min(first + capacity, (int)entries.size()); ++i) {
-        RECT r = CloseRect(entries[i]);
+    const Metrics m = Measure();
+    for (int i = first; i < PageEnd(); ++i) {
+        RECT r = CloseRect(entries[i], m);
         if (PtInRect(&r, p)) return i;
     }
     return -1;
+}
+
+// The card's window is the one (handle and process) a press or a middle press went down on: a handle reused by
+// another window since does not count.
+bool WindowPreview::SameWindow(int index, HWND source, DWORD pid) const {
+    return index >= 0 && source != nullptr && entries[index].source == source && entries[index].pid == pid;
 }
 
 // As the window's own close button (AppModel::AskToClose): the program may ask to save first, or go
@@ -429,11 +471,12 @@ void WindowPreview::Paint() {
     SetBkMode(mem, TRANSPARENT); SetTextColor(mem, RGB(240, 242, 247));
     Fill(mem, client, RGB(27, 30, 37));
     if (app) {
-        int pad = Px(8, scale), header = Px(30, scale);
+        const Metrics m = Measure();
+        const int pad = m.pad, header = m.header;
         RECT title{pad * 2, pad, previous.left, pad + header};
         std::wstring label = app->name;
         if ((int)entries.size() > capacity) label += L"  " + std::to_wstring(first + 1) + L"–" +
-            std::to_wstring(std::min(first + capacity, (int)entries.size())) + L" / " + std::to_wstring(entries.size());
+            std::to_wstring(PageEnd()) + L" / " + std::to_wstring(entries.size());
         DrawTextW(mem, label.c_str(), -1, &title, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         auto arrow = [&](RECT r, const wchar_t* text, bool enabled, int id) {
             if (hot == id) Fill(mem, r, RGB(65, 72, 87));
@@ -444,11 +487,11 @@ void WindowPreview::Paint() {
             arrow(previous, L"‹", first > 0, -2);
             arrow(next, L"›", first + capacity < (int)entries.size(), -3);
         }
-        for (int i = first; i < std::min(first + capacity, (int)entries.size()); ++i) {
+        for (int i = first; i < PageEnd(); ++i) {
             auto& e = entries[i];
             Fill(mem, e.card, hot == i ? RGB(64, 77, 97) : RGB(40, 44, 54));
             SetTextColor(mem, e.closing ? RGB(128, 134, 145) : RGB(240, 242, 247));
-            const RECT closeRect = CloseRect(e);
+            const RECT closeRect = CloseRect(e, m);
             RECT titleRect{e.card.left + pad, e.card.top, closeRect.left - Px(2, scale), e.card.top + header};
             DrawTextW(mem, e.title.c_str(), -1, &titleRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
             // the close button while the pointer is on the card (or the button is held), not while it closes
@@ -496,14 +539,14 @@ LRESULT CALLBACK WindowPreview::Proc(HWND h, UINT message, WPARAM wp, LPARAM lp)
         // the card: the pointer was on the button, not on the window's picture.
         const int x = self->HitClose(pt);
         if (x >= 0) {
-            if (pressedClose && self->entries[x].source == pressedClose && self->entries[x].pid == pid) self->AskClose(x);
+            if (self->SameWindow(x, pressedClose, pid)) self->AskClose(x);
             else InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
         if (pressedClose) InvalidateRect(h, nullptr, FALSE);   // the button, let go elsewhere
         int hit = self->Hit(pt);
         if (nav && nav == hit) self->ChangePage(nav == -2 ? -1 : 1);
-        else if (hit >= 0 && self->entries[hit].source == pressed && self->entries[hit].pid == pid && self->Valid(self->entries[hit])) {
+        else if (self->SameWindow(hit, pressed, pid) && self->Valid(self->entries[hit])) {
             auto app = self->app; self->Dismiss();
             g_apps.ActivateWindow(pressed); app->attention = false;
         }
@@ -520,7 +563,7 @@ LRESULT CALLBACK WindowPreview::Proc(HWND h, UINT message, WPARAM wp, LPARAM lp)
         self->middle = nullptr; self->middlePid = 0;
         if (GetCapture() == h) ReleaseCapture();
         int hit = self->Hit({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-        if (middle && hit >= 0 && self->entries[hit].source == middle && self->entries[hit].pid == pid) self->AskClose(hit);
+        if (self->SameWindow(hit, middle, pid)) self->AskClose(hit);
         return 0;
     }
     case WM_CAPTURECHANGED: self->pressed = self->pressedClose = self->middle = nullptr; self->pressedNav = 0; return 0;

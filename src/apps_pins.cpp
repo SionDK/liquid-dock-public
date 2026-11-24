@@ -1,22 +1,10 @@
 #include "apps.h"
 #include "apps_internal.h"
-#include "admin_helper.h"
-#include "admin_client.h"   // Elevated: the log names a window in front that runs as administrator
-#include "app_click.h"
-#include "system.h"         // TakeForegroundRight
-#include "taskbar_apps.h"   // a click through the app's button on the taskbar
-#include "explorer_taskbar.h"   // ExplorerTaskbar: asked whether it answers after a press
-#include "gfx.h"
 #include <shlobj.h>
 #include <shobjidl.h>
-#include <shellapi.h>
 #include <propkey.h>
 #include <propvarutil.h>
-#include <dwmapi.h>
-#include <appmodel.h>
 #include <fstream>
-#include <sstream>
-#include <thread>
 
 void AppModel::LoadPins() {
     std::wstring path = AppDataDir() + L"\\pins.txt";
@@ -60,22 +48,16 @@ void AppModel::SavePins() {
 }
 
 static bool ReadShortcut(const std::wstring& lnk, std::wstring& exe, std::wstring& aumid) {
-    ComPtr<IShellLinkW> sl;
-    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) return false;
-    ComPtr<IPersistFile> pf; sl.As(&pf);
-    if (FAILED(pf->Load(lnk.c_str(), STGM_READ))) return false;
+    Shortcut s;
+    if (!OpenShortcut(lnk, s)) return false;
     wchar_t target[MAX_PATH * 2] = {};
-    if (SUCCEEDED(sl->GetPath(target, ARRAYSIZE(target), nullptr, 0)) && target[0]) {
+    if (SUCCEEDED(s.link->GetPath(target, ARRAYSIZE(target), nullptr, 0)) && target[0]) {
         wchar_t expanded[MAX_PATH * 2];
         ExpandEnvironmentStringsW(target, expanded, ARRAYSIZE(expanded));
         exe = ToLower(expanded);
     }
     ComPtr<IPropertyStore> ps;
-    if (SUCCEEDED(sl.As(&ps))) {
-        PROPVARIANT pv; PropVariantInit(&pv);
-        if (SUCCEEDED(ps->GetValue(PKEY_AppUserModel_ID, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) aumid = pv.pwszVal;
-        PropVariantClear(&pv);
-    }
+    if (SUCCEEDED(s.link.As(&ps))) ReadAumid(ps.Get(), aumid);   // only when it has one: aumid as it was else
     return true;
 }
 
@@ -173,7 +155,7 @@ void AppModel::ImportTaskbarPins() {
             ReadShortcut(pin.lnk, a->exe, a->aumid);
         } else {
             a->aumid = pin.aumid;
-            a->launch = L"shell:AppsFolder\\" + pin.aumid;
+            a->launch = AppsFolderTarget(pin.aumid);
         }
         LoadIconAndName(*a, nullptr);
         items.push_back(a);
@@ -193,7 +175,7 @@ void AppModel::MigratePins() {
         auto a = NewItem();
         a->pinned = true;
         a->aumid = id;
-        a->launch = L"shell:AppsFolder\\" + id;
+        a->launch = AppsFolderTarget(id);
         LoadIconAndName(*a, nullptr);
         items.insert(items.begin() + PinnedCount(), a);
         added++;
@@ -216,8 +198,8 @@ int AppModel::PinFile(const std::wstring& path, int index) {
     // moved there
     for (size_t i = 0; i < items.size(); ++i) {
         AppItem& it = *items[i];
-        const bool sameId = !a->aumid.empty() && _wcsicmp(it.aumid.c_str(), a->aumid.c_str()) == 0;
-        const bool sameProgram = !a->exe.empty() && it.exe == a->exe && (it.aumid.empty() || a->aumid.empty());
+        const bool sameId = SameAppId(it.aumid, a->aumid);
+        const bool sameProgram = SameProgramOneIdless(it.exe, it.aumid, a->exe, a->aumid);
         if (!sameId && !sameProgram) continue;
         if (!it.pinned && shortcut) it.launch = path;   // a running app pinned by its shortcut: the pin starts that (its arguments)
         MoveTo(it, (int)i < index ? index - 1 : index, true);   // the dock's index counts it when it is left of the drop point
@@ -238,12 +220,7 @@ int AppModel::PinFile(const std::wstring& path, int index) {
 void AppModel::SetPinned(AppItem& a, bool pinned) {
     if (a.pinned == pinned) return;
     if (pinned) {
-        if (a.launch.empty()) {
-            std::wstring nm;
-            if (!a.aumid.empty() && AppsFolderItem(a.aumid, &nm)) a.launch = L"shell:AppsFolder\\" + a.aumid;
-            else a.launch = a.exe;
-        }
-        MoveTo(a, PinnedCount(), true);
+        MoveTo(a, PinnedCount(), true);   // a pin with nothing to start yet gets its default there (MoveTo)
     } else {
         a.pinned = false;
         // move to the running section (or drop entirely when not running)
@@ -264,9 +241,10 @@ void AppModel::MoveTo(AppItem& a, int index, bool pin) {
     auto sp = *it;
     items.erase(it);
     if (pin) {
+        // what a pin starts, when nothing says yet (an app pinned while running): its Start menu entry, else its program
         if (sp->launch.empty()) {
             std::wstring nm;
-            if (!sp->aumid.empty() && AppsFolderItem(sp->aumid, &nm)) sp->launch = L"shell:AppsFolder\\" + sp->aumid;
+            if (!sp->aumid.empty() && AppsFolderItem(sp->aumid, &nm)) sp->launch = AppsFolderTarget(sp->aumid);
             else sp->launch = sp->exe;
         }
         sp->pinned = true;

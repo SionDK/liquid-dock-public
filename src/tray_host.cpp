@@ -1,30 +1,24 @@
 #include "tray_host_internal.h"
+#include <shlwapi.h>   // SHAllocShared and the like (ForwardAppBar): shlwapi.lib on every link line that takes the tray host
 
 namespace trayhost {
 
-bool ProcessElevated() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-    TOKEN_ELEVATION e{};
-    DWORD n = 0;
-    bool elevated = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &n) && e.TokenIsElevated;
-    CloseHandle(token);
-    return elevated;
-}
-
-// host thread state
-std::atomic<bool> g_stop{ false };
+// host thread state (the other parts use these: tray_host_internal.h)
 std::atomic<bool> g_ready{ false };
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
+HWND g_wnd = nullptr, g_notifyWnd = nullptr;
+std::atomic<bool> g_elevated{ false };    // this process runs as administrator (set when the host starts)
+// ...and this file's alone
+namespace {
+std::atomic<bool> g_stop{ false };
 bool g_gaveUp = false;                    // UI thread: Stop() gave up waiting for g_thread (kept until it has ended)
 HANDLE g_readyEvent = nullptr;
-HWND g_wnd = nullptr, g_notifyWnd = nullptr;
 HWND g_explorer = nullptr, g_lastExplorer = nullptr;
 bool g_explorerMissed = false;            // a message did not reach Explorer: re-sync it when stopping
-std::atomic<bool> g_elevated{ false };    // this process runs as administrator (set when the host starts)
 std::atomic<bool> g_announce{ true };     // ask programs to re-add their icons when starting (tray icons shown)
 std::atomic<bool> g_announced{ false };   // ... asked in this run
+}   // namespace
 
 // ---------------------------------------------------------------- Explorer
 HWND ExplorerTray() {
@@ -32,12 +26,15 @@ HWND ExplorerTray() {
     return g_explorer;
 }
 
+// The one taskbar message that is handed on posted, not sent (WM_USER + 372; its meaning is not known here).
+constexpr UINT kPostedTaskbarMsg = WM_USER + 372;
+
 // Hands a message on to Explorer's taskbar and returns its answer.
 bool Forward(UINT msg, WPARAM wp, LPARAM lp, LRESULT& result) {
     result = 0;
     HWND ex = ExplorerTray();
     if (!ex) { g_explorerMissed = true; return false; }
-    if (msg == WM_USER + 372) {   // posted by its senders (as ManagedShell forwards it)
+    if (msg == kPostedTaskbarMsg) {   // posted by its senders (as ManagedShell forwards it)
         PostMessageW(ex, msg, wp, lp);
         return true;
     }
@@ -46,6 +43,68 @@ bool Forward(UINT msg, WPARAM wp, LPARAM lp, LRESULT& result) {
     if (!SendMessageTimeoutW(ex, msg, wp, lp, SMTO_ABORTIFHUNG, 2000, &r)) { g_explorerMissed = true; return false; }
     result = (LRESULT)r;
     return true;
+}
+
+// ---------------------------------------------------------------- app bars
+// What SHAppBarMessage sends the first "Shell_TrayWnd" (WM_COPYDATA, dwData 0), as ManagedShell's APPBARMSGDATAV3: the
+// APPBARDATA with 32-bit handles, the message and, for the ones with a rectangle (ABM_QUERYPOS, ABM_SETPOS,
+// ABM_GETTASKBARPOS), a shared block (SHAllocShared) holding that APPBARDATA, made for the process of the window it
+// found, whose number comes with it. The taskbar answers in that block.
+struct AppBarData32 { DWORD cbSize; DWORD hWnd; UINT uCallbackMessage; UINT uEdge; RECT rc; INT64 lParam; };
+struct AppBarMessage { AppBarData32 abd; DWORD dwMessage; DWORD pad; UINT64 hSharedMemory; DWORD dwProcessId; DWORD pad2; };
+static_assert(sizeof(AppBarData32) == 40 && sizeof(AppBarMessage) == 64, "APPBARMSGDATAV3 layout");
+static_assert(offsetof(AppBarMessage, dwMessage) == 40 && offsetof(AppBarMessage, hSharedMemory) == 48 &&
+              offsetof(AppBarMessage, dwProcessId) == 56, "APPBARMSGDATAV3 layout");
+
+// The block is made for the process of the window SHAppBarMessage found: the host's, so the dock's. A program's is a
+// handle Explorer can take from the dock. But a block made for the process that makes it is no handle - Windows hands
+// out a block in that process's own memory (2026-11-22, 26H2) - and the dock's own messages (its always-shown strip)
+// find the host first, in the dock's process. Explorer, passed that, reads nothing: ABM_QUERYPOS answers nothing and
+// ABM_SETPOS takes no strip, while both say TRUE, so maximised windows went under the dock until it was registered
+// while Explorer's taskbar happened to be first. For the dock's own messages (OwnAppBar names the window while it
+// sends) the block is copied into one made for Explorer's process, the message passed on with that, and Explorer's
+// answer copied back. Everything else goes on as it came, as before: the host opens no block of another program's
+// (an elevated dock would read and write it with rights the program does not have).
+namespace { std::atomic<HWND> g_ownAppBar{ nullptr }; }
+OwnAppBar::OwnAppBar(HWND w) { g_ownAppBar = w; }
+OwnAppBar::~OwnAppBar() { g_ownAppBar = nullptr; }
+
+#ifndef LD_TRAY_EXPLORER_PROCESS
+#define LD_TRAY_EXPLORER_PROCESS(wnd) WindowProcess(wnd)
+static DWORD WindowProcess(HWND w) { DWORD pid = 0; GetWindowThreadProcessId(w, &pid); return pid; }
+#endif
+bool ForwardAppBar(WPARAM wp, LPARAM lp, LRESULT& result) {
+    const auto* cds = (const COPYDATASTRUCT*)lp;
+    AppBarMessage m{};
+    const HWND own = g_ownAppBar;
+    if (!own || (HWND)wp != own || !cds || cds->cbData != sizeof(m) || !cds->lpData) return Forward(WM_COPYDATA, wp, lp, result);
+    memcpy(&m, cds->lpData, sizeof(m));
+    HWND ex = ExplorerTray();
+    const DWORD exPid = ex ? LD_TRAY_EXPLORER_PROCESS(ex) : 0;
+    if (!m.hSharedMemory || m.abd.cbSize != sizeof(AppBarData32) || m.abd.hWnd != (DWORD)(ULONG_PTR)own ||
+        m.dwProcessId != GetCurrentProcessId() || !exPid)
+        return Forward(WM_COPYDATA, wp, lp, result);
+    void* block = SHLockShared((HANDLE)(ULONG_PTR)m.hSharedMemory, m.dwProcessId);
+    if (!block) return Forward(WM_COPYDATA, wp, lp, result);
+    HANDLE theirs = SHAllocShared(block, sizeof(AppBarData32), exPid);
+    if (!theirs) { SHUnlockShared(block); return Forward(WM_COPYDATA, wp, lp, result); }
+    AppBarMessage sent = m;
+    sent.hSharedMemory = (UINT64)(ULONG_PTR)theirs;
+    sent.dwProcessId = exPid;
+    COPYDATASTRUCT out{ cds->dwData, sizeof(sent), &sent };
+    const bool passed = Forward(WM_COPYDATA, wp, (LPARAM)&out, result);
+    // Taken back only from the Explorer it was made for, once it has answered. Not answered (busy past the 2 s): the
+    // message may still be waiting there and its block is left to it - closing it could close another of Explorer's
+    // handles that takes the number. (Only the dock's own strip, so seldom; CheckAppBar asks for the strip again.)
+    if (passed && ExplorerTray() == ex && LD_TRAY_EXPLORER_PROCESS(ex) == exPid) {
+        if (void* answer = SHLockShared(theirs, exPid)) {
+            memcpy(block, answer, sizeof(AppBarData32));
+            SHUnlockShared(answer);
+        }
+        SHFreeShared(theirs, exPid);
+    }
+    SHUnlockShared(block);
+    return passed;
 }
 
 namespace {
@@ -73,10 +132,10 @@ LRESULT CALLBACK HostProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COPYDATA:
         return OnCopyData(wp, lp);
     case WM_WINDOWPOSCHANGING:   // shown only by the dock, whoever else asks ("hide/show the taskbar" tools)
-        if (lp && !g_showing) ((WINDOWPOS*)lp)->flags &= ~SWP_SHOWWINDOW;
+        if (lp && !g_hostedWidget.showing) ((WINDOWPOS*)lp)->flags &= ~SWP_SHOWWINDOW;
         break;
     case WM_WINDOWPOSCHANGED:
-        if (lp && (((WINDOWPOS*)lp)->flags & SWP_SHOWWINDOW) && !g_showing)
+        if (lp && (((WINDOWPOS*)lp)->flags & SWP_SHOWWINDOW) && !g_hostedWidget.showing)
             SetWindowLongPtrW(h, GWL_STYLE, GetWindowLongPtrW(h, GWL_STYLE) & ~WS_VISIBLE);
         break;
     case WM_ERASEBKGND: {   // black, alpha 0: see-through (SeeThrough), under the hosted widget too
@@ -165,8 +224,9 @@ struct RegWatch {
     }
 };
 
-DWORD WINAPI HostThread(void*) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);   // known folders
+// The host's windows, made on the host thread (COM initialised for it). False when it cannot run: Start()
+// has been told (g_readyEvent) and COM left again, the thread only returns.
+bool SetUpWindows(HWND& ex) {
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = HostProc; wc.hInstance = inst; wc.lpszClassName = LD_TRAY_CLASS;
@@ -175,7 +235,7 @@ DWORD WINAPI HostThread(void*) {
     wn.lpfnWndProc = DefWindowProcW; wn.hInstance = inst; wn.lpszClassName = L"TrayNotifyWnd";
     RegisterClassExW(&wn);
     g_explorer = nullptr;
-    HWND ex = ExplorerTray();
+    ex = ExplorerTray();
     RECT r{};
     if (ex) GetWindowRect(ex, &r);
     // Not WS_CLIPCHILDREN: it paints itself see-through under its children too (a layered child is
@@ -186,7 +246,7 @@ DWORD WINAPI HostThread(void*) {
         Log(L"tray host: window failed %lu", GetLastError());
         SetEvent(g_readyEvent);
         CoUninitialize();
-        return 1;
+        return false;
     }
     SeeThrough(g_wnd);
     SetPropW(g_wnd, kTrayHostProp, (HANDLE)1);
@@ -206,17 +266,64 @@ DWORD WINAPI HostThread(void*) {
         g_wnd = nullptr;
         SetEvent(g_readyEvent);
         CoUninitialize();
-        return 1;
+        return false;
     }
     g_notifyWnd = CreateWindowExW(0, L"TrayNotifyWnd", nullptr, WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                                   0, 0, r.right - r.left, r.bottom - r.top, g_wnd, nullptr, inst, nullptr);
     // a hosted widget sits above the dock's glass: kept out of the dock's backdrop capture (and out of
     // screenshots, like the dock), else the glass would show a blurred copy of it
     SetWindowDisplayAffinity(g_wnd, WDA_EXCLUDEFROMCAPTURE);
+    return true;
+}
+
+// How many programs answered the re-registration, and which programs' icons have not come.
+void LogSummary() {
+    int icons = 0, shown = 0;
+    std::vector<std::wstring> programs;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        icons = (int)g_icons.size();
+        for (const auto& ic : g_icons) {
+            if (ShownOnDock(ic)) ++shown;
+            if (std::find(programs.begin(), programs.end(), ic.exe) == programs.end()) programs.push_back(ic.exe);
+        }
+    }
+    Log(L"tray host: %d icons from %d programs so far, %d shown on the dock", icons, (int)programs.size(), shown);
+    LogMissing(programs);
+}
+
+// The host thread ends (stopped, or WM_QUIT): its windows go, a hosted widget back to Explorer's taskbar.
+void TearDown(RegWatch& watch) {
+    g_ready = false;   // stopped, or ended on its own (WM_QUIT): not running any more, Start() makes a new one
+    bool resync = g_explorerMissed;
+    watch.Close();
+    // Another program's widget goes back to Explorer's taskbar rather than being destroyed with this
+    // window (it would recreate it, a second later) - nothing puts it back in place here after that.
+    StopRealign();
+    HWND back = ExplorerTray();
+    for (HWND c = GetWindow(g_wnd, GW_CHILD); c;) {
+        HWND next = GetWindow(c, GW_HWNDNEXT);
+        if (c != g_notifyWnd && back) SetParent(c, back);
+        c = next;
+    }
+    RemovePropW(g_wnd, kTrayHostProp);
+    if (g_notifyWnd) DestroyWindow(g_notifyWnd);
+    DestroyWindow(g_wnd);
+    g_wnd = g_notifyWnd = nullptr;
+    EndHosting();
+    // Explorer missed some icon messages: let every program register its icons with it again
+    if (resync) BroadcastTaskbarCreated();
+    Log(L"tray host: down%s", resync ? L" (icons re-registered with Explorer)" : L"");
+}
+
+DWORD WINAPI HostThread(void*) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);   // known folders
+    HWND ex = nullptr;
+    if (!SetUpWindows(ex)) return 1;
     KeepFirst();
     g_lastExplorer = ex;
     g_explorerMissed = false;
-    g_hostingApplied = false;
+    g_hostedWidget.hostingApplied = false;
     LoadEntries();
     RegWatch watch;
     watch.Arm();
@@ -241,8 +348,8 @@ DWORD WINAPI HostThread(void*) {
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             if (m.message == WM_QUIT) g_stop = true;
             if (!m.hwnd && m.message == kPlaceMsg) {   // from the dock
-                if (m.wParam == 1) { if (!g_announced) announce(); }
-                else { ApplyHosting(); ApplyPlacement(); if (g_hostingApplied) UpdateHosted(); }
+                if (m.wParam == kPlaceAnnounce) { if (!g_announced) announce(); }
+                else { ApplyHosting(); ApplyPlacement(); if (g_hostedWidget.hostingApplied) UpdateHosted(); }
                 continue;
             }
             TranslateMessage(&m);
@@ -264,7 +371,7 @@ DWORD WINAPI HostThread(void*) {
             nextCheck = now + 0.1;
             KeepFirst();
             ApplyHosting();
-            if (g_hostingApplied) {
+            if (g_hostedWidget.hostingApplied) {
                 ApplyPlacement();   // also undoes "hide the taskbar" tools
                 UpdateHosted();     // the hosted widget changes its region on its own (no message for that)
             } else MirrorRect();
@@ -284,48 +391,11 @@ DWORD WINAPI HostThread(void*) {
         if (now >= nextPrune) { nextPrune = now + 2; Prune(); }
         if (summaryAt > 0 && now >= summaryAt) {
             summaryAt = 0;
-            int icons = 0, shown = 0;
-            std::vector<std::wstring> programs;
-            {
-                std::lock_guard<std::mutex> lk(g_mu);
-                icons = (int)g_icons.size();
-                for (const auto& ic : g_icons) {
-                    if (ic.promoted && !ic.hidden && ic.w > 0) ++shown;
-                    if (std::find(programs.begin(), programs.end(), ic.exe) == programs.end()) programs.push_back(ic.exe);
-                }
-            }
-            Log(L"tray host: %d icons from %d programs so far, %d shown on the dock", icons, (int)programs.size(), shown);
-            LogMissing(programs);
+            LogSummary();
         }
     }
 
-    g_ready = false;   // stopped, or ended on its own (WM_QUIT): not running any more, Start() makes a new one
-    bool resync = g_explorerMissed;
-    watch.Close();
-    // Another program's widget goes back to Explorer's taskbar rather than being destroyed with this
-    // window (it would recreate it, a second later) - nothing puts it back in place here after that.
-    StopRealign();
-    HWND back = ExplorerTray();
-    for (HWND c = GetWindow(g_wnd, GW_CHILD); c;) {
-        HWND next = GetWindow(c, GW_HWNDNEXT);
-        if (c != g_notifyWnd && back) SetParent(c, back);
-        c = next;
-    }
-    RemovePropW(g_wnd, kTrayHostProp);
-    if (g_notifyWnd) DestroyWindow(g_notifyWnd);
-    DestroyWindow(g_wnd);
-    g_wnd = g_notifyWnd = nullptr;
-    g_hostingApplied = false;
-    g_regionShown = false;
-    if (g_appliedRgn) { DeleteObject(g_appliedRgn); g_appliedRgn = nullptr; }
-    ForgetWidget();
-    {
-        std::lock_guard<std::mutex> lk(g_hostedMu);
-        g_hostedBox = {}; g_hostedChild = nullptr; g_hostedFitted = false;
-    }
-    // Explorer missed some icon messages: let every program register its icons with it again
-    if (resync) BroadcastTaskbarCreated();
-    Log(L"tray host: down%s", resync ? L" (icons re-registered with Explorer)" : L"");
+    TearDown(watch);
     CoUninitialize();
     return 0;
 }
@@ -394,7 +464,7 @@ void Stop() {
 bool Running() { return g_thread && g_ready; }
 
 void Announce() {
-    if (g_thread && g_ready && !g_announced) PostThreadMessageW(g_threadId, kPlaceMsg, 1, 0);
+    if (g_thread && g_ready && !g_announced) PostThreadMessageW(g_threadId, kPlaceMsg, kPlaceAnnounce, 0);
 }
 
 HWND Window() { return g_thread && g_ready ? g_wnd : nullptr; }

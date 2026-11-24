@@ -1,8 +1,5 @@
 #include "dock.h"
 #include "system.h"
-#include "sensors.h"
-#include "oled.h"
-#include "theme.h"
 #include <d2d1effects.h>
 
 struct GlassStyle { float sigma, tint, sat, refr, bezel, chroma, highlight, bright; };
@@ -98,7 +95,7 @@ void Dock::Render() {
         if (clearedWhileHidden) return;
         float zero[4] = { 0, 0, 0, 0 };
         g_gfx.ctx->ClearRenderTargetView(rtv.Get(), zero);
-        if (recording) g_gfx.ctx->ClearRenderTargetView(dockFrame.rtv.Get(), zero);
+        if (rec.recording) g_gfx.ctx->ClearRenderTargetView(rec.dockFrame.rtv.Get(), zero);
         swap->Present(0, 0);
         clearedWhileHidden = true;
         return;
@@ -108,8 +105,33 @@ void Dock::Render() {
     float zero[4] = { 0, 0, 0, 0 };
     g_gfx.ctx->ClearRenderTargetView(rtv.Get(), zero);
 
+    DrawGlass(glassVisible);
+
+    auto* dc = g_gfx.dc.Get();
+    dc->SetTarget(target.Get());
+    dc->BeginDraw();
+    dc->SetTransform(D2D1::Matrix3x2F::Identity());
+    float vis = clampf(reveal.x * 1.4f, 0, 1);
+
+    DrawSlotIcons(dc, vis);
+    if (vis > 0.01f) DrawBarContents(dc, vis);
+    DrawOverlays(glassVisible);
+
+    HRESULT hr = dc->EndDraw();
+    dc->SetTarget(nullptr);
+    if (FAILED(hr)) Log(L"EndDraw %08x", hr);
+    if (snapshotPending) { snapshotPending = false; SaveSnapshot(); }
+    if (rec.recording) {
+        ComPtr<ID3D11Texture2D> bb; swap->GetBuffer(0, IID_PPV_ARGS(&bb));
+        g_gfx.ctx->CopyResource(rec.dockFrame.tex.Get(), bb.Get());
+    }
+    swap->Present(0, 0);
+}
+
+// the backdrop blurred, the bar's glass, the luminance probe for the ink, the panel's glass over it
+void Dock::DrawGlass(bool glassVisible) {
     const GlassStyle& gs = kStyles[std::clamp(g_settings.glassStyle, 0, 2)];
-    D2D1_RECT_F bar = RectUV(barU0, barU1, margin - hideOff, margin + barThick - hideOff);
+    D2D1_RECT_F bar = RectUV(barU0, barU1, BarV0(), BarV1());
     if (glassVisible && (capture.gotFirstFrame || glassKept)) {
         GlassCB c = {};
         c.misc[0] = (float)winW; c.misc[1] = (float)winH;
@@ -167,13 +189,10 @@ void Dock::Render() {
             g_gfx.FullscreenPass(rtv.Get(), winW, winH, g_gfx.psGlass.Get(), nullptr, halfA.srv.Get(), true);
         }
     }
+}
 
-    auto* dc = g_gfx.dc.Get();
-    dc->SetTarget(target.Get());
-    dc->BeginDraw();
-    dc->SetTransform(D2D1::Matrix3x2F::Identity());
-    float vis = clampf(reveal.x * 1.4f, 0, 1);
-
+// the apps' icons (a peeking one over the screen edge) and their running / attention dots
+void Dock::DrawSlotIcons(ID2D1DeviceContext2* dc, float vis) {
     for (size_t i = 0; i < slots.size(); ++i) {
         auto& s = slots[i];
         if (dragging && (int)i == pressSlot) continue;
@@ -201,75 +220,84 @@ void Dock::Render() {
             dc->FillEllipse(D2D1::Ellipse(p, rr, rr), brush.Get());
         }
     }
+}
 
-    if (vis > 0.01f) {
-        float v0 = margin - hideOff, v1 = margin + barThick - hideOff;
-        // separator
-        float su = sepU + gap * 0.5f;
-        auto sr = RectUV(su, su + 1, v0 + pad * 1.2f, v1 - pad * 1.2f);
-        auto sc = Ink(su, vis); sc.a *= 0.42f;
-        brush->SetColor(sc);
-        dc->FillRectangle(sr, brush.Get());
-        if (widgetWidth.x > 1) {   // after FluentFlyout's widget, fading in as its slot opens
-            float wu = widgetU1 + gap * 0.5f;
-            auto wc = Ink(wu, vis); wc.a *= 0.42f * clampf(widgetWidth.x / (gap * 2 + 1), 0, 1);
-            brush->SetColor(wc);
-            dc->FillRectangle(RectUV(wu, wu + 1, v0 + pad * 1.2f, v1 - pad * 1.2f), brush.Get());
-        }
-
-        // hover highlight
-        D2D1_RECT_F hr{}; float hu = 0;
-        if (hoverKind == HitButton) {
-            hr = ButtonRect(hoverButton);
-            float inset = (stackButtons ? 1.5f : 2.0f) * scale;
-            hr.left += inset; hr.right -= inset; hr.top += inset; hr.bottom -= inset;
-            hu = Cell_(hoverButton).Mid();
-        } else if (hoverKind == HitNotify && NotifyKey(hoverNotify)) {
-            hr = NotifyRect(hoverNotify);
-            float inset = (notifyCells[hoverNotify].half >= 0 ? 1.5f : 2.0f) * scale;
-            hr.left += inset; hr.right -= inset; hr.top += inset; hr.bottom -= inset;
-            hu = (notifyCells[hoverNotify].u0 + notifyCells[hoverNotify].u1) * 0.5f;
-        } else if (hoverKind == HitTray || hoverKind == HitClock || hoverKind == HitSensor || hoverKind == HitBattery) {
-            const Cell& c = cells[hoverKind];
-            hr = RectUV(c.u0 + 1, c.u1 - 1, v0 + pad * 0.6f, v1 - pad * 0.6f);
-            hu = c.Mid();
-        }
-        if (hr.right > hr.left) {
-            float ink = InkAt(hu);
-            brush->SetColor(D2D1::ColorF(1 - ink, 1 - ink, 1 - ink, lerpf(0.16f, 0.08f, ink) * vis));
-            dc->FillRoundedRectangle({ hr, 8 * scale, 8 * scale }, brush.Get());
-        }
-        DrawSensorCell(v0, v1, vis);
-        DrawBatteryCell(v0, v1, vis);
-
-        // "show hidden icons" chevron points away from the screen edge
-        const wchar_t* chevG = g_settings.edge == Edge::Bottom ? L"" : g_settings.edge == Edge::Top ? L""
-                             : g_settings.edge == Edge::Left ? L"" : L"";
-        const Cell& tray = cells[HitTray];
-        DrawShadowText(chevG, g_gfx.fmtGlyph.Get(), RectUV(tray.u0, tray.u1, v0, v1), tray.Mid(), vis * 0.85f);
-        DrawNotifyIcons(vis);
-        const Cell& clk = cells[HitClock];
-        if (!IsVertical(g_settings.edge)) {
-            auto r = RectUV(clk.u0, clk.u1, v0, v1);
-            float timeH = TextSize(ClockFont(), g_sys.timeText).height;
-            float dateH = TextSize(ClockFont(true), g_sys.dateText).height;
-            float top = (r.top + r.bottom - timeH - dateH) * 0.5f;
-            DrawShadowText(g_sys.timeText, ClockFont(), { r.left, top, r.right, top + timeH }, clk.Mid(), vis);
-            DrawShadowText(g_sys.dateText, ClockFont(true), { r.left, top + timeH, r.right, top + timeH + dateH }, clk.Mid(), vis);
-        } else {
-            DrawShadowText(g_sys.timeShort, ClockFont(), RectUV(clk.u0, clk.u1, v0, v1), clk.Mid(), vis);
-        }
-        // the small buttons: the same drawing as the settings preview (buttons.cpp)
-        const IconState st = CurrentIconState(NowSeconds());
-        for (int i = 0; i < kButtonCount; ++i) {
-            auto r = ButtonRect((ButtonId)i);
-            if (r.right <= r.left) continue;
-            float u = Cell_((ButtonId)i).Mid(), ink = InkAt(u);
-            DrawButtonIcon((ButtonId)i, dc, brush.Get(), g_gfx.fmtGlyph.Get(), r, scale, ButtonIconScale(), Ink(u, vis),
-                           ink < 0.95f ? 0.35f * vis * (1 - ink) : 0, st);
-        }
+// what sits on the bar (Render: while it shows): separators, the hover highlight, the cells, the tray icons,
+// the clock, the small buttons
+void Dock::DrawBarContents(ID2D1DeviceContext2* dc, float vis) {
+    float v0 = BarV0(), v1 = BarV1();
+    // separator
+    float su = sepU + gap * 0.5f;
+    auto sr = RectUV(su, su + 1, v0 + pad * 1.2f, v1 - pad * 1.2f);
+    auto sc = Ink(su, vis); sc.a *= 0.42f;
+    brush->SetColor(sc);
+    dc->FillRectangle(sr, brush.Get());
+    if (widgetWidth.x > 1) {   // after FluentFlyout's widget, fading in as its slot opens
+        float wu = widgetU1 + gap * 0.5f;
+        auto wc = Ink(wu, vis); wc.a *= 0.42f * clampf(widgetWidth.x / (gap * 2 + 1), 0, 1);
+        brush->SetColor(wc);
+        dc->FillRectangle(RectUV(wu, wu + 1, v0 + pad * 1.2f, v1 - pad * 1.2f), brush.Get());
     }
 
+    DrawHoverHighlight(dc, v0, v1, vis);
+    DrawSensorCell(v0, v1, vis);
+    DrawBatteryCell(v0, v1, vis);
+
+    // "show hidden icons" chevron points away from the screen edge
+    const wchar_t* chevG = g_settings.edge == Edge::Bottom ? L"" : g_settings.edge == Edge::Top ? L""
+                         : g_settings.edge == Edge::Left ? L"" : L"";
+    const Cell& tray = cells[HitTray];
+    DrawShadowText(chevG, g_gfx.fmtGlyph.Get(), RectUV(tray.u0, tray.u1, v0, v1), tray.Mid(), vis * 0.85f);
+    DrawNotifyIcons(vis);
+    const Cell& clk = cells[HitClock];
+    if (!IsVertical(g_settings.edge)) {
+        auto r = RectUV(clk.u0, clk.u1, v0, v1);
+        float timeH = TextSize(ClockFont(), ClockTime()).height;
+        float dateH = TextSize(ClockFont(true), g_sys.dateText).height;
+        float top = (r.top + r.bottom - timeH - dateH) * 0.5f;
+        DrawShadowText(ClockTime(), ClockFont(), { r.left, top, r.right, top + timeH }, clk.Mid(), vis);
+        DrawShadowText(g_sys.dateText, ClockFont(true), { r.left, top + timeH, r.right, top + timeH + dateH }, clk.Mid(), vis);
+    } else {
+        DrawShadowText(g_sys.timeShort, ClockFont(), RectUV(clk.u0, clk.u1, v0, v1), clk.Mid(), vis);
+    }
+    // the small buttons: the same drawing as the settings preview (buttons.cpp)
+    const IconState st = CurrentIconState(NowSeconds());
+    for (int i = 0; i < kButtonCount; ++i) {
+        auto r = ButtonRect((ButtonId)i);
+        if (r.right <= r.left) continue;
+        float u = Cell_((ButtonId)i).Mid(), ink = InkAt(u);
+        DrawButtonIcon((ButtonId)i, dc, brush.Get(), g_gfx.fmtGlyph.Get(), r, scale, ButtonIconScale(), Ink(u, vis),
+                       ink < 0.95f ? 0.35f * vis * (1 - ink) : 0, st);
+    }
+}
+
+void Dock::DrawHoverHighlight(ID2D1DeviceContext2* dc, float v0, float v1, float vis) {
+    // hover highlight
+    D2D1_RECT_F hr{}; float hu = 0;
+    if (hover.kind == HitButton) {
+        hr = ButtonRect(hover.button);
+        float inset = (stackButtons ? 1.5f : 2.0f) * scale;
+        hr.left += inset; hr.right -= inset; hr.top += inset; hr.bottom -= inset;
+        hu = Cell_(hover.button).Mid();
+    } else if (hover.kind == HitNotify && NotifyKey(hover.notify)) {
+        hr = NotifyRect(hover.notify);
+        float inset = (notifyCells[hover.notify].half >= 0 ? 1.5f : 2.0f) * scale;
+        hr.left += inset; hr.right -= inset; hr.top += inset; hr.bottom -= inset;
+        hu = notifyCells[hover.notify].Mid();
+    } else if (hover.kind == HitTray || hover.kind == HitClock || hover.kind == HitSensor || hover.kind == HitBattery) {
+        const Cell& c = cells[hover.kind];
+        hr = RectUV(c.u0 + 1, c.u1 - 1, v0 + pad * 0.6f, v1 - pad * 0.6f);
+        hu = c.Mid();
+    }
+    if (hr.right > hr.left) {
+        float ink = InkAt(hu);
+        brush->SetColor(D2D1::ColorF(1 - ink, 1 - ink, 1 - ink, lerpf(0.16f, 0.08f, ink) * vis));
+        dc->FillRoundedRectangle({ hr, 8 * scale, 8 * scale }, brush.Get());
+    }
+}
+
+// over everything: the dragged icon, the tooltip, the panel, the overheat peek
+void Dock::DrawOverlays(bool glassVisible) {
     // dragged icon follows the cursor
     if (dragging && pressSlot >= 0 && pressSlot < (int)slots.size()) {
         auto& s = slots[pressSlot];
@@ -280,16 +308,6 @@ void Dock::Render() {
     DrawTooltip(tooltipText, tooltipU, tooltipV);
     if (panelAlpha.x > 0.01f && glassVisible) DrawPanel();
     if (sbPeek.x > 0.001f) DrawSensorPeek();
-
-    HRESULT hr = dc->EndDraw();
-    dc->SetTarget(nullptr);
-    if (FAILED(hr)) Log(L"EndDraw %08x", hr);
-    if (snapshotPending) { snapshotPending = false; SaveSnapshot(); }
-    if (recording) {
-        ComPtr<ID3D11Texture2D> bb; swap->GetBuffer(0, IID_PPV_ARGS(&bb));
-        g_gfx.ctx->CopyResource(dockFrame.tex.Get(), bb.Get());
-    }
-    swap->Present(0, 0);
 }
 
 // Debug: write (dock frame composited over the captured backdrop) to %APPDATA%\LiquidDock\snap_N.png
@@ -349,14 +367,20 @@ void Dock::SaveSnapshot() {
 }
 
 void Dock::DrawShadowText(const std::wstring& t, IDWriteTextFormat* f, D2D1_RECT_F r, float u, float a) {
+    DrawShadowText(t, f, r, InkAt(u), a, Ink(u, a));
+}
+
+// Text in `color` over its shadow: black, one scale's pixel below, at 0.35 of `a` - less over a light backdrop (ink:
+// InkAt where it is), none over the lightest (ink 0.95 and up). `a` is the cell's alpha, not the text's own (the
+// sensor cell's labels are dimmer than their shadow).
+void Dock::DrawShadowText(const std::wstring& t, IDWriteTextFormat* f, D2D1_RECT_F r, float ink, float a, D2D1_COLOR_F color) {
     auto* dc = g_gfx.dc.Get();
-    float ink = InkAt(u);
     if (ink < 0.95f) {
         brush->SetColor(D2D1::ColorF(0, 0, 0, 0.35f * a * (1 - ink)));
         D2D1_RECT_F rs = { r.left, r.top + scale, r.right, r.bottom + scale };
         dc->DrawTextW(t.c_str(), (UINT32)t.size(), f, rs, brush.Get());
     }
-    brush->SetColor(Ink(u, a));
+    brush->SetColor(color);
     dc->DrawTextW(t.c_str(), (UINT32)t.size(), f, r, brush.Get());
 }
 

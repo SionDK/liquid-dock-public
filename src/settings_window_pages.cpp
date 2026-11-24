@@ -1,17 +1,37 @@
 #include "settings_window.h"
 #include "settings_window_internal.h"
-#include "dock.h"
+#include "main.h"   // g_mainWnd, WM_APP_*
 #include "theme.h"
 #include "oled.h"
-#include "buttons.h"
 #include "sensors.h"
 #include "admin_helper.h"
-#include "version.h"
-#include <dwmapi.h>
-#include <map>
-#include "system.h"
 
 namespace settingswindow {
+
+namespace {
+
+// A control from its own fields only; the rest keep Control's defaults (no options, lo 0, hi 1, step 1, ...).
+Control MakeSlider(const wchar_t* label, const wchar_t* hint, Apply apply, float lo, float hi, float step,
+                   std::function<float()> value, std::function<void(float)> set, std::function<std::wstring(float)> text) {
+    Control c{ Control::Slider, label, hint, apply };
+    c.lo = lo; c.hi = hi; c.step = step;
+    c.value = std::move(value); c.set = std::move(set); c.text = std::move(text);
+    return c;
+}
+
+Control MakeToggle(const wchar_t* label, const wchar_t* hint, Apply apply, std::function<bool()> on, std::function<void(bool)> toggle) {
+    Control c{ Control::Toggle, label, hint, apply };
+    c.on = std::move(on); c.toggle = std::move(toggle);
+    return c;
+}
+
+Control MakeButton(const wchar_t* label, const wchar_t* hint, std::function<void()> press) {
+    Control c{ Control::Button, label, hint };
+    c.press = std::move(press);
+    return c;
+}
+
+}   // namespace
 
 std::wstring Num(float v, int decimals, const wchar_t* unit) {
     wchar_t b[32]; swprintf_s(b, L"%.*f%s", decimals, v, unit);
@@ -24,78 +44,81 @@ void BuildPages() {
     Page shape{ L"모양", L"" };
     shape.controls = {
         { Control::Segmented, L"위치", nullptr, Apply::Rebuild, { L"아래", L"왼쪽", L"오른쪽", L"위" },
-          [] { const int order[] = { 0, 1, 2, 3 }; return order[(int)g_settings.edge]; },
+          [] { return (int)g_settings.edge; },
           [](int i) { g_settings.edge = (Edge)i; } },
         { Control::Group, L"독 크기와 위치 조정", L"아이콘 크기·간격, 독 두께, 가장자리와 거리, 가장자리 따라 위치" },
-        { Control::Slider, L"아이콘 크기", nullptr, Apply::OnRelease, {}, {}, {}, 32, 64, 2,
+        MakeSlider(L"아이콘 크기", nullptr, Apply::OnRelease, 32, 64, 2,
           [] { return g_settings.iconSize; }, [](float v) { g_settings.iconSize = v; },
-          [](float v) { return Num(v, 0, L""); } },
-        { Control::Slider, L"아이콘 간격", nullptr, Apply::Live, {}, {}, {}, 10, 60, 2,
+          [](float v) { return Num(v, 0, L""); }),
+        MakeSlider(L"아이콘 간격", nullptr, Apply::Live, 10, 60, 2,
           [] { constexpr int preset[] = { 22, 32, 44 }; return (float)(g_settings.iconGap > 0 ? g_settings.iconGap : preset[std::clamp(g_settings.iconSpacing, 0, 2)]); },
           [](float v) { g_settings.iconGap = (int)v; },
-          [](float v) { return Num(v, 0, L"%"); } },
-        { Control::Slider, L"독 두께", L"아이콘 크기는 그대로 두고 유리 두께만 바뀝니다", Apply::Live, {}, {}, {}, 75, 150, 5,
+          [](float v) { return Num(v, 0, L"%"); }),
+        MakeSlider(L"독 두께", L"아이콘 크기는 그대로 두고 유리 두께만 바뀝니다", Apply::Live, 75, 150, 5,
           [] { return (float)g_settings.dockThickness; }, [](float v) { g_settings.dockThickness = (int)v; },
-          [](float v) { return Num(v, 0, L"%"); } },
-        { Control::Slider, L"화면 가장자리와 거리", nullptr, Apply::Live, {}, {}, {}, 0, 40, 2,
+          [](float v) { return Num(v, 0, L"%"); }),
+        MakeSlider(L"화면 가장자리와 거리", nullptr, Apply::Live, 0, 40, 2,
           [] { return (float)g_settings.edgeGap; }, [](float v) { g_settings.edgeGap = (int)v; },
-          [](float v) { return v == 0 ? std::wstring(L"붙임") : Num(v, 0, L" px"); } },
-        { Control::Slider, L"가장자리 따라 위치", nullptr, Apply::Live, {}, {}, {}, -100, 100, 5,
+          [](float v) { return v == 0 ? std::wstring(L"붙임") : Num(v, 0, L" px"); }),
+        MakeSlider(L"가장자리 따라 위치", nullptr, Apply::Live, -100, 100, 5,
           [] { return (float)g_settings.edgeOffset; }, [](float v) { g_settings.edgeOffset = (int)v; },
           [](float v) {
               if (v == 0) return std::wstring(L"가운데");
               bool vert = IsVertical(g_settings.edge);
               return std::wstring(v < 0 ? (vert ? L"위로 " : L"왼쪽으로 ") : (vert ? L"아래로 " : L"오른쪽으로 ")) + Num(std::fabs(v), 0, L"%");
-          } },
+          }),
         { Control::Segmented, L"유리 질감", nullptr, Apply::Live, { L"맑게", L"보통", L"뿌옇게" },
           [] { return std::clamp(g_settings.glassStyle, 0, 2); }, [](int i) { g_settings.glassStyle = i; } },
         { Control::Segmented, L"시계 글자", nullptr, Apply::Live, { L"보통", L"크게" },
           [] { return std::clamp(g_settings.clockSize, 0, 1); }, [](int i) { g_settings.clockSize = i; } },
+        { Control::Segmented, L"센서 글자", L"독에 보이는 CPU·GPU 온도 글자 (PC 상태 창은 그대로)", Apply::Live, { L"보통", L"크게" },
+          [] { return std::clamp(g_settings.sensorSize, 0, 1); }, [](int i) { g_settings.sensorSize = i; } },
     };
     shape.controls[1].count = 5;   // the five sliders after it
     shape.reset = [] {
         Settings d; auto& s = g_settings;
         s.iconSize = d.iconSize; s.iconGap = d.iconGap; s.iconSpacing = d.iconSpacing; s.dockThickness = d.dockThickness;
-        s.edgeGap = d.edgeGap; s.edgeOffset = d.edgeOffset; s.glassStyle = d.glassStyle; s.clockSize = d.clockSize;
+        s.edgeGap = d.edgeGap; s.edgeOffset = d.edgeOffset; s.glassStyle = d.glassStyle; s.clockSize = d.clockSize; s.sensorSize = d.sensorSize;
     };
 
     Page behaviour{ L"동작", L"" };
     behaviour.controls = {
-        { Control::Toggle, L"자동 숨김", L"끄면 늘 보이고 창이 독을 가리지 않습니다 (OLED 모드 화면 제외)", Apply::Live, {}, {}, {}, 0, 1, 1, {}, {}, {},
-          [] { return g_settings.autoHide; }, [](bool v) { g_settings.autoHide = v; } },
-        { Control::Toggle, L"보조 모니터에서는 항상 표시", L"메인이 아닌 모니터의 독은 숨지 않습니다", Apply::Live, {}, {}, {}, 0, 1, 1, {}, {}, {},
-          [] { return g_settings.secondaryAlwaysShown; }, [](bool v) { g_settings.secondaryAlwaysShown = v; } },
-        { Control::Toggle, L"시작 메뉴와 함께 표시", L"Windows 키로 시작 메뉴, 검색, 빠른 설정, 알림을 열면 숨어 있던 독도 같이 나옵니다", Apply::Live, {}, {}, {}, 0, 1, 1, {}, {}, {},
-          [] { return g_settings.showWithStart; }, [](bool v) { g_settings.showWithStart = v; } },
+        MakeToggle(L"자동 숨김", L"끄면 늘 보이고 창이 독을 가리지 않습니다 (OLED 모드 화면 제외)", Apply::Live,
+          [] { return g_settings.autoHide; }, [](bool v) { g_settings.autoHide = v; }),
+        MakeToggle(L"보조 모니터에서는 항상 표시", L"메인이 아닌 모니터의 독은 숨지 않습니다", Apply::Live,
+          [] { return g_settings.secondaryAlwaysShown; }, [](bool v) { g_settings.secondaryAlwaysShown = v; }),
+        MakeToggle(L"시작 메뉴와 함께 표시", L"Windows 키로 시작 메뉴, 검색, 빠른 설정, 알림을 열면 숨어 있던 독도 같이 나옵니다", Apply::Live,
+          [] { return g_settings.showWithStart; }, [](bool v) { g_settings.showWithStart = v; }),
         { Control::Group, L"확대 효과와 속도 조정", L"확대 효과, 나타나는 속도, 숨는 속도" },
-        { Control::Slider, L"확대 효과", L"아이콘에 마우스를 올렸을 때 커지는 정도", Apply::OnRelease, {}, {}, {}, 1.0f, 2.1f, 0.1f,
+        MakeSlider(L"확대 효과", L"아이콘에 마우스를 올렸을 때 커지는 정도", Apply::OnRelease, 1.0f, 2.1f, 0.1f,
           [] { return g_settings.magnification; }, [](float v) { g_settings.magnification = v; },
-          [](float v) { return v < 1.05f ? std::wstring(L"끄기") : Num(v, 1, L"배"); } },
-        { Control::Slider, L"나타나는 속도", L"화면 가장자리에 마우스를 대고 독이 나올 때까지", Apply::None, {}, {}, {}, 0, 0.6f, 0.05f,
+          [](float v) { return v < 1.05f ? std::wstring(L"끄기") : Num(v, 1, L"배"); }),
+        MakeSlider(L"나타나는 속도", L"화면 가장자리에 마우스를 대고 독이 나올 때까지", Apply::None, 0, 0.6f, 0.05f,
           [] { return g_settings.showDelay; }, [](float v) { g_settings.showDelay = v; },
-          [](float v) { return v < 0.025f ? std::wstring(L"즉시") : Num(v, 2, L"초"); } },
-        { Control::Slider, L"숨는 속도", L"마우스가 독을 벗어나고 독이 들어갈 때까지", Apply::None, {}, {}, {}, 0.1f, 1.5f, 0.05f,
+          [](float v) { return v < 0.025f ? std::wstring(L"즉시") : Num(v, 2, L"초"); }),
+        MakeSlider(L"숨는 속도", L"마우스가 독을 벗어나고 독이 들어갈 때까지", Apply::None, 0.1f, 1.5f, 0.05f,
           [] { return g_settings.hideDelay; }, [](float v) { g_settings.hideDelay = v; },
-          [](float v) { return Num(v, 2, L"초"); } },
+          [](float v) { return Num(v, 2, L"초"); }),
+        MakeToggle(L"24시간제 시계", L"끄면 Windows의 시계 설정(12시간 또는 24시간)을 따릅니다", Apply::Live,
+          [] { return g_settings.clockFormat == 1; }, [](bool v) { g_settings.clockFormat = v ? 1 : 0; }),
     };
     behaviour.controls[3].count = 3;   // the three sliders after it
-    behaviour.reset = [] { Settings d; g_settings.autoHide = d.autoHide; g_settings.secondaryAlwaysShown = d.secondaryAlwaysShown; g_settings.showWithStart = d.showWithStart; g_settings.magnification = d.magnification; g_settings.showDelay = d.showDelay; g_settings.hideDelay = d.hideDelay; };
+    behaviour.reset = [] { Settings d; g_settings.autoHide = d.autoHide; g_settings.secondaryAlwaysShown = d.secondaryAlwaysShown; g_settings.showWithStart = d.showWithStart; g_settings.magnification = d.magnification; g_settings.showDelay = d.showDelay; g_settings.hideDelay = d.hideDelay; g_settings.clockFormat = d.clockFormat; };
 
     Page buttons{ L"버튼", L"" };
-    buttons.controls.clear();
     buttons.controls.push_back({ Control::Customizer, L"독에 표시할 버튼" });
-    buttons.controls.push_back({ Control::Toggle, L"트레이 아이콘 표시 (실험)", L"작업 표시줄 설정에서 켠 아이콘을 › 옆에 2줄로", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
-        [] { return g_settings.trayIcons; }, [](bool v) { g_settings.trayIcons = v; PostMessageW(g_mainWnd, WM_APP_TRAYHOST, 0, 0); } });
-    buttons.controls.push_back({ Control::Toggle, L"FluentFlyout 연동", L"실행 중이면 작업 표시줄 위젯을 시작 버튼 왼쪽에, 플라이아웃은 독 위에", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
-        [] { return g_settings.fluentFlyout; }, [](bool v) { g_settings.fluentFlyout = v; PostMessageW(g_mainWnd, WM_APP_TRAYHOST, 0, 0); } });
+    buttons.controls.push_back(MakeToggle(L"트레이 아이콘 표시 (실험)", L"작업 표시줄 설정에서 켠 아이콘을 › 옆에 2줄로", Apply::None,
+        [] { return g_settings.trayIcons; }, [](bool v) { g_settings.trayIcons = v; PostMessageW(g_mainWnd, WM_APP_TRAYHOST, 0, 0); }));
+    buttons.controls.push_back(MakeToggle(L"FluentFlyout 연동", L"실행 중이면 작업 표시줄 위젯을 시작 버튼 왼쪽에, 플라이아웃은 독 위에", Apply::None,
+        [] { return g_settings.fluentFlyout; }, [](bool v) { g_settings.fluentFlyout = v; PostMessageW(g_mainWnd, WM_APP_TRAYHOST, 0, 0); }));
     buttons.controls.push_back({ Control::Segmented, L"OLED 모드를 적용할 모니터", nullptr, Apply::None, { L"모든 모니터", L"설정을 연 모니터만" },
         [] { return g_settings.oledOneMonitor ? 1 : 0; }, [](int i) { g_settings.oledOneMonitor = i == 1; } });
-    buttons.controls.push_back({ Control::Toggle, L"OLED 모드 켜기", L"지금 바로 검은 배경으로 바꿉니다", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
+    buttons.controls.push_back(MakeToggle(L"OLED 모드 켜기", L"지금 바로 검은 배경으로 바꿉니다", Apply::None,
         [] { return oled::Active(); },
-        [](bool v) { if (v) oled::Enable(g_settings.oledOneMonitor ? g_monitor : nullptr); else oled::Disable(); } });
+        [](bool v) { if (v) oled::Enable(g_settings.oledOneMonitor ? g_monitor : nullptr); else oled::Disable(); }));
     buttons.controls.back().hasDefault = false;   // an action, not a stored setting
-    buttons.controls.push_back({ Control::Toggle, L"Windows 다크 모드", nullptr, Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
-        [] { return !theme::IsLight(); }, [](bool v) { if (v == theme::IsLight()) theme::Toggle(); } });
+    buttons.controls.push_back(MakeToggle(L"Windows 다크 모드", nullptr, Apply::None,
+        [] { return !theme::IsLight(); }, [](bool v) { if (v == theme::IsLight()) theme::Toggle(); }));
     buttons.controls.back().hasDefault = false;
     buttons.reset = [] {
         Settings d; g_settings.trayButtons = d.trayButtons; g_settings.oledOneMonitor = d.oledOneMonitor;
@@ -107,30 +130,31 @@ void BuildPages() {
 
     Page system{ L"시스템", L"" };
     system.controls = {
-        { Control::Toggle, L"Windows 시작 시 자동 실행", nullptr, Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
+        MakeToggle(L"Windows 시작 시 자동 실행", nullptr, Apply::None,
           [] { return g_settings.autostart; },
-          [](bool v) { g_settings.autostart = v; PostMessageW(g_mainWnd, WM_APP_AUTOSTART, 0, 0); } },
+          [](bool v) { g_settings.autostart = v; PostMessageW(g_mainWnd, WM_APP_AUTOSTART, 0, 0); }),
         { Control::Segmented, L"독 열기 단축키", L"다른 프로그램이 이미 쓰는 조합이면 동작하지 않습니다", Apply::None,
           { L"끄기", L"Ctrl+Alt+D", L"Ctrl+Shift+Space", L"Win+Shift+D" },
           [] { return std::clamp(g_settings.revealHotkey, 0, 3); },
           [](int i) { g_settings.revealHotkey = i; PostMessageW(g_mainWnd, WM_APP_HOTKEY, 0, 0); } },
-        { Control::Toggle, L"시작 버튼 우클릭 메뉴", L"작업 관리자, 실행, 잠금·절전·다시 시작·종료", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
-          [] { return g_settings.startMenuExtras; }, [](bool v) { g_settings.startMenuExtras = v; } },
-        { Control::Toggle, L"Shift+클릭으로 관리자 권한 실행", L"독의 앱 아이콘을 Shift를 누른 채 클릭 (스토어 앱 제외)", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
-          [] { return g_settings.shiftRunsAsAdmin; }, [](bool v) { g_settings.shiftRunsAsAdmin = v; } },
-        { Control::Toggle, L"관리자 권한 앱 창 제어", L"OBS 등의 창 · 설치·업데이트할 때마다 Windows 확인 한 번", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {},
+        MakeToggle(L"시작 버튼 우클릭 메뉴", L"작업 관리자, 실행, 잠금·절전·다시 시작·종료", Apply::None,
+          [] { return g_settings.startMenuExtras; }, [](bool v) { g_settings.startMenuExtras = v; }),
+        MakeToggle(L"Shift+클릭으로 관리자 권한 실행", L"독의 앱 아이콘을 Shift를 누른 채 클릭 (스토어 앱 제외)", Apply::None,
+          [] { return g_settings.shiftRunsAsAdmin; }, [](bool v) { g_settings.shiftRunsAsAdmin = v; }),
+        MakeToggle(L"관리자 권한 앱 창 제어", L"OBS 등의 창 · 설치·업데이트할 때마다 Windows 확인 한 번", Apply::None,
           [] { return g_settings.adminWindows == 1; },
-          [](bool v) { if (!v) g_settings.adminWindows = 2; else adminhelper::Enable(g_wnd); } },
-        { Control::Button, L"Liquid Dock 종료", L"Windows 기본 작업표시줄로 돌아갑니다", Apply::None, {}, {}, {}, 0, 1, 1, {}, {}, {}, {}, {},
-          [] { PostMessageW(g_mainWnd, WM_CLOSE, 0, 0); } },
+          [](bool v) { if (!v) g_settings.adminWindows = 2; else adminhelper::Enable(g_wnd); }),
+        MakeButton(L"Liquid Dock 종료", L"Windows 기본 작업표시줄로 돌아갑니다",
+          [] { PostMessageW(g_mainWnd, WM_CLOSE, 0, 0); }),
     };
 
     // The sensors (sensorlogic::ShowItems): where temperatures come from, and what the "PC 상태" panel and the
-    // dock's cell show. Every change rebuilds the docks: a horizontal dock's thickness follows the panel's rows.
+    // dock's cell show. Every change rebuilds the docks: a horizontal dock's thickness follows the panel's rows (but
+    // the power draw's, which changes no row: laid out again in place).
     Page sensors{ L"센서", L"\xE9D9" };   // Diagnostic
     auto show = [](const wchar_t* label, const wchar_t* hint, bool Settings::* member) {
-        return Control{ Control::Toggle, label, hint, Apply::Rebuild, {}, {}, {}, 0, 1, 1, {}, {}, {},
-                        [member] { return g_settings.*member; }, [member](bool v) { g_settings.*member = v; } };
+        return MakeToggle(label, hint, Apply::Rebuild,
+                          [member] { return g_settings.*member; }, [member](bool v) { g_settings.*member = v; });
     };
     sensors.controls = {
         { Control::Segmented, L"온도 읽기", L"온도를 어디서 읽을지 정합니다 (모든 온도 항목에 함께 적용)", Apply::Rebuild,
@@ -145,13 +169,24 @@ void BuildPages() {
         show(L"VRAM 온도", L"VRAM 줄 아래의 온도 줄", &Settings::showVramTemp),
         show(L"RAM 슬롯 온도", L"메모리 모듈마다의 온도 줄 (HWiNFO에서만)", &Settings::showRamTemp),
         show(L"SSD", L"드라이브 줄 (이름과 온도)", &Settings::showSsd),
+        // the power draw (mod.40, sensorlogic::ShowItems::powerView): the panel's height stays, so the docks are laid
+        // out again in place, not rebuilt; the two switches under it only while it is not 없음
+        { Control::Segmented, L"전력 소비량", L"PC 상태의 CPU·GPU 전력 (그래프: 카드에 지난 60초, 요약: 아래쪽에 지금 값)", Apply::Live,
+          { L"없음", L"그래프", L"요약" },
+          [] { return std::clamp(g_settings.powerView, 0, 2); }, [](int i) { g_settings.powerView = i; } },
+        MakeToggle(L"CPU 전력", L"HWiNFO Gadget의 CPU 패키지 전력 ('온도 읽기'가 HWiNFO일 때)", Apply::Live,
+          [] { return g_settings.showCpuPower; }, [](bool v) { g_settings.showCpuPower = v; }),
+        MakeToggle(L"GPU 전력", L"NVIDIA GPU의 전력 (NVML)", Apply::Live,
+          [] { return g_settings.showGpuPower; }, [](bool v) { g_settings.showGpuPower = v; }),
     };
     sensors.controls[1].count = 6;   // the six switches after it
+    for (int i : { 9, 10 }) sensors.controls[i].shown = [] { return g_settings.powerView != sensorlogic::kPowerOff; };
     sensors.reset = [] {
         Settings d; auto& s = g_settings;
         s.sensorSource = d.sensorSource;
         s.showCpuTemp = d.showCpuTemp; s.showGpu = d.showGpu; s.showVram = d.showVram;
         s.showVramTemp = d.showVramTemp; s.showRamTemp = d.showRamTemp; s.showSsd = d.showSsd;
+        s.powerView = d.powerView; s.showCpuPower = d.showCpuPower; s.showGpuPower = d.showGpuPower;
     };
     g_pages = { shape, behaviour, buttons, system, sensors };
 

@@ -2,22 +2,26 @@
 #include "taskbar_apps_logic.h"
 #include "explorer_taskbar.h"
 #include <uiautomation.h>
+#include "explorer_uia.h"
 #include <shlobj.h>
 #include <algorithm>
 #include <mutex>
 #include <thread>
 
-// What taskbar_apps.h says. The calls into Explorer follow the ones taskbar_start.cpp makes for the Start button
-// (the same per-call timeouts, the same reading of a failed call), kept apart so the Start button's tested code
-// stays as it is. The press differs on purpose: an app button is pressed by Invoke or Toggle only (ReadWays),
-// where the Start button also falls back to the accessibility default action.
+// What taskbar_apps.h says. The calls into Explorer follow the ones taskbar_start.cpp makes for the Start button:
+// the per-call timeouts and the reading of a failed call are the same - explorer_uia.h's, shared with it and with
+// native_tray.cpp. The rest (UI Automation's object, the lookups, how a failure is classified) is kept apart, so
+// the Start button's tested code stays as it is. The press differs on purpose: an app button is pressed by Invoke
+// or Toggle only (ReadWays), where the Start button also falls back to the accessibility default action.
 
 namespace taskbarapps {
 namespace {
 
-constexpr DWORD kUiaTimeoutMs = 500;      // per call into a busy Explorer (connection, transaction)
+using exploreruia::kUiaTimeoutMs;         // per call into a busy Explorer (explorer_uia.h)
+using exploreruia::Gone;                  // what a failed call means (explorer_uia.h)
+using exploreruia::MayHaveRun;
+
 constexpr double kLookupBudget = 1.5;     // a lookup tries no further root once this long has gone (a hung Explorer)
-constexpr HRESULT kUiaTimeout = static_cast<HRESULT>(0x80131505);   // UIA_E_TIMEOUT (not in every SDK's headers)
 
 struct State {
     std::mutex calls;               // calls into UI Automation, one at a time; uia
@@ -51,17 +55,6 @@ IUIAutomation* Uia() {
         }
     }
     return s.uia.Get();
-}
-
-// The element was surely not reached: it is gone (Explorer rebuilt its taskbar, or restarted).
-bool Gone(HRESULT hr) {
-    return hr == static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE) || hr == RPC_E_DISCONNECTED || hr == RPC_E_SERVER_DIED_DNE ||
-           hr == CO_E_OBJNOTCONNECTED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) || hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED_DNE);
-}
-// The call failed, and may have run all the same (the call timed out, or Explorer went away during it).
-bool MayHaveRun(HRESULT hr) {
-    return hr == kUiaTimeout || hr == RPC_E_TIMEOUT || hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT) || hr == RPC_E_SERVER_DIED ||
-           hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED);
 }
 
 // A press that may have run is Unsure, whether Explorer went away during it or not: no taskbar is kept here to

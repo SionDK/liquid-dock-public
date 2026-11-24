@@ -1,15 +1,9 @@
 #include "oled.h"
-#include "oled_internal.h"
-#include <shobjidl.h>
+#include "oled_internal.h"   // also <shobjidl.h> (IDesktopWallpaper); ComPtr: common.h
 #include <shlobj.h>
 #include <exdisp.h>
 #include <shlguid.h>
-#include <dwmapi.h>
-#include <wrl/client.h>
 #include <fstream>
-#include <map>
-
-using Microsoft::WRL::ComPtr;
 
 namespace oled {
 namespace {
@@ -79,7 +73,7 @@ HRESULT g_wallpaperLast = S_OK;   // how the last ask for the wallpaper API went
 
 // Explorer's wallpaper API; none while Explorer is not running. retry: the covers' 2 s retry, which asks
 // again and again while Explorer is away - a line when that starts, not on every try.
-ComPtr<IDesktopWallpaper> Wallpaper(bool retry = false) {
+ComPtr<IDesktopWallpaper> Wallpaper(bool retry) {
     ComPtr<IDesktopWallpaper> w;
     HRESULT hr = CoCreateInstance(__uuidof(DesktopWallpaper), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&w));
     if (FAILED(hr) && (!retry || hr != g_wallpaperLast)) Log(L"oled: wallpaper api unavailable %08x", hr);
@@ -236,8 +230,7 @@ bool Disable() {
     }
     DeleteFileW(StatePath().c_str());
     SetCached(false);
-    DestroyCovers();
-    g_coversDirty = true;
+    DestroyCovers();   // and built again once the mode is back on
     Log(L"oled: off");
     return true;
 }

@@ -129,6 +129,34 @@ int wmain() {
         Settings some; some.Load();
         Check(!some.showGpu && !some.showSsd && some.showCpuTemp && some.showVram && some.sensorSource == 1, "only the keys in the file change");
     }
+    // the power draw (전력 소비량): 0 없음 by default, 1 그래프, 2 요약, and its two switches (on by default)
+    {
+        const Settings d;
+        Check(d.powerView == 0 && d.showCpuPower && d.showGpuPower, "a fresh install: 전력 소비량 없음, CPU and GPU 전력 on underneath");
+        write(legacy);
+        Settings old; old.Load();
+        Check(old.powerView == 0 && old.showCpuPower && old.showGpuPower && legacyUnchanged(old), "older files (before mod.40): 없음, both switches on");
+        for (int view = 0; view < 3; ++view) for (int cpu = 0; cpu < 2; ++cpu) for (int gpu = 0; gpu < 2; ++gpu) {
+            Settings p; p.Load();
+            p.powerView = view; p.showCpuPower = cpu != 0; p.showGpuPower = gpu != 0; p.Save();
+            Settings back; back.Load();
+            Check(back.powerView == view && back.showCpuPower == (cpu != 0) && back.showGpuPower == (gpu != 0) && legacyUnchanged(back),
+                  "every 전력 소비량 choice and switch survives save and load (legacy preferences kept)");
+        }
+        { std::ifstream in(path); std::string all((std::istreambuf_iterator<char>(in)), {});
+          Check(all.find("powerView=2\n") != std::string::npos && all.find("showCpuPower=1\n") != std::string::npos &&
+                all.find("showGpuPower=1\n") != std::string::npos, "saved as powerView=, showCpuPower=, showGpuPower= lines"); }
+        write("powerView=9\n");
+        Settings high; high.Load();
+        write("powerView=-1\n");
+        Settings low; low.Load();
+        write("powerView=graph\nshowCpuPower=x\n");
+        Settings bad; bad.Load();
+        Check(high.powerView == 2 && low.powerView == 0 && bad.powerView == 0 && bad.showCpuPower, "powerView is bounded to 0..2, a malformed value keeps the default");
+        write("powerView=1\nshowGpuPower=0\n");
+        Settings some; some.Load();
+        Check(some.powerView == 1 && some.showCpuPower && !some.showGpuPower && some.sensorSource == 1 && some.showGpu, "only the power keys in the file change");
+    }
     printf("RESULT settings checks=%d failures=%d\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -35,12 +35,9 @@ bool Close(HWND, const std::wstring&) { return false; }
 bool ActivateOver(HWND, const std::wstring&) { return false; }
 }
 bool IsShellPopupWindow(HWND) { return false; }   // the shell's pop-ups: not looked for (no key is sent)
+int LauncherVisible() { return -1; }              // ...nor Start
 bool SendKeyCombo(std::initializer_list<WORD>) { return false; }
-namespace taskbarapps {
-bool Begin(const Job&) { return false; }
-bool Take(uint32_t, Result&) { return false; }
-const wchar_t* OutcomeText(Outcome) { return L""; }
-}
+#include "stub_taskbar_apps.h"
 #include "../src/apps.cpp"
 #include "../src/apps_pins.cpp"
 #include "../src/apps_click.cpp"

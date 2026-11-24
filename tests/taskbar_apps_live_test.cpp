@@ -8,7 +8,7 @@
 //      the accessibility default action, measured to do nothing) is told apart: nothing is pressed, the window is
 //      left as it was, the dock goes its own way.
 // No other program's window is pressed, moved or activated. Like the dock, the test takes the right to change
-// the front window with a key no program acts on (0xE8; system.cpp, TakeForegroundRight) and hands it on to
+// the front window with a key no program acts on (0xE8; shell_front.cpp, TakeForegroundRight) and hands it on to
 // Explorer before a press (and says whether it could). tests\run_taskbar_apps_live.bat builds and runs it: keep
 // its window in front. Arguments: "front" (whatever is in front now: the console it was started from) or the
 // process id of the window the caller saw in front.
@@ -34,12 +34,8 @@ namespace {
 int checks = 0, failures = 0;
 void Check(bool ok, const char* what) { ++checks; if (!ok) ++failures; printf("%s: %s\n", ok ? "PASS" : "FAIL", what); fflush(stdout); }
 
-std::string U8(const std::wstring& w) {
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
-    return s;
-}
+#define TEST_SUPPORT_U8
+#include "test_support.h"
 std::wstring Lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
 
 void Pump(int ms) {
@@ -51,7 +47,7 @@ void Pump(int ms) {
     } while (GetTickCount64() < end);
 }
 
-// as system.cpp's TakeForegroundRight, then Explorer gets the right (as AppModel::StartPress does, Explorer last)
+// as shell_front.cpp's TakeForegroundRight, then Explorer gets the right (as AppModel::StartPress does, Explorer last)
 void LetExplorerToFront() {
     const DWORD me = GetCurrentProcessId();
     const BOOL had = AllowSetForegroundWindow(me);

@@ -21,7 +21,6 @@ namespace trayhost {
     void Stop();           // UI thread; idempotent
     bool Running();
     int Version();         // bumps whenever a shown icon, its picture or its tooltip changes
-    bool ProcessElevated();   // whether the dock runs as administrator
 
     struct IconView {
         uint64_t key = 0;            // stable while the icon exists
@@ -57,4 +56,15 @@ namespace trayhost {
     };
     Hosted HostedState();
     HWND Window();         // the host window while it runs
+
+    // ---- the dock's own app bar (its always-shown strip). Its SHAppBarMessage finds the host first, in this process,
+    // and Windows then hands the host a block Explorer cannot read (tray_host.cpp, ForwardAppBar). Around its
+    // ABM_QUERYPOS and ABM_SETPOS the dock names its window here (UI thread), and the host makes that block readable
+    // for Explorer - for those messages alone: other programs' messages go on to Explorer as they came.
+    struct OwnAppBar {
+        explicit OwnAppBar(HWND w);
+        ~OwnAppBar();
+        OwnAppBar(const OwnAppBar&) = delete;
+        OwnAppBar& operator=(const OwnAppBar&) = delete;
+    };
 }

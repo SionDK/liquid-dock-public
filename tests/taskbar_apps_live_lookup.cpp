@@ -30,12 +30,8 @@ namespace {
 int checks = 0, failures = 0;
 void Check(bool ok, const char* what) { ++checks; if (!ok) ++failures; printf("%s: %s\n", ok ? "PASS" : "FAIL", what); fflush(stdout); }
 
-std::string U8(const std::wstring& w) {
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
-    return s;
-}
+#define TEST_SUPPORT_U8
+#include "test_support.h"
 
 // ---- the running apps' windows, as the dock tells them apart (apps.cpp Refresh, in short)
 std::wstring ExeOf(DWORD pid) {

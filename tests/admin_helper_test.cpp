@@ -26,14 +26,8 @@ std::wstring SelfPath() {
     return std::wstring(p, n);
 }
 
-template <class F> bool WaitFor(F&& ok, DWORD ms = 3000) {
-    ULONGLONG until = GetTickCount64() + ms;
-    while (!ok()) {
-        if (GetTickCount64() > until) return false;
-        Sleep(20);
-    }
-    return true;
-}
+#define TEST_SUPPORT_WAIT_TICKS
+#include "test_support.h"
 
 // An "app": its windows on their own thread with a message loop, as a real program has.
 struct App {

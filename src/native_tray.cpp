@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <shldisp.h>
 #include <uiautomation.h>
+#include "explorer_uia.h"
 
 // The native taskbar stays "shown" (just invisible, see NativeTaskbar), so Explorer's own tray
 // windows open normally when their buttons are pressed.
@@ -37,7 +38,7 @@ bool ToggleDesktop() {
 // found from the island is (taskbar_start.cpp). The hidden-icons button keeps its own way: the
 // taskbar expanded for a moment, the button looked for from its window (OpenOverflowWin11).
 enum Button { Chevron, Network, Clock, ButtonCount };
-static const wchar_t* kButtonClass[ButtonCount] = { L"SystemTray.NormalButton",    // first one: hidden icons
+static const wchar_t* kButtonClass[ButtonCount] = { traybuttons::kNormal,          // hidden icons: not read (FindButton asks FindChevron)
                                                     L"SystemTray.AccentButton",    // network / quick settings
                                                     L"SystemTray.OmniButton" };    // clock / calendar
 static ComPtr<IUIAutomation> g_uia;
@@ -138,9 +139,15 @@ static ComPtr<IUIAutomationElement> FindButton(HWND tray, Button b, double until
     return nullptr;
 }
 
-static bool ClassicTray(HWND tray) {   // classic (Windows 10 style) taskbar, no XAML buttons: it has the classic hidden-icons button
+// The classic (Windows 10 style) taskbar's hidden-icons button, nullptr on the XAML taskbar.
+constexpr int kClassicChevronId = 1502;
+static HWND ClassicChevron(HWND tray) {
     HWND notify = FindWindowExW(tray, nullptr, L"TrayNotifyWnd", nullptr);
-    return notify && GetDlgItem(notify, 1502);
+    return notify ? GetDlgItem(notify, kClassicChevronId) : nullptr;
+}
+
+static bool ClassicTray(HWND tray) {   // classic (Windows 10 style) taskbar, no XAML buttons: it has the classic hidden-icons button
+    return ClassicChevron(tray) != nullptr;
 }
 
 // The buttons from `first` to `last` that are not cached yet, looked up now: the first always, the
@@ -160,7 +167,7 @@ static void CacheButtons(HWND tray, Button first, Button last, double until = No
             FAILED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_uia)))) { g_uia.Reset(); return; }
         // a busy explorer must not freeze the dock: give up quickly
         ComPtr<IUIAutomation2> u2;
-        if (SUCCEEDED(g_uia.As(&u2))) { u2->put_ConnectionTimeout(500); u2->put_TransactionTimeout(500); }
+        if (SUCCEEDED(g_uia.As(&u2))) { u2->put_ConnectionTimeout(exploreruia::kUiaTimeoutMs); u2->put_TransactionTimeout(exploreruia::kUiaTimeoutMs); }
     }
     for (int i = first; i <= last && (i == first || NowSeconds() < until); ++i)
         if (!g_button[i] && (g_button[i] = FindButton(tray, (Button)i, until))) Log(L"tray button %d cached (found %ls)", i, g_buttonFrom[i]);
@@ -259,13 +266,29 @@ static HWND WaitShown(const wchar_t* cls, DWORD ms) {
     }
 }
 
+// Where the hidden-icons window (window: where Windows showed it) goes: 12 px off the dock's bar on the screen's
+// side, centred on the anchor along the bar, and 4 px inside the anchor's monitor. Pixels as they are: the gap and
+// the margin are not scaled with the monitor's DPI.
+static POINT OverflowPlacement(POINT anchor, Edge edge, RECT bar, RECT window, RECT monitor) {
+    int w = window.right - window.left, h = window.bottom - window.top, gap = 12;
+    int x = anchor.x - w / 2, y = anchor.y - h / 2;
+    switch (edge) {
+    case Edge::Bottom: y = bar.top - h - gap; break;
+    case Edge::Top:    y = bar.bottom + gap; break;
+    case Edge::Left:   x = bar.right + gap; break;
+    case Edge::Right:  x = bar.left - w - gap; break;
+    }
+    x = std::clamp<int>(x, monitor.left + 4, std::max(monitor.left + 4, monitor.right - w - 4));
+    y = std::clamp<int>(y, monitor.top + 4, std::max(monitor.top + 4, monitor.bottom - h - 4));
+    return { x, y };
+}
+
 bool OpenOverflow(POINT anchor, Edge edge, RECT bar, OverflowFailure* why) {
     OverflowFailure failure = OverflowFailure::NotOpened;
     bool ok = g_taskbar.WithInvisibleTaskbars([&]() -> bool {
     HWND tray = ExplorerTaskbar();
     if (!tray) return false;
-    HWND notify = FindWindowExW(tray, nullptr, L"TrayNotifyWnd", nullptr);
-    HWND chevron = notify ? GetDlgItem(notify, 1502) : nullptr;   // classic (Windows 10 style) taskbar
+    HWND chevron = ClassicChevron(tray);   // classic (Windows 10 style) taskbar
     const wchar_t* popupClass = chevron ? L"NotifyIconOverflowWindow" : L"TopLevelWindowForOverflowXamlIsland";
     HWND previous = FindWindowW(popupClass, nullptr);
     bool wasOpen = previous && IsWindowVisible(previous);
@@ -287,19 +310,10 @@ bool OpenOverflow(POINT anchor, Edge edge, RECT bar, OverflowFailure* why) {
     }
     if (!ov) return false;
     RECT wr{}; if (!GetWindowRect(ov, &wr)) return false;
-    int w = wr.right - wr.left, h = wr.bottom - wr.top, gap = 12;
-    int x = anchor.x - w / 2, y = anchor.y - h / 2;
-    switch (edge) {
-    case Edge::Bottom: y = bar.top - h - gap; break;
-    case Edge::Top:    y = bar.bottom + gap; break;
-    case Edge::Left:   x = bar.right + gap; break;
-    case Edge::Right:  x = bar.left - w - gap; break;
-    }
     HMONITOR mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
-    x = std::clamp<int>(x, mi.rcMonitor.left + 4, std::max(mi.rcMonitor.left + 4, mi.rcMonitor.right - w - 4));
-    y = std::clamp<int>(y, mi.rcMonitor.top + 4, std::max(mi.rcMonitor.top + 4, mi.rcMonitor.bottom - h - 4));
-    if (!SetWindowPos(ov, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE))   // shown: placing it is a nicety
+    const POINT at = OverflowPlacement(anchor, edge, bar, wr, mi.rcMonitor);
+    if (!SetWindowPos(ov, HWND_TOPMOST, at.x, at.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE))   // shown: placing it is a nicety
         Log(L"overflow: shown where Windows put it (not moved next to the dock: %lu)", GetLastError());
     failure = OverflowFailure::None;
     return true;
@@ -314,18 +328,10 @@ bool OpenOverflow(POINT anchor, Edge edge, RECT bar, OverflowFailure* why) {
 // pressed. Both ways toggle, so a click never gets both: a press that may still arrive would open the
 // flyout and the keys shut it.
 
-constexpr HRESULT kUiaTimeout = static_cast<HRESULT>(0x80131505);   // UIA_E_TIMEOUT (not in every SDK's headers)
-// What a failed call means, told as taskbar_start.cpp tells it for the Start button.
-// The element was surely not reached: it is gone (Explorer rebuilt its taskbar, or restarted). Look again.
-static bool Gone(HRESULT hr) {
-    return hr == static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE) || hr == RPC_E_DISCONNECTED || hr == RPC_E_SERVER_DIED_DNE ||
-           hr == CO_E_OBJNOTCONNECTED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) || hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED_DNE);
-}
-// The call failed, and may have run all the same (the call timed out, or Explorer went away during it).
-static bool MayHaveRun(HRESULT hr) {
-    return hr == kUiaTimeout || hr == RPC_E_TIMEOUT || hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT) || hr == RPC_E_SERVER_DIED ||
-           hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED);
-}
+// What a failed call means, told as for the Start button and the app buttons (explorer_uia.h).
+using exploreruia::kUiaTimeout;
+using exploreruia::Gone;
+using exploreruia::MayHaveRun;
 // How a press went. pressCall: the press itself (Invoke) was called - only its failure may have reached
 // Explorer. Gone: surely not pressed, and the element is no more (worth one more lookup when it was a kept
 // one). Unsure: the press may still arrive - nothing may follow it; UnsureGone: and Explorer went away.

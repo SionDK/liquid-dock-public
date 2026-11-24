@@ -4,12 +4,14 @@
 #include "taskbar_start.h"
 #include "taskbar_visibility.h"
 #include "explorer_taskbar.h"
+#include "main.h"   // g_mainWnd
 
 NativeTaskbar g_taskbar;
 
 // ---------------------------------------------------------------- native taskbar
 
-static void ForEachTaskbar(const std::function<void(HWND)>& fn) {
+template <class Fn>
+static void ForEachTaskbar(const Fn& fn) {
     if (HWND h = ExplorerTaskbar()) fn(h);
     HWND s = nullptr;
     while ((s = FindWindowExW(nullptr, s, L"Shell_SecondaryTrayWnd", nullptr)) != nullptr) fn(s);
@@ -44,9 +46,6 @@ static void Vanish(HWND h, bool onUiThread) {
     }
 }
 
-extern HWND g_mainWnd;
-constexpr UINT WM_APP_ENFORCE = WM_APP + 30;   // handled by the main window: Enforce() on the UI thread
-
 void NativeTaskbar::StartEnforcer() {
     const bool runs = TryDetach([this] {
         double start = NowSeconds();
@@ -55,9 +54,9 @@ void NativeTaskbar::StartEnforcer() {
             // often, and ask about auto-hide every time, for the first minute. Later the region and the
             // opacity (local and cheap) every second, auto-hide - a round trip to Explorer - every 5 s
             // and at once when the taskbar settings change (main.cpp: WM_SETTINGCHANGE "TraySettings").
-            const bool early = NowSeconds() - start < 60;
-            Sleep(early ? 250 : 1000);
-            const bool askAutoHide = early || pass % 5 == 0 || recheck.exchange(false);
+            const taskbarvisibility::EnforcerPass p = taskbarvisibility::EnforcerPlan(NowSeconds() - start, pass);
+            Sleep(p.sleepMs);
+            const bool askAutoHide = p.alwaysAsk || recheck.exchange(false);
             if (hidden) Enforce(false, askAutoHide);
         }
     });
@@ -74,13 +73,13 @@ bool NativeTaskbar::Hide() {
         originalState = SHAppBarMessage(ABM_GETSTATE, &abd);
         // remember across crashes so a later run can restore it
         HKEY k = nullptr;
-        LSTATUS saved = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\LiquidDock", 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr);
+        LSTATUS saved = RegCreateKeyExW(HKEY_CURRENT_USER, LD_TASKBAR_STATE_KEY, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr);
         if (saved == ERROR_SUCCESS) {
             DWORD v = (DWORD)originalState;
             DWORD existing = 0, sz = sizeof(existing);
-            saved = RegGetValueW(HKEY_CURRENT_USER, L"Software\\LiquidDock", L"TaskbarState", RRF_RT_REG_DWORD, nullptr, &existing, &sz);
+            saved = RegGetValueW(HKEY_CURRENT_USER, LD_TASKBAR_STATE_KEY, LD_TASKBAR_STATE_VALUE, RRF_RT_REG_DWORD, nullptr, &existing, &sz);
             if (saved == ERROR_FILE_NOT_FOUND || saved == ERROR_PATH_NOT_FOUND)
-                saved = RegSetValueExW(k, L"TaskbarState", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+                saved = RegSetValueExW(k, LD_TASKBAR_STATE_VALUE, 0, REG_DWORD, (BYTE*)&v, sizeof(v));
             else if (saved == ERROR_SUCCESS) originalState = existing;
             RegCloseKey(k);
         }
@@ -131,7 +130,7 @@ bool NativeTaskbar::Restore() {
     std::lock_guard<std::recursive_mutex> lk(mu);
     hidden = false;
     DWORD st = 0, sz = sizeof(st);
-    LSTATUS read = RegGetValueW(HKEY_CURRENT_USER, L"Software\\LiquidDock", L"TaskbarState", RRF_RT_REG_DWORD, nullptr, &st, &sz);
+    LSTATUS read = RegGetValueW(HKEY_CURRENT_USER, LD_TASKBAR_STATE_KEY, LD_TASKBAR_STATE_VALUE, RRF_RT_REG_DWORD, nullptr, &st, &sz);
     bool fromReg = read == ERROR_SUCCESS;
     if (!stateSaved && !fromReg && read != ERROR_FILE_NOT_FOUND && read != ERROR_PATH_NOT_FOUND) return false;
     if (!stateSaved && fromReg) { originalState = st; stateSaved = true; }
@@ -158,7 +157,7 @@ bool NativeTaskbar::Restore() {
     std::vector<HWND> current;
     ForEachTaskbar([&](HWND h) { current.push_back(h); });
     if (!restored || primary != ExplorerTaskbar() || current != bars) return false;
-    LSTATUS removed = RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\LiquidDock", L"TaskbarState");
+    LSTATUS removed = RegDeleteKeyValueW(HKEY_CURRENT_USER, LD_TASKBAR_STATE_KEY, LD_TASKBAR_STATE_VALUE);
     if (removed != ERROR_SUCCESS && removed != ERROR_FILE_NOT_FOUND && removed != ERROR_PATH_NOT_FOUND) return false;
     stateSaved = false;
     return true;

@@ -1,17 +1,27 @@
 // The start button's worker (src/start_menu.cpp) on Windows or Wine. Two modes:
-//   start_menu_worker_test.exe          safe (tests\run_regressions.bat): neither the taskbar's Start button
-//                                       nor the shell is touched, and no key reaches Windows (keys are only
-//                                       counted). Checks the worker itself: it ends on its own, clears its number,
+//   start_menu_worker_test.exe          safe (tests\run_regressions.bat): neither the shell nor the taskbar's Start
+//                                       button is touched, and no key reaches Windows (keys are only
+//                                       counted). What the click's dock.log lines read stays real, and
+//                                       only reads: the shell's CoreWindows looked up (FindWindowExW), the
+//                                       programs of those and of the window in front opened for their name, age
+//                                       and elevation (OpenProcess, QueryFullProcessImageNameW, GetProcessTimes,
+//                                       OpenProcessToken), the windows'
+//                                       cloak (DwmGetWindowAttribute), the last input (GetLastInputInfo) and
+//                                       the monitors (MonitorFromWindow, GetMonitorInfoW). Checks the worker itself: it ends on its own, clears its number,
 //                                       logs why Start did not come, takes further clicks without a second key,
 //                                       closes Start with one key and no wait (and stops a wait still running),
 //                                       hands a click to a waiting worker, starts over after a stuck one.
 //   start_menu_worker_test.exe --live   real Windows only (tests\run_start_menu_live.bat): checks that an
 //                                       unassigned key gives this background process the right to change the
 //                                       front window (what the dock's clicks rely on), then opens and closes the
-//                                       real Start menu a few times - by the taskbar's own Start button, then by
-//                                       the shell's request as without it. Hands off the mouse and the keyboard
-//                                       for about 30 seconds.
-//   cl /std:c++20 /EHsc /utf-8 /DUNICODE /D_UNICODE tests\start_menu_worker_test.cpp /link user32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib
+//                                       real Start menu a few times - by the shell's request (the dock's first way
+//                                       since mod.36), then, the shell taken away, by the taskbar's own Start button
+//                                       and by the Windows key, each by itself; Start is closed by the Windows key.
+//                                       It prints what was not measured when the ladder was written (no check on
+//                                       them): the taskbar button's toggle state while Start is closed, open by the
+//                                       shell's request and closed again, and the window in front once the key closed
+//                                       Start. Hands off the mouse and the keyboard for about 30 seconds.
+//   cl /std:c++20 /EHsc /utf-8 /DUNICODE /D_UNICODE tests\start_menu_worker_test.cpp /link user32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib dwmapi.lib
 #define SendKeyCombo CountedKeyCombo
 #include "../src/start_menu.cpp"
 #include "../src/taskbar_start.cpp"
@@ -34,12 +44,11 @@ void Log(const wchar_t* fmt, ...) {
     WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8, sizeof(utf8), nullptr, nullptr);
     printf("  log: %s\n", utf8);
 }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
-}
-std::wstring AppDataDir() { return L"."; }   // never asked: the test keeps no verdict of the dock's (g_keepVerdict)
+#define TEST_SUPPORT_QPC_NOW
+#define TEST_SUPPORT_FOREGROUND_RIGHT_TEXT
+#include "test_support.h"
+static std::atomic<int> g_dataDirAsked{ 0 };
+std::wstring AppDataDir() { ++g_dataDirAsked; return L"."; }   // never asked: the start button keeps nothing on disk (mod.36)
 static std::atomic<int> g_keys{ 0 }, g_rights{ 0 };
 static bool g_realKeys = false;   // --live: the keys really go out (closing Start needs one)
 bool CountedKeyCombo(std::initializer_list<WORD> keys) {
@@ -50,7 +59,7 @@ bool CountedKeyCombo(std::initializer_list<WORD> keys) {
     for (auto it = keys.end(); it != keys.begin();) { --it; INPUT i = {}; i.type = INPUT_KEYBOARD; i.ki.wVk = *it; i.ki.dwFlags = KEYEVENTF_KEYUP; in.push_back(i); }
     return SendInput((UINT)in.size(), in.data(), sizeof(INPUT)) == in.size();
 }
-// system.cpp's TakeForegroundRight, the same steps; in safe mode nothing goes out
+// shell_front.cpp's TakeForegroundRight, the same steps; in safe mode nothing goes out
 ForegroundRight TakeForegroundRight() {
     ++g_rights;
     if (!g_realKeys) return ForegroundRight::Had;
@@ -89,13 +98,8 @@ static bool StartHasKeyboard() {
 }
 
 // ---- checks
-static int checks = 0, failures = 0;
-static void Check(bool ok, const char* what) {
-    ++checks;
-    if (!ok) ++failures;
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
-    fflush(stdout);
-}
+#include "portable_check.h"
+static const bool kFlushEachCheck = (portable_check::FlushEach() = true);
 static bool LogHas(size_t from, const wchar_t* text) {
     std::lock_guard<std::mutex> lk(g_logMu);
     for (size_t i = from; i < g_log.size(); ++i) if (g_log[i].find(text) != std::wstring::npos) return true;
@@ -110,14 +114,11 @@ static bool WaitIdle(double seconds) {
     }
     return startmenu::g_current.load() == 0;
 }
+static const int kAllWays = startmenu::kWayShell | startmenu::kWayTaskbar | startmenu::kWayKey;
 
 static void SafeTests(HMONITOR primary) {
-    {   // neither the taskbar's Start button nor the shell is touched here: no real Start can open
-        std::lock_guard<std::mutex> lk(startmenu::g_mu);
-        startmenu::g_pref.askShell = false;
-        startmenu::g_pref.shellFirst = false;
-        startmenu::g_pref.taskbar = startmenu::TaskbarState::Off;
-    }
+    // neither the shell nor the taskbar's Start button is touched here: no real Start can open (the key is only counted)
+    startmenu::g_ways = startmenu::kWayKey;
     const double wait = startmenu::kGiveUp + 2;
 
     int keys = g_keys; size_t log = LogSize();
@@ -131,42 +132,6 @@ static void SafeTests(HMONITOR primary) {
     Check(LogHas(log, L"taskbar: off"), "...nor the taskbar's Start button");
     Check(!taskbarstart::TaskbarOn(nullptr), "no monitor: no taskbar to press (the click goes the other ways)");
 
-    {   // the taskbar's button has proved itself, but this process keeps none for the monitor (it never looked one
-        // up) and nothing of Start is in front: closing goes by the Windows key at once, no lookup, no press
-        { std::lock_guard<std::mutex> lk(startmenu::g_mu); startmenu::g_pref.taskbar = startmenu::TaskbarState::Works; }
-        keys = g_keys;
-        startmenu::Click(primary, true);
-        Check(g_keys - keys == 1 && startmenu::g_current.load() == 0 && !taskbarstart::Kept(primary),
-              "the button trusted, but none kept for this monitor (and Start's window not in front there): the Windows key closes Start");
-        { std::lock_guard<std::mutex> lk(startmenu::g_mu); startmenu::g_pref.taskbar = startmenu::TaskbarState::Off; }
-    }
-
-    {   // the taskbar button's verdict, kept across runs - here in a file of the test's own, removed after
-        wchar_t dir[MAX_PATH] = L"", file[MAX_PATH + 64] = L"";
-        GetTempPathW(ARRAYSIZE(dir), dir);
-        _snwprintf_s(file, ARRAYSIZE(file), _TRUNCATE, L"%lsliquid-dock-test-%lu-taskbar-start.txt", dir, GetCurrentProcessId());
-        std::lock_guard<std::mutex> lk(startmenu::g_mu);
-        const startmenu::Preference saved = startmenu::g_pref;
-        wcscpy_s(startmenu::g_verdictFile, file);
-        startmenu::SaveVerdict(startmenu::TaskbarState::Works);
-        const bool written = GetFileAttributesW(file) != INVALID_FILE_ATTRIBUTES;
-        startmenu::g_pref.taskbar = startmenu::TaskbarState::Unknown;
-        startmenu::g_verdictLoaded = false;
-        startmenu::LoadVerdict();
-        const bool works = startmenu::g_pref.taskbar == startmenu::TaskbarState::Works;
-        startmenu::SaveVerdict(startmenu::TaskbarState::Unknown);   // cleared (nothing proven either way)
-        const bool removed = GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES;
-        startmenu::g_pref.taskbar = startmenu::TaskbarState::Unknown;
-        startmenu::g_verdictLoaded = false;
-        startmenu::LoadVerdict();
-        const bool cleared = startmenu::g_pref.taskbar == startmenu::TaskbarState::Unknown;
-        DeleteFileW(file);
-        startmenu::g_verdictFile[0] = L'\0';
-        startmenu::g_pref = saved;
-        Check(written && works, "a verdict kept (\"works\" on this Windows build) is read back at the next run's first click");
-        Check(removed && cleared, "...and once cleared nothing is kept: the next run checks the button again");
-    }
-
     keys = g_keys; log = LogSize();
     startmenu::Click(primary, false); Sleep(150);
     startmenu::Click(primary, false); Sleep(150);
@@ -175,9 +140,11 @@ static void SafeTests(HMONITOR primary) {
     Check(g_keys - keys == 1, "three clicks while Start is on its way: one key (a second would close it again)");
     Check(LogHas(log, L"2 more clicks"), "dock.log counts the two clicks made while waiting");
 
-    keys = g_keys;
+    keys = g_keys; log = LogSize();
     startmenu::Click(primary, true);
     Check(g_keys - keys == 1 && startmenu::g_current.load() == 0, "Start in front at the press: one key closes it, no worker");
+    Check(LogHas(log, L"start: closing Start (the start button pressed while it was open; in front: ") && LogHas(log, L") by the Windows key"),
+          "...and dock.log says Start was closed, how, and what was in front");
     Check(g_rights.load() >= 1, "an opening click takes the right to change the front window before it hands it to the shell");
 
     {   // Start closed with the button while a wait still runs: that wait must not bring it back
@@ -204,6 +171,8 @@ static void SafeTests(HMONITOR primary) {
     startmenu::Click(primary, false);
     Check(LogHas(log, L"starting over") && startmenu::g_current.load() != 0xFFFF0001u, "a click after kStuck leaves the stuck worker behind and starts over");
     Check(WaitIdle(wait), "the new worker ends");
+    Check(g_dataDirAsked == 0, "in all of it the dock's data folder was never asked for: no verdict is kept on disk (data\\taskbar-start.txt is left as it is)");
+    startmenu::g_ways = kAllWays;
 }
 
 // The Windows build and whether this run is elevated: the two runs (as the user, as administrator) differ
@@ -227,6 +196,57 @@ static taskbarstart::Found FindTaskbarButton(HMONITOR m) {
     return f;
 }
 
+// ---- measures (--live; printed, never a check). The taskbar Start button's toggle state right now, read only -
+// nothing is pressed: "off", "on", "indeterminate", or why it could not be read. (The ladder presses the button only
+// when it reads off; whether it reads on while Start is open by the shell's request was not measured when it was written.)
+static std::string StartToggleNow(HMONITOR m) {
+    std::string text = "?";
+    std::thread([&] {
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const taskbarstart::Found f = taskbarstart::Find(m);
+        if (f != taskbarstart::Found::Kept && f != taskbarstart::Found::Now) {
+            text = "no button to read (" + Utf8(taskbarstart::FoundText(f)) + ")";
+        } else {
+            ComPtr<IUIAutomationElement> button;
+            {
+                std::lock_guard<std::mutex> lk(taskbarstart::S().book);
+                button = taskbarstart::At(taskbarstart::TaskbarOn(m)).button;
+            }
+            if (!button) text = "the button went away meanwhile";
+            else {
+                std::lock_guard<std::mutex> call(taskbarstart::S().calls);
+                ComPtr<IUIAutomationTogglePattern> toggle;
+                const HRESULT hr = button->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&toggle));
+                if (FAILED(hr) || !toggle) { char b[64]; snprintf(b, sizeof(b), "no Toggle pattern (%08lx)", (unsigned long)hr); text = b; }
+                else {
+                    double took = 0; bool timedOut = false;
+                    const int state = taskbarstart::StateOf(toggle.Get(), &took, &timedOut);
+                    char b[96];
+                    snprintf(b, sizeof(b), "%s (read in %.0f ms%s)", Utf8(startmenu::ToggleText(state)).c_str(), took * 1000, timedOut ? ", timed out" : "");
+                    text = b;
+                }
+            }
+        }
+        if (SUCCEEDED(co)) CoUninitialize();
+    }).join();
+    return text;
+}
+// The window in front as dock.log names one: program, class, whether it is cloaked (DWM) or hidden, its monitor.
+static std::string FrontNow() {
+    const HWND fg = GetForegroundWindow();
+    if (!fg) return "nothing";
+    wchar_t cls[96] = L"";
+    GetClassNameW(fg, cls, ARRAYSIZE(cls));
+    DWORD cloak = 0;
+    DwmGetWindowAttribute(fg, DWMWA_CLOAKED, &cloak, sizeof(cloak));
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mi);
+    char b[400];
+    snprintf(b, sizeof(b), "%s %s, cloak %lu%s, %s, on monitor %ld,%ld", FrontExe().c_str(), Utf8(cls).c_str(), cloak,
+             cloak ? " (cloaked)" : "", IsWindowVisible(fg) ? "visible" : "hidden", mi.rcMonitor.left, mi.rcMonitor.top);
+    return b;
+}
+
 static void LiveTests(HMONITOR primary) {
     PrintRun();
     g_realKeys = true;
@@ -247,14 +267,6 @@ static void LiveTests(HMONITOR primary) {
         if (before && IsWindow(before)) { TakeForegroundRight(); SetForegroundWindow(before); }
         Sleep(150);
     }
-    // as the dock starts; taskbar: how it may use the taskbar's own Start button
-    auto fresh = [](startmenu::TaskbarState taskbar) {
-        std::lock_guard<std::mutex> lk(startmenu::g_mu);
-        startmenu::g_pref = startmenu::Preference{};
-        startmenu::g_pref.taskbar = taskbar;
-        startmenu::g_reportedFirst = false;   // so the first usual click of each part is logged
-    };
-    auto state = [] { std::lock_guard<std::mutex> lk(startmenu::g_mu); return startmenu::g_pref.taskbar; };
     ComPtr<startmenu::IVisibility> vis;
     CoCreateInstance(startmenu::kAppVisibility, nullptr, CLSCTX_ALL, startmenu::kAppVisibilityIid, reinterpret_cast<void**>(vis.GetAddressOf()));
     auto open = [&] { return startmenu::Visible(vis.Get(), nullptr); };
@@ -263,107 +275,136 @@ static void LiveTests(HMONITOR primary) {
         while (NowSeconds() < until && open() != want) Sleep(30);
         return open() == want;
     };
-    fresh(startmenu::TaskbarState::Off);
+    // a click with Start open closes it: the Windows key (mod.36: never the taskbar's button)
+    auto close = [&] {
+        if (!startmenu::InFront()) return false;   // (a click without Start open would open it)
+        const int keys = g_keys;
+        const size_t log = LogSize();
+        startmenu::Click(primary, true);
+        return settle(false, 2) && g_keys == keys + 1 && LogHas(log, L") by the Windows key");
+    };
+    startmenu::g_ways = kAllWays;
     if (open()) { startmenu::Click(primary, true); settle(false, 2); }
     Check(!open(), "Start closed before the test");
 
-    // ---- the taskbar's own Start button (src/taskbar_start.cpp), what the dock presses first since mod.18.
-    // With the dock running, its taskbar is hidden: this shows whether the button is found then.
-    fresh(startmenu::TaskbarState::Unknown);
+    // The taskbar's own Start button (src/taskbar_start.cpp): the ladder's second way, behind the shell's request. With
+    // the dock running, its taskbar is hidden: this shows whether the button is found then, and what its state reads.
     const double lookT = NowSeconds();
     const taskbarstart::Found found = FindTaskbarButton(primary);
+    const bool button = found == taskbarstart::Found::Kept || found == taskbarstart::Found::Now;
     printf("  the taskbar's Start button: %s, in %.0f ms (%s)\n", Utf8(taskbarstart::FoundText(found)).c_str(), (NowSeconds() - lookT) * 1000,
            Utf8(taskbarstart::Describe()).c_str());
-    if (found == taskbarstart::Found::Kept || found == taskbarstart::Found::Now) {
-        int keys = g_keys; size_t log = LogSize();
-        startmenu::Click(primary, false);
-        WaitIdle(8);
-        Check(settle(true, 1), "a click opens Start");
-        Check(LogHas(log, L"Start came by the taskbar's Start button"), "...by the taskbar's own Start button (dock.log names it)");
-        Check(g_keys == keys, "...without the Windows key");
-        Sleep(200);
-        Check(StartHasKeyboard(), "...and Start has the keyboard (typing goes to its search box)");
-        Check(state() == startmenu::TaskbarState::Works, "...and from now on the taskbar's button is trusted (it closes Start too)");
+    printf("  measure: Start closed - the taskbar button's toggle state reads %s\n", StartToggleNow(primary).c_str());
 
-        Check(startmenu::InFront(), "Start open: the press-time check sees it (what decides that the button closes it)");
-        keys = g_keys; log = LogSize();
-        startmenu::Click(primary, startmenu::InFront());
-        Check(settle(false, 2), "a click with Start open closes it");
-        Sleep(300);   // a press that did not go through would be logged by now
-        Check(g_keys == keys && !LogHas(log, L"did not go through"), "...by the taskbar's button (no Windows key)");
-        printf("  in front once Start closed: %s\n", FrontExe().c_str());
-
-        keys = g_keys;
-        for (int i = 0; i < 3; ++i) { startmenu::Click(primary, false); Sleep(80); }
-        WaitIdle(8);
-        Check(settle(true, 1), "three quick clicks: Start is open (the extra clicks did not toggle it shut)");
-        Check(g_keys == keys, "...and no Windows key was pressed");
-        startmenu::Click(primary, startmenu::InFront());
-        settle(false, 2);
-        // A test PC, 2026-10-27 14:17: the shell's request sent about half a second after Start had been closed by
-        // the taskbar's button was taken and brought no Start (8 s); the same request nine seconds later did. The
-        // dock does not mix the two that way (once the button works, it opens and closes Start); here the shell's
-        // part waits a little first, so it checks the shell and not that hand-over.
-        Sleep(2000);
-    } else {
-        printf("  not checked: no Start button to press on this taskbar - the dock then asks the shell, checked below\n");
-    }
-
-    // ---- without the taskbar's button: the shell's request, as before mod.18 (the dock's fallback)
+    // ---- 1. as the dock starts: the shell's request (the first way since mod.36)
     printf("  in front before the shell's part: %s\n", FrontExe().c_str());
-    fresh(startmenu::TaskbarState::Off);
     int keys = g_keys; size_t log = LogSize();
     startmenu::Click(primary, false);
-    WaitIdle(8);
-    Check(settle(true, 1), "without the taskbar's button: a click opens Start");
-    Check(g_keys == keys, "...without the Windows key (the shell's request brought it)");
-    Check(LogHas(log, L"Start came by the shell's request"), "dock.log names the shell's request");
+    WaitIdle(10);
+    Check(settle(true, 1), "a click opens Start");
+    Check(LogHas(log, L"Start came by the shell's request"), "...by the shell's request (dock.log names it)");
+    Check(g_keys == keys, "...without the Windows key");
     Sleep(200);
     Check(StartHasKeyboard(), "...and Start has the keyboard (typing goes to its search box)");
+    printf("  measure: Start open by the shell's request - the taskbar button's toggle state reads %s\n", StartToggleNow(primary).c_str());
+    printf("  measure: Start open by the shell's request - in front: %s\n", FrontNow().c_str());
 
     Check(startmenu::InFront(), "Start open: the press-time check sees it (what decides that the button closes it)");
-    if (startmenu::InFront()) {   // (a click without Start open would open it)
-        startmenu::Click(primary, true);
-        Check(settle(false, 2), "a click with Start open closes it (the Windows key)");
-    }
-    Sleep(500);
+    Check(close(), "a click with Start open closes it, by the Windows key (dock.log says so, with what was in front)");
+    Sleep(300);
+    printf("  measure: Start closed by the Windows key, 0.3 s later - in front: %s\n", FrontNow().c_str());
+    printf("  measure: Start closed by the Windows key - the taskbar button's toggle state reads %s\n", StartToggleNow(primary).c_str());
+    Sleep(200);   // (Start closed by the key, the next request half a second later: what the dock does on a quick reopen)
 
     keys = g_keys;
     for (int i = 0; i < 3; ++i) { startmenu::Click(primary, false); Sleep(80); }
-    WaitIdle(8);
+    WaitIdle(10);
     Check(settle(true, 1), "three quick clicks: Start is open (the extra clicks did not toggle it shut)");
     Check(g_keys == keys, "...and no Windows key was pressed");
-    startmenu::Click(primary, true);
-    settle(false, 2);
+    Check(close(), "...and a click closes it again");
+    Sleep(500);
 
-    fresh(startmenu::TaskbarState::Unknown);   // as the dock starts: that monitor's taskbar button, if it has one
+    // ---- 2. the shell taken away: the taskbar's own Start button by itself (pressed only when its state reads off)
+    if (button) {
+        startmenu::g_ways = startmenu::kWayTaskbar;
+        keys = g_keys; log = LogSize();
+        startmenu::Click(primary, false);
+        WaitIdle(10);
+        Check(settle(true, 1), "the shell taken away: a click opens Start");
+        Check(LogHas(log, L"by the taskbar's Start button - taskbar: pressed (toggle, state off -> "), "...by the taskbar's own Start button, its state off before the press (dock.log names both)");
+        Check(g_keys == keys, "...without the Windows key");
+        Sleep(200);
+        Check(StartHasKeyboard(), "...and Start has the keyboard (typing goes to its search box)");
+        printf("  measure: Start open by the taskbar's button - its toggle state reads %s\n", StartToggleNow(primary).c_str());
+        startmenu::g_ways = kAllWays;
+        Check(close(), "...and a click closes it, by the Windows key");
+        Sleep(300);
+        printf("  measure: Start opened by the taskbar's button, closed by the Windows key - the button's toggle state reads %s; in front: %s\n",
+               StartToggleNow(primary).c_str(), FrontNow().c_str());
+        Sleep(700);
+    } else {
+        printf("  not checked: no Start button to press on this taskbar - the ladder then goes from the shell to the Windows key, checked below\n");
+    }
+
+    // ---- 3. the shell and the button taken away: the Windows key by itself (the last way)
+    startmenu::g_ways = startmenu::kWayKey;
+    keys = g_keys; log = LogSize();
+    startmenu::Click(primary, false);
+    WaitIdle(10);
+    Check(settle(true, 1), "the shell and the button taken away: a click opens Start");
+    Check(g_keys == keys + 1 && LogHas(log, L"by the Windows key"), "...by the Windows key, pressed once (dock.log names it)");
+    startmenu::g_ways = kAllWays;
+    Check(close(), "...and a click closes it");
+    Sleep(1000);
+
+    // ---- 4. another monitor's dock: the shell's request puts Start on that monitor (ConnectToMonitor - not measured before
+    // mod.36: the dock pressed that monitor's taskbar button); then that taskbar's own button, the shell taken away
     std::vector<HMONITOR> mons;
     EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM p) -> BOOL {
         reinterpret_cast<std::vector<HMONITOR>*>(p)->push_back(m); return TRUE;
     }, reinterpret_cast<LPARAM>(&mons));
     for (HMONITOR m : mons) {
         if (m == primary) continue;
+        log = LogSize();
         startmenu::Click(m, false);
-        WaitIdle(8);
+        WaitIdle(10);
         bool up = settle(true, 1);
         HWND fg = GetForegroundWindow();
-        Check(up && fg && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == m, "the start button of another monitor's dock opens Start on that monitor");
+        Check(up && fg && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == m, "the start button of another monitor's dock opens Start on that monitor (as the dock starts: the shell's request)");
+        printf("  measure: another monitor's dock - %s%s; in front: %s\n",
+               LogHas(log, L"Start came by the shell's request") ? "the shell's request brought Start" : "the shell's request alone did not bring Start (see the lines above)",
+               LogHas(log, L"not on the dock's monitor") ? ", NOT on the dock's monitor (Windows chose)" : "", FrontNow().c_str());
         startmenu::Click(m, true);
         settle(false, 2);
+        Sleep(1000);
+        // Asked once: the first answer can be Now (found, and kept from then on) and the second Kept.
+        const taskbarstart::Found there = FindTaskbarButton(m);
+        if (there == taskbarstart::Found::Kept || there == taskbarstart::Found::Now) {
+            startmenu::g_ways = startmenu::kWayTaskbar;
+            startmenu::Click(m, false);
+            WaitIdle(10);
+            up = settle(true, 1);
+            fg = GetForegroundWindow();
+            Check(up && fg && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == m, "the start button of another monitor's dock opens Start on that monitor (the shell taken away: that taskbar's own button)");
+            startmenu::g_ways = kAllWays;
+            startmenu::Click(m, true);
+            settle(false, 2);
+        } else {
+            printf("  not checked: no Start button to press on that monitor's taskbar\n");
+        }
         break;
     }
+    startmenu::g_ways = kAllWays;
 }
 
 int wmain(int argc, wchar_t** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    startmenu::g_keepVerdict = false;   // the dock's kept verdict (data\taskbar-start.txt) is neither read nor written
     const bool live = argc > 1 && !wcscmp(argv[1], L"--live");
     HMONITOR primary = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
     if (live) LiveTests(primary);
     else SafeTests(primary);
-    printf("start_menu_worker_test%s: %s (%d checks, %d failure%s)\n", live ? " --live" : "", failures ? "FAILED" : "ALL PASSED",
-           checks, failures, failures == 1 ? "" : "s");
+    Summary(live ? "start_menu_worker_test --live" : "start_menu_worker_test");
     fflush(stdout);
-    return failures;
+    return portable_check::Failures();
 }

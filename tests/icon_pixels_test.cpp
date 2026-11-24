@@ -40,6 +40,14 @@ int main() {
     Check(px[2] == Argb(128, 128, 128, 128), "half alpha halves the colour");
     Check(px[3] == Argb(254, 0, 0, 0), "rounded down");
 
+    // ---- AnyAlpha, MakeOpaque (apps.cpp's app icons)
+    Check(!AnyAlpha({}) && !AnyAlpha({ Argb(0, 255, 255, 255), Argb(0, 1, 2, 3) }), "no pixels, or none with alpha: no alpha");
+    Check(AnyAlpha({ Argb(0, 9, 9, 9), Argb(1, 0, 0, 0) }), "one pixel with the least alpha: alpha");
+    std::vector<uint32_t> noAlpha = { Argb(0, 10, 20, 30), Argb(0, 0, 0, 0), Argb(7, 1, 2, 3) };
+    MakeOpaque(noAlpha);
+    Check(noAlpha[0] == Argb(255, 10, 20, 30) && noAlpha[1] == Argb(255, 0, 0, 0) && noAlpha[2] == Argb(255, 1, 2, 3),
+          "made opaque: alpha 255, every colour as it was");
+
     // ---- Shrink
     Pic small = Fill(64, 64, Argb(255, 1, 2, 3));
     Shrink(small);

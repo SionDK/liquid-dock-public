@@ -1,14 +1,9 @@
 #include "settings_window.h"
 #include "settings_window_internal.h"
-#include "dock.h"
-#include "theme.h"
-#include "oled.h"
+#include "gfx.h"
+#include "main.h"          // g_mainWnd, WM_APP_RELAYOUT
+#include "dock_shared.h"   // IconGapRatio, ThicknessRatio, StackButtons: the dock's own proportions
 #include "buttons.h"
-#include "sensors.h"
-#include "admin_helper.h"
-#include "version.h"
-#include <dwmapi.h>
-#include <map>
 #include "system.h"
 
 namespace settingswindow {
@@ -68,24 +63,21 @@ void CommitButtons(const std::vector<ButtonId>& list) {
     PostMessageW(g_mainWnd, WM_APP_RELAYOUT, 0, 0);
 }
 
-float DrawCustomizer(float x0, float y, float x1) {
-    auto* dc = g_gfx.dc.Get();
-    const float top = y;
-    const IconState st = CurrentIconState(NowSeconds());
-    Draw(L"독에 표시할 버튼", g_fLabel.Get(), { x0, y, x1, y + 22 }, Text());
-    y += 24;
-    Draw(L"아래 목록에서 독으로 끌어다 놓으세요. 독 밖으로 끌어내면 빠집니다.", g_fHint.Get(), { x0, y, x1, y + 18 }, Muted());
-    y += 28;
+namespace {
 
-    // ---- preview: the tray end of the dock, at the dock's proportions
+// ---- DrawCustomizer's parts, in the order it draws them (so the hot areas are the preview's, then the list's, and
+// the dragged button is drawn over both). dc, st: DrawCustomizer's; x0, x1: the page's column; y: the part's top.
+
+// The preview: the tray end of the dock, at the dock's proportions. Returns the chosen list as shown there (while a
+// button is dragged: as it would be after the drop), which the list below leaves out.
+std::vector<ButtonId> DrawPreview(ID2D1DeviceContext2* dc, const IconState& st, float x0, float y, float x1) {
     g_preview = { x0, y, x1, y + 112 };
     Fill(g_preview, Wash(g_bd.active && OverPreview(g_bd.x, g_bd.y) ? 0.09f : 0.05f), 8);
     std::vector<ButtonId> chosen = ShownList(), group1 = chosen;
     group1.push_back(ButtonId::Settings);
     const std::vector<ButtonId> group0 = { ButtonId::Network, ButtonId::Volume };
-    const float pct = std::clamp(g_settings.dockThickness, 75, 150) / 100.f;
-    constexpr float spacing[] = { 0.22f, 0.32f, 0.44f };
-    const float gapRatio = g_settings.iconGap > 0 ? std::clamp(g_settings.iconGap, 10, 60) / 100.f : spacing[std::clamp(g_settings.iconSpacing, 0, 2)];
+    const float pct = ThicknessRatio();   // the dock's rules (dock_shared.h); the gap is not rounded here, unlike the dock's
+    const float gapRatio = IconGapRatio();
     float k = 0.62f, icon = 0, thick = 0, pad = 0, gap = 0, width = 0;
     bool stack = false;
     const battery::State bat = g_sys.Battery();   // the battery cell, on a PC with a battery
@@ -93,7 +85,7 @@ float DrawCustomizer(float x0, float y, float x1) {
     for (int pass = 0; pass < 2; ++pass) {   // shrink once if the bar does not fit the panel
         icon = std::round(g_settings.iconSize * 0.78f * k);
         thick = icon / 0.6f * pct; pad = (thick - icon) / 2; gap = icon * gapRatio;
-        stack = thick * 0.5f >= 22 * k;
+        stack = StackButtons(thick, k);   // before the padding: the dock pairs by its bar after it
         width = 2 * pad + 3 * (icon + gap) + 1 + gap + icon * 0.45f + 46 * k + 58 * k + batteryWidth()
               + PlanButtons(group0, icon, k, stack, 0, nullptr) + PlanButtons(group1, icon, k, stack, 0, nullptr);
         float avail = g_preview.right - g_preview.left - 24;
@@ -125,7 +117,7 @@ float DrawCustomizer(float x0, float y, float x1) {
     std::vector<PlannedCell> cells;
     x = PlanButtons(group0, icon, k, stack, x, &cells);
     for (auto& c : cells) DrawButtonIcon(c.id, dc, g_brush.Get(), glyphs, cellRect(c), k, stack ? 0.8f : 1.0f, Text(), 0, st);
-    Draw(g_sys.timeText, g_fTiny.Get(), { x, by + thick / 2 - 15, x + 46 * k, by + thick / 2 }, Text());
+    Draw(g_settings.clockFormat == 1 ? g_sys.timeShort : g_sys.timeText, g_fTiny.Get(), { x, by + thick / 2 - 15, x + 46 * k, by + thick / 2 }, Text());
     Draw(g_sys.dateText.size() > 5 ? g_sys.dateText.substr(g_sys.dateText.size() - 5) : g_sys.dateText, g_fTiny.Get(),
          { x, by + thick / 2, x + 46 * k, by + thick / 2 + 15 }, Muted());
     x += 46 * k;
@@ -159,9 +151,11 @@ float DrawCustomizer(float x0, float y, float x1) {
             if (at != chosenNow.end()) g_hots.push_back({ r, kHotDock - (int)(at - chosenNow.begin()), 0 });
         }
     }
-    y = g_preview.bottom + 18;
+    return chosen;
+}
 
-    // ---- the buttons not on the dock
+// The buttons not on the dock. Returns the y under them.
+float DrawButtonList(ID2D1DeviceContext2* dc, const IconState& st, const std::vector<ButtonId>& chosen, float x0, float y, float x1) {
     Draw(L"사용 가능한 버튼", g_fLabel.Get(), { x0, y, x1, y + 22 }, Text());
     y += 30;
     std::vector<ButtonId> rest;
@@ -182,15 +176,32 @@ float DrawCustomizer(float x0, float y, float x1) {
         if (!g_bd.active) g_hots.push_back({ r, kHotPalette - (int)rest[i], 0 });
     }
     y += ((rest.size() + cols - 1) / cols) * (ch + 8) + 8;
+    return y;
+}
 
-    // ---- the button being dragged follows the pointer
-    if (g_bd.active) {
-        D2D1_RECT_F g = { g_bd.x - 20, g_bd.y - 20, g_bd.x + 20, g_bd.y + 20 };
-        Fill(g, g_dark ? ColorF(0.25f, 0.25f, 0.28f, 0.92f) : ColorF(1, 1, 1, 0.95f), 8);
-        g_brush->SetColor(g_accent);
-        dc->DrawRoundedRectangle({ g, 8, 8 }, g_brush.Get(), 1.5f);
-        DrawButtonIcon(g_bd.id, dc, g_brush.Get(), GlyphFont(15), g, 0.85f, 1, Text(), 0, st);
-    }
+// The button being dragged follows the pointer.
+void DrawDraggedButton(ID2D1DeviceContext2* dc, const IconState& st) {
+    D2D1_RECT_F g = { g_bd.x - 20, g_bd.y - 20, g_bd.x + 20, g_bd.y + 20 };
+    Fill(g, g_dark ? ColorF(0.25f, 0.25f, 0.28f, 0.92f) : ColorF(1, 1, 1, 0.95f), 8);
+    g_brush->SetColor(g_accent);
+    dc->DrawRoundedRectangle({ g, 8, 8 }, g_brush.Get(), 1.5f);
+    DrawButtonIcon(g_bd.id, dc, g_brush.Get(), GlyphFont(15), g, 0.85f, 1, Text(), 0, st);
+}
+
+}   // namespace
+
+float DrawCustomizer(float x0, float y, float x1) {
+    auto* dc = g_gfx.dc.Get();
+    const float top = y;
+    const IconState st = CurrentIconState(NowSeconds());
+    Draw(L"독에 표시할 버튼", g_fLabel.Get(), { x0, y, x1, y + 22 }, Text());
+    y += 24;
+    Draw(L"아래 목록에서 독으로 끌어다 놓으세요. 독 밖으로 끌어내면 빠집니다.", g_fHint.Get(), { x0, y, x1, y + 18 }, Muted());
+    y += 28;
+    const std::vector<ButtonId> chosen = DrawPreview(dc, st, x0, y, x1);
+    y = g_preview.bottom + 18;
+    y = DrawButtonList(dc, st, chosen, x0, y, x1);
+    if (g_bd.active) DrawDraggedButton(dc, st);
     return y - top;
 }
 

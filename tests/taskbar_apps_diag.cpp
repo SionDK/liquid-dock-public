@@ -7,7 +7,7 @@
 // Windows refused shows a flash; a press that did nothing shows neither. Only a button counting its one window is
 // pressed (never one it shares with another copy of the test); a press that may still arrive (a call that timed out)
 // stops the steps after it. Like the dock, it takes the right to change the front window with a key no program acts
-// on (0xE8; system.cpp, TakeForegroundRight) and hands it on to Explorer before each press. Its window keeps handling
+// on (0xE8; shell_front.cpp, TakeForegroundRight) and hands it on to Explorer before each press. Its window keeps handling
 // messages while a press is made, as the dock's windows do: a press Explorer acts on may send to it at once.
 //
 // Why it is kept: mod.22 stopped pressing app buttons by the accessibility default action, all they offer on a 25H2
@@ -58,12 +58,8 @@ void Out(const char* fmt, ...) {
     putchar('\n');
     fflush(stdout);
 }
-std::string U8(const std::wstring& w) {
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
-    return s;
-}
+#define TEST_SUPPORT_U8
+#include "test_support.h"
 std::wstring Lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
 std::wstring ExeName(DWORD pid) {
     std::wstring out;
@@ -97,7 +93,7 @@ void Pump(int ms) {
     } while (GetTickCount64() < end);
 }
 
-// As system.cpp's TakeForegroundRight, then Explorer gets the right (AppModel::StartPress), every result printed.
+// As shell_front.cpp's TakeForegroundRight, then Explorer gets the right (AppModel::StartPress), every result printed.
 void GiveExplorerTheRight() {
     const DWORD me = GetCurrentProcessId();
     SetLastError(0);

@@ -25,37 +25,12 @@
 
 Settings g_settings;
 HWND g_mainWnd = nullptr;
-struct MonitorCase { HMONITOR handle; RECT rect; bool primary; bool actual; const char* name; };
-static std::vector<MonitorCase> monitors;
-static bool fgEnabled=false, fgMaximized=false;
-static RECT fgRect{};
-static HMONITOR fgMonitor=nullptr;
-static LONG_PTR fgStyle=WS_POPUP;
-static const wchar_t* fgClass=L"MatrixFullscreen";
-static HWND fgHandle=(HWND)(uintptr_t)0xF00DFACE;
-static BOOL WINAPI MatrixMonitorInfo(HMONITOR m,LPMONITORINFO info) {
- for(const auto& entry:monitors) if(entry.handle==m) {info->rcMonitor=info->rcWork=entry.rect;info->dwFlags=entry.primary?MONITORINFOF_PRIMARY:0;return TRUE;}
- return ::GetMonitorInfoW(m,info);
-}
-static HWND WINAPI MatrixForeground(){return fgEnabled?fgHandle:nullptr;}
-static HMONITOR WINAPI MatrixMonitorFromWindow(HWND h,DWORD flags){return h==fgHandle ? fgMonitor : ::MonitorFromWindow(h,flags);}
-static BOOL WINAPI MatrixWindowRect(HWND h,LPRECT rect){if(h==fgHandle){*rect=fgRect;return TRUE;}return ::GetWindowRect(h,rect);}
-static BOOL WINAPI MatrixIsZoomed(HWND h){return h==fgHandle ? fgMaximized : ::IsZoomed(h);}
-static LONG_PTR WINAPI MatrixWindowLong(HWND h,int index){return h==fgHandle ? fgStyle : ::GetWindowLongPtrW(h,index);}
-// the client area GetWindowInfo reports for the window in front (a maximized window is fullscreen only when it
-// covers the monitor): empty unless a check sets it; fgInfoFails makes the call fail
-static RECT fgClient{};
-static bool fgInfoFails=false;
-static BOOL WINAPI MatrixWindowInfo(HWND h,PWINDOWINFO wi){
- if(h!=fgHandle)return ::GetWindowInfo(h,wi);
- if(fgInfoFails)return FALSE;
- wi->rcWindow=fgRect;wi->rcClient=fgClient;wi->dwStyle=(DWORD)fgStyle;return TRUE;
-}
+// fake monitors, the fake window in front (fg*) and the other fakes of the fixture's window system
+#include "dock_fixture_matrix.h"
 // Chrome maximized and then put in F11 (or a page's fullscreen video): still maximized, no caption, no resize frame
 static const LONG_PTR kChromeF11=WS_OVERLAPPED|WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_VISIBLE|WS_MAXIMIZE;
 static const LONG_PTR kChromeMaximized=WS_OVERLAPPEDWINDOW|WS_VISIBLE|WS_MAXIMIZE;
 static RECT Grown(const RECT& r,int by){return {r.left-by,r.top-by,r.right+by,r.bottom+by};}
-static int WINAPI MatrixClassName(HWND h,LPWSTR text,int capacity){if(h==fgHandle){wcsncpy_s(text,capacity,fgClass,_TRUNCATE);return (int)wcslen(text);}return ::GetClassNameW(h,text,capacity);}
 // The z-order over a dock (FrontTests, mod.32): the window in front lies above the dock while fgAboveDock; the dock
 // going topmost again (BringToFront) puts it back over it. Only the window lent to the dock in FrontTests is seen.
 static HWND frontDock=nullptr;
@@ -70,10 +45,7 @@ static BOOL WINAPI MatrixSetWindowPos(HWND h,HWND after,int x,int y,int cx,int c
  if(h&&h==frontDock&&after==HWND_TOPMOST){++dockRaises;fgAboveDock=false;}
  return ::SetWindowPos(h,after,x,y,cx,cy,flags);
 }
-static BOOL WINAPI MatrixShowWindow(HWND,int){return TRUE;} // keep fixture windows invisible
-static SHORT WINAPI MatrixKeyState(int){return 0;}
 static int settingsMenus=0;
-static BOOL WINAPI MatrixForegroundSet(HWND){return TRUE;}
 static BOOL WINAPI MatrixPopupMenu(HMENU,UINT,int,int,int,HWND,const RECT*){++settingsMenus;return 0;}
 static int desktopActions=0;
 namespace nativetray {
@@ -108,10 +80,9 @@ static int MatrixFileOperation(LPSHFILEOPSTRUCTW op){
 }
 static HRESULT WINAPI MatrixEmptyRecycleBin(HWND,LPCWSTR,DWORD){return S_OK;}
 #include "../src/audio_devices.h"
-static int audioSwitches=0;
 namespace audio {
 std::vector<Device> Outputs(){return {{L"a",L"Speakers",true},{L"b",L"Headset",false}};}
-bool SetDefault(const std::wstring&){++audioSwitches;return true;}
+bool SetDefault(const std::wstring&){return true;}
 std::wstring DefaultOutputName(){return L"Speakers";}   // the audio button's tooltip (since mod.15)
 }
 // start button stubs: the matrix never opens Start or presses the Windows key
@@ -121,56 +92,13 @@ namespace startmenu {
 bool InFront(){return false;}
 void Click(HMONITOR m,bool startWasInFront){++startClicks;startClickMonitor=m;startClickInFront=startWasInFront;}
 }
-// the taskbar's Start button (system_taskbar.obj's taskbar hiding looks it up): the matrix never looks into the real taskbar
-#include "../src/taskbar_start.h"
-namespace taskbarstart { void Remember(HWND){} }
-// app clicks through the taskbar's own buttons (apps_press.obj, taskbar_apps.h): the matrix never presses the real
-// taskbar - no press can be started, so every click goes the dock's own way
-#include "../src/taskbar_apps.h"
-namespace taskbarapps {
-bool Begin(const Job&){return false;}
-bool Take(uint32_t,Result&){return false;}
-const wchar_t* OutcomeText(Outcome){return L"";}
-}
-#define ShellExecuteW MatrixShellExecute
-#define SHFileOperationW MatrixFileOperation
-#define SHEmptyRecycleBinW MatrixEmptyRecycleBin
-#define GetMonitorInfoW MatrixMonitorInfo
-#define GetForegroundWindow MatrixForeground
-#define MonitorFromWindow MatrixMonitorFromWindow
-#define GetWindowRect MatrixWindowRect
-#define IsZoomed MatrixIsZoomed
-#define GetWindowLongPtrW MatrixWindowLong
-#define GetWindowInfo MatrixWindowInfo
-#define GetClassNameW MatrixClassName
-#define ShowWindow MatrixShowWindow
-#define GetAsyncKeyState MatrixKeyState
-#define SetForegroundWindow MatrixForegroundSet
-#define TrackPopupMenu MatrixPopupMenu
-#define ToggleDesktop MatrixToggleDesktop
+// the taskbar's Start button and app buttons, and the shell's app bars (no real app bar is registered)
+#include "dock_fixture_taskbar.h"
+#include "dock_fixture_appbar.h"
+// the Dock's parts under the fixture's fakes, and this test's two more (the z-order over a dock)
 #define GetWindow MatrixGetWindow
 #define SetWindowPos MatrixSetWindowPos
-#include "../src/dock.cpp"
-#include "../src/dock_window.cpp"
-#include "../src/dock_input.cpp"
-#include "../src/dock_layout.cpp"
-#include "../src/dock_render.cpp"
-#include "../src/dock_sensors.cpp"
-#include "../src/dock_controls.cpp"
-#include "../src/dock_notify.cpp"
-#undef GetMonitorInfoW
-#undef GetForegroundWindow
-#undef MonitorFromWindow
-#undef GetWindowRect
-#undef IsZoomed
-#undef GetWindowLongPtrW
-#undef GetWindowInfo
-#undef GetClassNameW
-#undef ShowWindow
-#undef GetAsyncKeyState
-#undef SetForegroundWindow
-#undef TrackPopupMenu
-#undef ToggleDesktop
+#include "dock_fixture_parts.h"
 #undef GetWindow
 #undef SetWindowPos
 
@@ -364,7 +292,7 @@ static void StateTests(Dock& d) {
   if(d.reveal.target!=1)report<<"DETAIL\t"<<caseLabel<<"\ticon="<<index<<" cursorU="<<d.cursorU<<" cursorV="<<d.cursorV<<" bar="<<d.barU0<<","<<d.barU1<<" reveal="<<d.reveal.x<<"\n";
  }
  // The sensor popup must be reachable and contained in the target monitor in every orientation.
- ResetHidden(d);d.reveal.snap(1);d.hideOff=0;d.Layout(simTime);d.ComputePanelRect();
+ ResetHidden(d);d.reveal.snap(1);d.hideOff=0;d.Layout();d.ComputePanelRect();
  auto sensor=d.ScreenPointUV((d.cells[Dock::HitSensor].u0+d.cells[Dock::HitSensor].u1)/2,d.margin+d.barThick/2);
  Advance(d,sensor,0.9);Check(d.panelAlpha.x>0.95f,"sensor hover opens panel");
  Check(d.panelRect.left>=0 && d.panelRect.top>=0 && d.panelRect.right<=d.winW && d.panelRect.bottom<=d.winH,"sensor panel remains inside monitor window");
@@ -578,7 +506,7 @@ static void SideExitTests(Dock& d) {
    if(side)drift=std::max({drift,std::fabs(d.cells[Dock::HitClock].u0-clock),std::fabs(d.sepU-sep)});
   };
   for(int f=1;f<=24;++f){POINT p{icon.x+(beside.x-icon.x)*f/24,icon.y+(beside.y-icon.y)*f/24};Advance(d,p,1.f/120);track();}
-  for(int f=0;f<96;++f){Advance(d,beside,1.f/120);track();if(side)onClock&=d.hoverKind==Dock::HitClock;}
+  for(int f=0;f<96;++f){Advance(d,beside,1.f/120);track();if(side)onClock&=d.hover.kind==Dock::HitClock;}
   bool rest=true;for(auto& s:d.slots)rest&=s.size<=d.base+0.01f;
   Check(d.magAmount.target==0 && rest,"side exit: beside the apps every icon is back to its size");
   Check(drift<=0.1f,"side exit: the end of the dock beside the pointer stays put while the apps shrink");
@@ -614,15 +542,15 @@ static void PinnedLayoutTests(Dock& d) {
  const float step=12*d.scale,room=4*d.scale+1;
  for(float lead:{0.f,std::ceil(200*d.scale/step)*step+d.gap})for(int side:{-1,1}){
   d.widgetWidth.snap(lead);d.pinSide=0;d.pinBlend.snap(0);
-  d.magAmount.snap(0);d.Layout(0);
+  d.magAmount.snap(0);d.Layout();
   const float c0=d.barU0,c1=d.barU1;const size_t k=d.slots.size()/2;const float rest=d.slots[k].u;   // at rest, centred
-  d.magAmount.snap(1);d.hoverU=side<0?d.slots.front().u:d.slots.back().u;d.Layout(0);
+  d.magAmount.snap(1);d.hoverU=side<0?d.slots.front().u:d.slots.back().u;d.Layout();
   if(d.barU0<room||d.barU1>d.len-room)continue;   // no room to magnify with the slot open: the screen's end decides there
   const float u0=d.barU0,u1=d.barU1,w0=d.widgetU0,w1=d.widgetU1,a0=d.appsU0,sep=d.sepU,clock=d.cells[Dock::HitClock].u0;
   d.pinSide=side;d.pinU=side>0?u1:u0;d.pinBlend.snap(1);
   float worst=0;
   for(int i=20;i>=0;--i){
-   d.magAmount.snap(i/20.f);d.Layout(0);
+   d.magAmount.snap(i/20.f);d.Layout();
    worst=std::max(worst,side<0?std::max({std::fabs(d.barU0-u0),std::fabs(d.widgetU0-w0),std::fabs(d.widgetU1-w1),std::fabs(d.appsU0-a0)})
                               :std::max({std::fabs(d.barU1-u1),std::fabs(d.sepU-sep),std::fabs(d.cells[Dock::HitClock].u0-clock)}));
   }
@@ -630,19 +558,19 @@ static void PinnedLayoutTests(Dock& d) {
                            :"end held: the separator, the clock and the bar's end stay put at every magnification");
   bool atRest=true;for(auto& s:d.slots)atRest&=std::fabs(s.size-d.base)<0.01f;
   Check(atRest && std::fabs(side<0?d.barU1-(u0+c1-c0):d.barU0-(u1-(c1-c0)))<=0.05f,"held, not magnified: every icon at its size and the dock as long as at rest");
-  d.pinBlend.snap(0.5f);d.Layout(0);
+  d.pinBlend.snap(0.5f);d.Layout();
   Check(std::fabs(d.barU0-(c0+(side<0?u0:u1-(c1-c0)))*0.5f)<=0.05f,"easing back: halfway between held and centred");
-  d.pinBlend.snap(1);d.magAmount.snap(0.5f);d.Layout(0);   // pinOff: how far off centre this magnification is held
-  d.hoverU=rest+d.pinOff;d.Layout(0);
+  d.pinBlend.snap(1);d.magAmount.snap(0.5f);d.Layout();   // pinOff: how far off centre this magnification is held
+  d.hoverU=rest+d.pinOff;d.Layout();
   Check(std::fabs(d.pinOff)>d.base*(d.mag-1)*0.2f && d.slots[k].size>d.slots[k-1].size && std::fabs(d.slots[k-1].size-d.slots[k+1].size)<=d.base*(d.mag-1)*0.1f,
         "held off centre: the icon under the pointer is the one enlarged, its neighbours alike");
-  d.pinSide=0;d.magAmount.snap(0.4f);d.Layout(0);
-  d.pinSide=side;d.pinU=side>0?d.barU1:d.barU0;d.pinBlend.snap(1);d.magAmount.snap(1);d.Layout(0);
+  d.pinSide=0;d.magAmount.snap(0.4f);d.Layout();
+  d.pinSide=side;d.pinU=side>0?d.barU1:d.barU0;d.pinBlend.snap(1);d.magAmount.snap(1);d.Layout();
   Check(std::fabs(d.barU0-u0)<=0.05f && std::fabs(d.barU1-u1)<=0.05f,"growing again past an end held at part size: the centred dock, not pushed past its place");
-  d.pinSide=0;d.pinBlend.snap(0);d.magAmount.snap(0);d.Layout(0);
+  d.pinSide=0;d.pinBlend.snap(0);d.magAmount.snap(0);d.Layout();
   Check(std::fabs(d.barU0-c0)<=0.05f && std::fabs(d.barU1-c1)<=0.05f,"let go: the dock is centred as at rest");
  }
- d.widgetWidth.snap(0);d.pinSide=0;d.pinBlend.snap(0);d.magAmount.snap(0);d.hoverU=0;d.Layout(0);
+ d.widgetWidth.snap(0);d.pinSide=0;d.pinBlend.snap(0);d.magAmount.snap(0);d.hoverU=0;d.Layout();
 }
 
 // The dock gets shorter while an end is held (mod.28 review): an app closes its last window with the pointer on the
@@ -725,12 +653,12 @@ static void OptionsTests(Dock& d) {
  if(HasButton(ButtonId::Desktop)){
   auto br=d.ButtonRect(ButtonId::Desktop);POINT p={d.winX+(LONG)((br.left+br.right)*0.5f),d.winY+(LONG)((br.top+br.bottom)*0.5f)};
   Advance(d,p,0.8);
-  Check(d.hoverKind==Dock::HitButton && d.hoverButton==ButtonId::Desktop && d.reveal.target==1,"desktop button stays reachable with dock visible");
+  Check(d.hover.kind==Dock::HitButton && d.hover.button==ButtonId::Desktop && d.reveal.target==1,"desktop button stays reachable with dock visible");
   Check(d.panelAlpha.target==0,"desktop hover does not open sensor panel");
  }
  auto sr=d.ButtonRect(ButtonId::Settings);POINT settingsPoint={d.winX+(LONG)((sr.left+sr.right)*0.5f),d.winY+(LONG)((sr.top+sr.bottom)*0.5f)};
  Advance(d,settingsPoint,0.8);
- Check(d.hoverButton==ButtonId::Settings && d.reveal.target==1,"gear remains reachable after leaving magnified apps");
+ Check(d.hover.button==ButtonId::Settings && d.reveal.target==1,"gear remains reachable after leaving magnified apps");
  Check(d.panelAlpha.target==0,"settings hover does not open the sensor panel");
  int windowsBefore=settingsWindows,menuBefore=settingsMenus,desktopBefore=desktopActions;
  d.Click(Dock::ButtonHit(ButtonId::Settings)); // popup display is intercepted; no real menu or focus changes
@@ -739,7 +667,7 @@ static void OptionsTests(Dock& d) {
   auto r=d.ButtonRect(id);
   POINT p={d.winX+(LONG)((r.left+r.right)*0.5f),d.winY+(LONG)((r.top+r.bottom)*0.5f)};
   Advance(d,p,0.8);
-  Check(d.hoverButton==id && d.reveal.target==1,"connectivity hover selects its own tooltip and keeps dock visible");
+  Check(d.hover.button==id && d.reveal.target==1,"connectivity hover selects its own tooltip and keeps dock visible");
   Check(!d.tooltipText.empty() && d.tooltipAlpha.target==1,"connectivity tooltip remains available in paired row");
  }
  ResetHidden(d);
@@ -1022,7 +950,7 @@ int wmain(int argc,wchar_t** argv) {
   g_settings.trayButtons=x.buttons?"desktop,theme,oled,awake,screenshot,quiet,trash,downloads,audio,sff":"";
   Apps(x.apps);Dock d(monitor.handle,cases,monitor.primary);InitializeLayout(d);
   // let the fit settle as it would after a few frames on screen
-  for(int i=0;i<60;++i){d.ApplyFit(1.f/60.f);d.Layout(0);}
+  for(int i=0;i<60;++i){d.ApplyFit(1.f/60.f);d.Layout();}
   Check(d.barU0>=-1 && d.barU1<=d.len+1,"extreme settings still fit the monitor edge");
   StateTests(d);OptionsTests(d);SweepTests(d);SideExitTests(d);
   if(monitor.actual)ReachabilityTests(d);
@@ -1048,7 +976,7 @@ int wmain(int argc,wchar_t** argv) {
   g_settings.dockThickness=sh.thick==150?75:150;g_settings.edgeGap=40-sh.gap;g_settings.edgeOffset=-sh.offset;
   Check(d.Relayout(),"thickness, gap and offset change without recreating the window");
   Check(d.winX==wx&&d.winY==wy&&d.winW==ww&&d.winH==wh,"relayout keeps the window rectangle");
-  d.Layout(0);
+  d.Layout();
   Check((g_settings.dockThickness>sh.thick)==(d.barThick>before),"thicker setting gives a thicker glass");
   Check(d.margin+d.barThick<=d.T,"glass stays inside the window after a live change");
   StateTests(d);OptionsTests(d);SweepTests(d);SideExitTests(d);
@@ -1198,7 +1126,7 @@ int wmain(int argc,wchar_t** argv) {
   battery::State st;st.present=true;st.percent=crowded?15:64;st.charging=st.plugged=!crowded;
   g_sys.SetBattery(st);
   Apps(crowded?40:8);Dock d(monitor.handle,cases,monitor.primary);InitializeLayout(d);
-  for(int i=0;i<60;++i){d.ApplyFit(1.f/60.f);d.Layout(0);}
+  for(int i=0;i<60;++i){d.ApplyFit(1.f/60.f);d.Layout();}
   const auto metrics=d.MeasureMetrics(d.fit);
   const auto& cell=d.cells[Dock::HitBattery];
   Check(cell.u1-cell.u0>=BatteryIconWidth(metrics.icon,d.scale)*0.99f || IsVertical(g_settings.edge),"battery cell is as wide as its icon");
@@ -1207,7 +1135,7 @@ int wmain(int argc,wchar_t** argv) {
   Check(d.barU0>=-1 && d.barU1<=d.len+1,"the battery cell keeps the dock on the monitor");
   ResetHidden(d);Advance(d,EdgePoint(d.mon,g_settings.edge,0.5f,0),0.8);AssertHitGeometry(d);
   auto p=d.ScreenPointUV((cell.u0+cell.u1)/2,d.margin+d.barThick/2);Advance(d,p,1.0);
-  Check(d.hoverKind==Dock::HitBattery && d.reveal.target==1,"the battery cell is hovered and keeps the dock out");
+  Check(d.hover.kind==Dock::HitBattery && d.reveal.target==1,"the battery cell is hovered and keeps the dock out");
   Check(d.panelAlpha.target==0,"battery hover does not open the sensor panel");
   g_sys.SetBattery({});Advance(d,p,0.5);
   Check(d.cells[Dock::HitBattery].u1<=d.cells[Dock::HitBattery].u0+0.01f,"no battery: the cell takes no space");
@@ -1249,7 +1177,7 @@ int wmain(int argc,wchar_t** argv) {
   g_settings=Settings{};g_settings.edge=(Edge)edge;g_settings.trayButtons=lists[li];
   if(crowded){g_settings.iconSize=54;g_settings.magnification=2.1f;}
   Apps(crowded?40:8);Dock d(monitor.handle,cases,monitor.primary);InitializeLayout(d);
-  for(int i=0;i<60;++i){d.ApplyFit(1.f/60.f);d.Layout(0);}
+  for(int i=0;i<60;++i){d.ApplyFit(1.f/60.f);d.Layout();}
   Check(d.barU0>=-1 && d.barU1<=d.len+1,"any button list keeps the dock on the monitor");
   OptionsTests(d);SweepTests(d);
   // a list change applies in place

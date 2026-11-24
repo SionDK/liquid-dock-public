@@ -8,6 +8,7 @@
 // patterns), what the dock's own lookup finds, and every button with an "Appid:" (the app buttons).
 //   cl /std:c++20 /EHsc /utf-8 /DUNICODE /D_UNICODE tests\taskbar_probe.cpp /link user32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib shell32.lib
 #include "../src/taskbar_start.cpp"
+#include "../src/app_visibility.h"
 #include <shellapi.h>
 #include <cstdarg>
 #include <cstdio>
@@ -33,21 +34,12 @@ void Log(const wchar_t* fmt, ...) {
     va_end(ap);
     Out(L"  (dock's log line: %ls)", buf);
 }
-double NowSeconds() {
-    static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return double(t.QuadPart) / double(f.QuadPart);
-}
+#define TEST_SUPPORT_QPC_NOW
+#include "test_support.h"
 
 namespace {
 
-// IAppVisibility (shobjidl_core.h), as src/start_menu.cpp declares it
-const CLSID kAppVisibility = { 0x7e5fe3d9, 0x985f, 0x4908, { 0x91, 0xf9, 0xee, 0x19, 0xf9, 0xfd, 0x15, 0x14 } };
-const IID kAppVisibilityIid = { 0x2246ea2d, 0xcaea, 0x4444, { 0xa3, 0xc4, 0x6d, 0xe8, 0x27, 0xe4, 0x43, 0x13 } };
-struct IVisibility : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE GetAppVisibilityOnMonitor(HMONITOR, int*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE IsLauncherVisible(BOOL* visible) = 0;
-};
+using IVisibility = IAppVisibilityDecl;   // IAppVisibility, the dock's own declaration (src/app_visibility.h)
 
 constexpr int kMaxDepth = 12;
 constexpr int kMaxNodes = 400;

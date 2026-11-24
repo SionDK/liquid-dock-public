@@ -30,12 +30,6 @@ static bool shown = false, failDwm = false;
 static int updates = 0, checks = 0, activations = 0, registrations = 0, sourceTouched = 0;
 static HWND foreground = (HWND)0x9090;
 static SHORT escapeState = 0;
-static WindowPreview* current = nullptr;
-static HWND captured = nullptr;
-static LONG_PTR WINAPI FakeUserData(HWND, int) { return reinterpret_cast<LONG_PTR>(current); }
-static HWND WINAPI FakeCapture(HWND h) { HWND old = captured; captured = h; return old; }
-static HWND WINAPI FakeCaptured() { return captured; }
-static BOOL WINAPI FakeRelease() { captured = nullptr; return TRUE; }
 static BOOL WINAPI FakeIsWindow(HWND h) { return sources.count(h) && sources[h].alive; }
 static BOOL WINAPI FakeVisible(HWND h) { return h == (HWND)0x8080 ? shown : FakeIsWindow(h); }
 // Showing, restoring or moving a source window would be the preview touching it.
@@ -43,7 +37,6 @@ static BOOL WINAPI FakeShow(HWND h, int cmd) { if (sources.count(h)) { ++sourceT
 static DWORD WINAPI FakePid(HWND h, LPDWORD pid) { if (pid) *pid = FakeIsWindow(h) ? sources[h].pid : 0; return 1; }
 static BOOL WINAPI FakeIconic(HWND h) { return sources[h].minimized; }
 static BOOL WINAPI FakeAffinity(HWND h, DWORD* value) { *value = sources[h].protectedContent ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE; return TRUE; }
-static HRESULT WINAPI FakeAttribute(HWND, DWORD, PVOID value, DWORD) { *static_cast<DWORD*>(value) = 0; return S_OK; }
 static HRESULT WINAPI FakeRegister(HWND, HWND h, HTHUMBNAIL* out) {
     if (failDwm) return E_FAIL;
     ++registrations; ++registeredFor[h]; *out = (HTHUMBNAIL)h; thumbnails.insert(*out); return S_OK;
@@ -75,43 +68,17 @@ static BOOL WINAPI FakeWindowRect(HWND h, LPRECT r) {
     if (it == sources.end() || it->second.rectFails) return FALSE;
     *r = it->second.minimized ? it->second.minimizedRect : it->second.normalRect; return TRUE;
 }
-static int WINAPI FakeClassName(HWND, LPWSTR name, int count) { wcscpy_s(name, count, L"FixtureClass"); return 12; }
 static BOOL WINAPI FakePos(HWND h, HWND, int, int, int, int, UINT) { if (sources.count(h)) ++sourceTouched; return TRUE; }
 static int WINAPI FakeRegion(HWND, HRGN r, BOOL) { DeleteObject(r); return 1; }
 static BOOL WINAPI FakeInvalidate(HWND, const RECT*, BOOL) { return TRUE; }
-static int WINAPI FakeText(HWND, LPWSTR text, int count) { wcscpy_s(text, count, L"Fixture window"); return 14; }
 static HWND WINAPI FakeForeground() { return foreground; }
 static SHORT WINAPI FakeKey(int key) { return key == VK_ESCAPE ? escapeState : 0; }
-static BOOL WINAPI FakeDestroy(HWND) { return TRUE; }
 static void FakeLog(const wchar_t* fmt, ...) {
     wchar_t line[1024]; va_list ap; va_start(ap, fmt); vswprintf(line, 1024, fmt, ap); va_end(ap);
     logs.push_back(line);
 }
 
-#define IsWindow FakeIsWindow
-#define IsWindowVisible FakeVisible
-#define ShowWindow FakeShow
-#define GetWindowThreadProcessId FakePid
-#define IsIconic FakeIconic
-#define GetWindowDisplayAffinity FakeAffinity
-#define DwmGetWindowAttribute FakeAttribute
-#define DwmRegisterThumbnail FakeRegister
-#define DwmUnregisterThumbnail FakeUnregister
-#define DwmQueryThumbnailSourceSize FakeSize
-#define DwmUpdateThumbnailProperties FakeUpdate
-#define GetWindowRect FakeWindowRect
-#define GetClassNameW FakeClassName
-#define SetWindowPos FakePos
-#define SetWindowRgn FakeRegion
-#define InvalidateRect FakeInvalidate
-#define GetWindowTextW FakeText
-#define GetForegroundWindow FakeForeground
-#define GetAsyncKeyState FakeKey
-#define DestroyWindow FakeDestroy
-#define GetWindowLongPtrW FakeUserData
-#define SetCapture FakeCapture
-#define GetCapture FakeCaptured
-#define ReleaseCapture FakeRelease
+#include "preview_fakes.h"
 #define OpenIcon FakeTouch
 #define SetForegroundWindow FakeTouch
 #define BringWindowToTop FakeTouch
@@ -129,7 +96,8 @@ void AppModel::ActivateWindow(HWND) { ++activations; }
 static std::vector<HWND> asked;   // the windows the preview asked the AppModel to close
 void AppModel::AskToClose(HWND h, const std::wstring&) { asked.push_back(h); }
 static void Check(bool value, const char* message) {
-    ++checks; if (!value) { std::printf("FAIL: %s\n", message); std::exit(1); }
+    ++checks;
+    if (!value) { std::printf("FAIL: %s\n", message); std::printf("window_preview_test: FAILED (%d checks, 1 failure)\n", checks); std::exit(1); }
 }
 // Each block its own handles (base), so what the preview's log remembers of one block's windows
 // does not meet the next block's.
@@ -376,4 +344,5 @@ int main() {
     }
     Check(thumbnails.empty()&&activations==1,"fixtures route to fake activation and release all thumbnails");
     std::printf("PASS: %d preview checks, %d thumbnail updates\n",checks,updates);
+    std::printf("window_preview_test: ALL PASSED (%d checks, 0 failures)\n", checks);
 }

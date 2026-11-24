@@ -7,7 +7,6 @@ namespace {
 // ---------------------------------------------------------------- FluentFlyout's settings
 // %APPDATA%\FluentFlyout\settings.xml (fluent_settings.h). The Microsoft Store version keeps it in its
 // package's private copy of AppData. Read again whenever the file changes.
-FfSettings ParseSettings(const std::wstring& xml) { return fluentsettings::Parse(xml); }
 
 bool ReadUtf8File(const std::wstring& path, std::wstring& out) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -62,19 +61,18 @@ std::vector<std::wstring> SettingsFiles() {
 
 FfSettings g_ff;
 int g_ffVersion = 0;
+int g_fileSetting = -1;                     // its widget monitor setting (0-based), -1 until read
+double g_fileAt = -1;                       // when that value was read as new
+bool g_choiceDirty = true;                  // the setting or the monitors changed: work the monitor out again
+
+namespace {
+
 std::wstring g_ffPath;
 FILETIME g_ffTime{};
 double g_nextSettingsCheck = 0;
 double g_ffMissingSince = -1;               // FluentFlyout replaces the file when saving: a moment without it
 std::vector<std::wstring> g_settingsFiles;  // where it may be (the Store version's folder name is looked up)
 double g_settingsFilesAt = -1;
-int g_fileSetting = -1;                     // its widget monitor setting (0-based), -1 until read
-double g_fileAt = -1;                       // when that value was read as new
-bool g_choiceDirty = true;                  // the setting or the monitors changed: work the monitor out again
-int g_fileMonitor = -1;                     // g_fileSetting as a position among the monitors (UpdateMonitor)
-std::atomic<bool> g_namesWanted{ false };   // found, its app filter on: the media sessions' apps are named (PublishSessions)
-
-namespace {
 
 // The places its settings file may be, looked up again every 30 s (and right away while none exists):
 // enumerating the Packages folder on every check is not needed.
@@ -113,7 +111,7 @@ void LoadSettings(double now, bool force) {
     if (best == g_ffPath && CompareFileTime(&bestTime, &g_ffTime) == 0) return;
     std::wstring xml;
     if (!ReadUtf8File(best, xml)) return;   // being replaced right now: next time
-    FfSettings s = ParseSettings(xml);
+    FfSettings s = fluentsettings::Parse(xml);
     if (!s.loaded) return;
     g_ffPath = best; g_ffTime = bestTime;
     if (s.widgetMonitor != g_fileSetting) { g_fileSetting = s.widgetMonitor; g_fileAt = now; g_choiceDirty = true; }

@@ -200,7 +200,7 @@
       "context": [
         { "cmd": ["{python}", "tools/llm-tasks/checks/check_log_guide.py", "--list"], "title": "the messages to explain (from src/fluent_*.cpp and src/tray_host*.cpp, with the code just before each)", "lang": "text" },
         { "file": "src/fluent_flyout.cpp", "from": "// Where FluentFlyout's widget window is, for the log.", "to": "// Where its widget window is.", "title": "src/fluent_flyout.cpp (the texts that fill \"widget window is in …\" and the monitor in other messages)" },
-        { "file": "README.md", "from": "## 트레이 아이콘", "to": "## CPU 온도", "title": "README.md (the tray icon and FluentFlyout sections)" }
+        { "file": "docs/modifications.md", "from": "## 트레이 아이콘", "to": "## CPU 온도", "title": "docs/modifications.md (the tray icon, FluentFlyout and admin-app sections)" }
       ],
       "verify": {
         "kind": "script",

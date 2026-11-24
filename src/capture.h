@@ -14,7 +14,6 @@ public:
     static bool UseGdi();   // Windows 10: no borderless capture -> GDI fallback (dock region only)
     // Copies the newest frame's region (monitor-relative) into dst at (0,0). Returns true when a new frame arrived.
     bool Poll(ID3D11Texture2D* dst, int srcX, int srcY, int w, int h, ID3D11Texture2D* fullDst = nullptr);
-    double startedAt = 0;
     bool gotFirstFrame = false;
 
     static void RequestBorderlessAccess();   // call once at startup

@@ -17,10 +17,9 @@ NotifyBitmap* BitmapFor(uint64_t key, uint32_t imageVersion) {
     uint32_t ver = 0; int w = 0, h = 0;
     std::vector<uint32_t> px;
     if (!trayhost::Image(key, ver, w, h, px) || w <= 0 || h <= 0) return nullptr;
-    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    ComPtr<ID2D1Bitmap1> b;
-    if (FAILED(g_gfx.dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, bp, &b))) return nullptr;
+    HRESULT hr = S_OK;
+    ComPtr<ID2D1Bitmap1> b = BitmapFromPixels(g_gfx.dc, px, w, h, &hr);
+    if (FAILED(hr)) return nullptr;
     auto& e = g_notifyBitmaps[key];
     e.bmp = b; e.imageVersion = ver; e.w = w; e.h = h; e.tint.Reset();
     return &e;
@@ -51,7 +50,7 @@ void Dock::SyncNotifyIcons(double now) {
     nextNotifySync = now + 0.5;
     notifyVersion = v;
     auto views = g_settings.trayIcons ? trayhost::Shown() : std::vector<trayhost::IconView>{};
-    uint64_t hovered = NotifyKey(hoverNotify);
+    uint64_t hovered = NotifyKey(hover.notify);
     std::vector<NotifyCell> fresh;
     fresh.reserve(views.size());
     for (auto& iv : views) {
@@ -60,8 +59,8 @@ void Dock::SyncNotifyIcons(double now) {
         fresh.push_back(std::move(c));
     }
     notifyCells = std::move(fresh);
-    hoverNotify = -1;
-    for (int i = 0; i < (int)notifyCells.size(); ++i) if (notifyCells[i].key == hovered) hoverNotify = i;
+    hover.notify = -1;
+    for (int i = 0; i < (int)notifyCells.size(); ++i) if (notifyCells[i].key == hovered) hover.notify = i;
     for (auto it = g_notifyBitmaps.begin(); it != g_notifyBitmaps.end();) {   // pictures of icons that are gone
         bool used = std::any_of(views.begin(), views.end(), [&](const trayhost::IconView& iv) { return iv.key == it->first; });
         it = used ? std::next(it) : g_notifyBitmaps.erase(it);
@@ -89,17 +88,13 @@ D2D1_RECT_F Dock::NotifyRect(int i) const {
     if (i < 0 || i >= (int)notifyCells.size()) return {};
     const auto& c = notifyCells[i];
     if (c.u1 <= c.u0) return {};
-    auto r = RectUV(c.u0, c.u1, margin - hideOff, margin + barThick - hideOff);
-    if (c.half >= 0) {   // as the small buttons: the first one left (side docks) or on top
-        if (IsVertical(g_settings.edge)) { float mid = (r.left + r.right) * 0.5f; (c.half ? r.left : r.right) = mid; }
-        else { float mid = (r.top + r.bottom) * 0.5f; (c.half ? r.top : r.bottom) = mid; }
-    }
+    auto r = RectUV(c.u0, c.u1, BarV0(), BarV1());
+    SplitHalf(r, c.half);   // as the small buttons: the first one left (side docks) or on top
     return r;
 }
 
 RECT Dock::NotifyScreenRect(int i) const {
-    auto r = NotifyRect(i);
-    return { winX + (LONG)std::floor(r.left), winY + (LONG)std::floor(r.top), winX + (LONG)std::ceil(r.right), winY + (LONG)std::ceil(r.bottom) };
+    return ScreenRectOut(NotifyRect(i));
 }
 
 void Dock::DrawNotifyIcons(float vis) {
@@ -117,7 +112,7 @@ void Dock::DrawNotifyIcons(float vis) {
         if (c.glyph) {   // a white or black glyph made for the taskbar's theme: drawn in the dock's ink, like its own icons
             if (!b->tint && SUCCEEDED(dc->CreateEffect(CLSID_D2D1ColorMatrix, &b->tint))) b->tint->SetInput(0, b->bmp.Get());
             if (b->tint) {
-                auto ink = Ink((c.u0 + c.u1) * 0.5f, vis);
+                auto ink = Ink(c.Mid(), vis);
                 D2D1_MATRIX_5X4_F mtx = { 0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, ink.a,  ink.r, ink.g, ink.b, 0 };
                 b->tint->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, mtx);
                 dc->SetTransform(D2D1::Matrix3x2F::Scale(sw / b->w, sh / b->h) * D2D1::Matrix3x2F::Translation(x, y));
@@ -133,13 +128,13 @@ void Dock::DrawNotifyIcons(float vis) {
 // Like Explorer: the program hears the pointer move over its icon right away, and after a moment that
 // it may open its own pop-up (version 4 programs) - and that it can close it when the pointer leaves.
 void Dock::NotifyHover(double now, POINT cursor) {
-    uint64_t key = hoverKind == HitNotify ? NotifyKey(hoverNotify) : 0;
+    uint64_t key = hover.kind == HitNotify ? NotifyKey(hover.notify) : 0;
     if (key != notifyHoverKey) {
         if (notifyHoverKey && notifyEntered) trayhost::Send(notifyHoverKey, trayhost::Mouse::Leave, cursor, notifyHoverAnchor);
         notifyHoverKey = key; notifyHoverSince = now; notifyEntered = false; nextNotifyMove = 0;
     }
     if (!key) return;
-    notifyHoverAnchor = NotifyScreenRect(hoverNotify);
+    notifyHoverAnchor = NotifyScreenRect(hover.notify);
     if (now >= nextNotifyMove && (nextNotifyMove == 0 || cursor.x != lastNotifyCursor.x || cursor.y != lastNotifyCursor.y)) {
         trayhost::Send(key, trayhost::Mouse::Move, cursor, notifyHoverAnchor);
         nextNotifyMove = now + 0.05; lastNotifyCursor = cursor;

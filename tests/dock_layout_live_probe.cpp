@@ -22,7 +22,6 @@
 
 Settings g_settings;
 HWND g_mainWnd = nullptr;
-bool RevealHotkeyFailed() { return false; }
 
 namespace {
 struct Mon { HMONITOR h; RECT rect, work; };

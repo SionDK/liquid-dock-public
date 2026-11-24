@@ -1,7 +1,7 @@
 // Interactive native-flyout integration test. Requires the current installed
 // dock to have already protected both taskbars. Never starts from a bare desktop.
 #include "../src/native_tray.h"
-#include "../src/system.h"
+#include "../src/native_taskbar.h"
 #include "../src/taskbar_visibility.h"
 #include <shellapi.h>
 #include <thread>

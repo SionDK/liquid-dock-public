@@ -8,7 +8,7 @@
 // when it went down - and the dock used to "minimize" it again: the first click did nothing, the next
 // one (once something else was active) brought it up.
 //
-// A program slow to answer (Claude's window, seen on 2026-10-26: still minimized 0.45 s after the
+// A program slow to answer (seen on a test PC, 2026-10-26: still minimized 0.45 s after the
 // click) gets clicked again before its window comes. Those clicks bring the same window up again: they
 // never minimize it - the one right after it came would - and never start over the dock's wait for it
 // (each click used to restart the 0.45 s before the second try, so it never came while the user kept

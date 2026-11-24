@@ -73,5 +73,25 @@ struct RestoreRetry {
     bool restored = false;     // the last try put every taskbar back
     bool Due(bool hidden, double now) const { return (hidden || !restored) && now >= next; }
     void Tried(bool ok) { restored = ok; }
+    // The main loop's pass while no dock replaces the taskbar: restore() (NativeTaskbar::Restore) when a try is due, the
+    // next not before a second later. Whether it tried.
+    template <class Fn> bool TryWhenDue(bool hidden, double now, Fn&& restore) {
+        if (!Due(hidden, now)) return false;
+        Tried(restore());
+        next = now + 1.0;
+        return true;
+    }
 };
+
+// NativeTaskbar::StartEnforcer's pass (elapsed: seconds since it started): how long it sleeps first, and whether it
+// asks about auto-hide whatever else - in the first minute every 250 ms and every time, later every second and on
+// every fifth pass. A recheck asked for (RecheckSoon) is the enforcer's to take after the sleep, when not asked anyway.
+struct EnforcerPass {
+    DWORD sleepMs;
+    bool alwaysAsk;
+};
+inline EnforcerPass EnforcerPlan(double elapsed, int pass) {
+    const bool early = elapsed < 60;
+    return { early ? 250u : 1000u, early || pass % 5 == 0 };
+}
 }

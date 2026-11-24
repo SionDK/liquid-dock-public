@@ -146,7 +146,6 @@ struct FakeNvmlField {
     int valueType, nvmlReturn;
     union { double d; unsigned ui; unsigned long long ull; } value;
 };
-int FakeNvmlInit() { return 0; }
 int FakeNvmlHandle(unsigned, void** dev) { *dev = &g_nvml; return 0; }
 int FakeNvmlName(void*, char* name, unsigned size) { strcpy_s(name, size, "NVIDIA GeForce RTX 4060 Ti"); return 0; }
 int FakeNvmlTemp(void*, int, unsigned* t) { *t = 30; return 0; }
@@ -160,13 +159,24 @@ int FakeNvmlFields(void*, int count, FakeNvmlField* f) {
     f->value.ui = g_nvmlMemTemp;
     return 0;                                       // the call itself succeeds, as on the real card
 }
+// the power calls (the panel's power draw, hw::NvmlPower): mW; a driver may lack either (g_nvmlPowerCalls)
+bool g_nvmlPowerCalls = true, g_nvmlLimitCall = true;
+unsigned g_nvmlPowerMw = 287000, g_nvmlLimitMw = 360000;   // an RTX 5080 class card: 287 of 360 W
+int g_nvmlPowerRc = 0;
+int g_nvmlPowerAsks = 0, g_nvmlLimitAsks = 0, g_nvmlInits = 0, g_nvmlLoads = 0;
+int FakeNvmlPower(void*, unsigned* mw) { ++g_nvmlPowerAsks; if (g_nvmlPowerRc) return g_nvmlPowerRc; *mw = g_nvmlPowerMw; return 0; }
+int FakeNvmlLimit(void*, unsigned* mw) { ++g_nvmlLimitAsks; *mw = g_nvmlLimitMw; return 0; }
+int FakeNvmlInitCounted() { ++g_nvmlInits; return 0; }
 HMODULE WINAPI FakeLoadLibraryExW(LPCWSTR name, HANDLE, DWORD) {
+    if (g_nvml && wcsstr(name, L"nvml.dll")) ++g_nvmlLoads;
     return g_nvml && wcsstr(name, L"nvml.dll") ? (HMODULE)&g_nvml : nullptr;
 }
 FARPROC WINAPI FakeGetProcAddress(HMODULE lib, LPCSTR name) {
     if (lib != (HMODULE)&g_nvml) return nullptr;
     const std::string n = name;
-    if (n == "nvmlInit_v2") return (FARPROC)FakeNvmlInit;
+    if (n == "nvmlInit_v2") return (FARPROC)FakeNvmlInitCounted;
+    if (n == "nvmlDeviceGetPowerUsage") return g_nvmlPowerCalls ? (FARPROC)FakeNvmlPower : nullptr;
+    if (n == "nvmlDeviceGetEnforcedPowerLimit") return g_nvmlLimitCall ? (FARPROC)FakeNvmlLimit : nullptr;
     if (n == "nvmlDeviceGetHandleByIndex_v2") return (FARPROC)FakeNvmlHandle;
     if (n == "nvmlDeviceGetName") return (FARPROC)FakeNvmlName;
     if (n == "nvmlDeviceGetTemperature") return (FARPROC)FakeNvmlTemp;
@@ -257,14 +267,20 @@ struct FakeGpu {
     bool hasTemp = false, hasUsed = false, hasUsage = false;
     float celsius = 0, usedMB = 0, usagePct = 0;
 };
-struct FakeReading { bool running = false, cpuFound = false; float cpuCelsius = 0; std::vector<FakeDimm> dimms; std::vector<FakeGpu> gpus; };
+struct FakeReading {
+    bool running = false, cpuFound = false; float cpuCelsius = 0; std::vector<FakeDimm> dimms; std::vector<FakeGpu> gpus;
+    bool cpuPowerFound = false; float cpuPowerW = 0;
+};
+// the CPU's package power (asked for: Read(..., true)) - reported while cpuPower is set (NAN: not ticked in HWiNFO)
 struct FakeHWiNFO {
-    int reads = 0, dimmReads = 0;
+    int reads = 0, dimmReads = 0, powerReads = 0;
+    float cpuPower = NAN;
     std::vector<FakeGpu> gpus;
-    FakeReading Read(bool wantDimms) {
-        ++reads; dimmReads += wantDimms ? 1 : 0;
+    FakeReading Read(bool wantDimms, bool wantPower = false) {
+        ++reads; dimmReads += wantDimms ? 1 : 0; powerReads += wantPower ? 1 : 0;
         FakeReading r;
         r.running = r.cpuFound = true; r.cpuCelsius = 48.6f;
+        if (wantPower && !std::isnan(cpuPower)) { r.cpuPowerFound = true; r.cpuPowerW = cpuPower; }
         if (wantDimms) r.dimms = { { 1, L"P0 CHANNEL A/DIMM 1", 35.8f }, { 3, L"P0 CHANNEL B/DIMM 1", 36.0f } };
         if (wantDimms) r.gpus = gpus;
         return r;
@@ -511,6 +527,155 @@ void VramPasses() {
     }
 }
 
+// The panel's power draw as the sensor thread reads it (hw::SensorThread::WantPower, SamplePower): 없음 reads
+// nothing new (not even NVML's power calls looked up), 그래프 every pass into a 60 s history placed by time (2 s
+// apart closed, 1 s open), 요약 only while a panel is open; a device switched off, or the view leaving 그래프,
+// drops what it held; the GPU's top is NVML's enforced limit (read every 30 s and when a panel opens), the CPU's
+// the steady auto scale; no NVML power call, or no NVML, gives no GPU power and nothing breaks.
+void PowerPasses() {
+    using namespace sensorlogic;
+    g_disks.clear(); g_disks[0].product = "SAMSUNG MZVL21T0HCLR-00B00";
+    g_volumes.clear(); g_volumes[L'C'].disk = 0;
+    ULONGLONG now = 20000000;
+    LDSensorBlock b = {};
+    sensorlogic::PanelData p;
+    sensorlogic::PowerData pw;
+    int published = 0;
+    auto pass = [&](auto& t, bool open) {
+        b = {}; Advance(1.0);
+        t.SampleCell(open, now, b);
+        const bool got = t.SamplePower(open, now, pw);
+        published += got ? 1 : 0;
+        t.SamplePanel(open, now, p);
+        now += t.WaitMs(open);
+        return got;
+    };
+    g_nvml = true; g_nvmlPowerCalls = g_nvmlLimitCall = true; g_nvmlPowerRc = 0; g_nvmlPowerMw = 287000; g_nvmlLimitMw = 360000;
+    g_nvmlPowerAsks = g_nvmlLimitAsks = 0;
+    {
+        FakeHWiNFO hwi;
+        hwi.cpuPower = 71.2f;
+        hw::SensorThread<FakeHWiNFO> t(hwi);
+        t.Init(hw::VideoInfo{ true, 15.6f, L"NVIDIA GeForce RTX 5080" });
+        const int loads = g_nvmlLoads, inits = g_nvmlInits;
+
+        // 없음 (the default): a minute closed and 10 s open, nothing new read or published
+        t.Want(true, true);
+        t.WantPower(kPowerOff, false, false);
+        for (int i = 0; i < 30; ++i) pass(t, false);
+        for (int i = 0; i < 10; ++i) pass(t, true);
+        Check(published == 0 && hwi.powerReads == 0 && g_nvmlPowerAsks == 0 && g_nvmlLimitAsks == 0 && g_nvmlLoads == loads && g_nvmlInits == inits,
+              "없음: 40 passes (closed and open) - no HWiNFO power asked, NVML's power calls neither looked up nor asked, nothing published");
+        pass(t, false);   // closed again (the sampler's own linger is SensorClient's: here the next pass is closed)
+
+        // 그래프, both: every pass, closed (2 s apart) or open (1 s); one handle of its own on NVML, made once
+        t.WantPower(kPowerGraph, true, true);
+        published = 0;
+        const ULONGLONG start = now;
+        for (int i = 0; i < 30; ++i) pass(t, false);
+        Check(published == 30 && hwi.powerReads == 30 && g_nvmlPowerAsks == 30 && g_nvmlLoads == loads + 1 && g_nvmlInits == inits + 1,
+              "그래프: a minute closed - 30 passes, each with the CPU's (HWiNFO) and the GPU's (NVML) power; NVML loaded and initialised once more, once");
+        Check(pw.view == kPowerGraph && pw.cpu.read && Near(pw.cpu.watts, 71.2f) && pw.gpu.read && Near(pw.gpu.watts, 287.0f) && Near(pw.gpu.limitW, 360.0f),
+              "...CPU 71.2 W, GPU 287 W of its 360 W limit");
+        Check(g_nvmlLimitAsks == 2, "...the GPU's enforced limit read at the first pass and 30 s on (2 in a minute), not every pass");
+        Check(pw.atMs == now - 2000 && pw.cpu.history.size() == 30 && pw.cpu.history.back().ms == pw.atMs && pw.cpu.history.front().ms == start,
+              "...the history: the minute's 30 points 2 s apart by time, the newest at the pass's time");
+        Check(Near(pw.gpu.top, 360.0f) && Near(pw.cpu.top, 100.0f), "...the graph's tops: the GPU's limit (360 W), the CPU's auto scale (71.2 W with 20 % room, 85.4 -> 100 W)");
+        for (int i = 0; i < 20; ++i) pass(t, true);
+        size_t inWindow = 0;
+        for (const auto& pt : pw.cpu.history) inWindow += pt.ms + kPowerWindowMs >= pw.atMs ? 1 : 0;
+        Check(published == 50 && pw.cpu.history.size() >= 40 && inWindow == pw.cpu.history.size() - 1,
+              "...20 s open: a point every second, mixed with the 2 s ones before (placed by time), still only the last 60 s");
+        Check(g_nvmlLimitAsks == 3, "...the panel opening read the limit again (3), then not for 30 s");
+        hwi.cpuPower = 140.f;
+        pass(t, true);
+        Check(Near(pw.cpu.top, 200.0f), "a CPU peak of 140 W: the auto top rises at once (168 -> 200 W)");
+        hwi.cpuPower = 60.f;
+        for (int i = 0; i < 30; ++i) pass(t, true);
+        Check(Near(pw.cpu.top, 200.0f), "...30 s later the peak is still in the window: the top stays");
+        for (int i = 0; i < 35; ++i) pass(t, true);
+        Check(Near(pw.cpu.top, 100.0f), "...the peak left the 60 s window: down at once to 100 W (60 W steady keeps 35 % of room: 81 -> 100)");
+
+        // a CPU package power no longer reported (unticked in HWiNFO): unknown, no point added, the history moves on
+        hwi.cpuPower = NAN;
+        pass(t, true);
+        Check(pw.cpu.read && std::isnan(pw.cpu.watts) && pw.cpu.history.back().ms < pw.atMs && Near(pw.gpu.watts, 287.0f),
+              "the CPU's power unticked: read but unknown (the card's hint), no new point; the GPU's goes on");
+        hwi.cpuPower = 65.f;
+
+        // NVML does not answer for a pass: the GPU's unknown for it, its limit kept
+        g_nvmlPowerRc = 999;
+        pass(t, true);
+        Check(std::isnan(pw.gpu.watts) && Near(pw.gpu.limitW, 360.0f) && Near(pw.gpu.top, 360.0f), "a pass NVML does not answer: the GPU's unknown for it, the limit and the top kept");
+        g_nvmlPowerRc = 0;
+
+        // GPU 전력 off: its all dropped at once, NVML no longer asked; on again: the limit read at once
+        t.WantPower(kPowerGraph, true, false);
+        const int asks = g_nvmlPowerAsks, limits = g_nvmlLimitAsks;
+        Check(pass(t, true) && !pw.gpu.read && std::isnan(pw.gpu.watts) && pw.gpu.history.empty() && pw.gpu.top == 0 && std::isnan(pw.gpu.limitW) && pw.cpu.read,
+              "GPU 전력 off: the GPU's power, limit and history dropped, the CPU's kept");
+        for (int i = 0; i < 10; ++i) pass(t, true);
+        Check(g_nvmlPowerAsks == asks && g_nvmlLimitAsks == limits, "...and NVML not asked for 10 passes");
+        t.WantPower(kPowerGraph, true, true);
+        pass(t, true);
+        Check(g_nvmlLimitAsks == limits + 1 && Near(pw.gpu.limitW, 360.0f) && pw.gpu.history.size() == 1, "...on again: the limit read at its first pass, a new history");
+
+        // 요약: the histories go; read only while a panel is open
+        t.WantPower(kPowerSummary, true, true);
+        Check(pass(t, true) && pw.view == kPowerSummary && pw.cpu.history.empty() && pw.cpu.top == 0 && pw.gpu.history.empty() && Near(pw.cpu.watts, 65.0f),
+              "요약: the histories and tops dropped, the current watts read (panel open)");
+        published = 0;
+        const int reads = hwi.powerReads, gpuAsks = g_nvmlPowerAsks;
+        for (int i = 0; i < 30; ++i) pass(t, false);
+        Check(published == 0 && hwi.powerReads == reads && g_nvmlPowerAsks == gpuAsks,
+              "...a minute closed: neither power asked, nothing published (the footer it feeds is not seen)");
+        Check(pass(t, true) && published == 1 && hwi.powerReads == reads + 1 && g_nvmlPowerAsks == gpuAsks + 1 && pw.cpu.history.empty(),
+              "...the panel opens: both read on that pass, no history kept");
+
+        // the source not HWiNFO (WantPower says the CPU's is not shown): no HWiNFO read for it
+        t.Want(false, true);
+        t.WantPower(kPowerSummary, false, true);
+        Check(pass(t, true) && !pw.cpu.read && pw.gpu.read && hwi.powerReads == reads + 1, "PawnIO / 끄기: no CPU power (HWiNFO only), the GPU's still read");
+        t.Want(true, true);
+
+        // 없음 again: what was there dropped once, then nothing
+        t.WantPower(kPowerOff, false, false);
+        published = 0;
+        Check(pass(t, true) && pw.view == kPowerOff && !pw.cpu.read && !pw.gpu.read, "없음 again: everything dropped on its first pass");
+        for (int i = 0; i < 10; ++i) pass(t, true);
+        Check(published == 1, "...and nothing published after it");
+    }
+    // a driver without the power calls, or no NVML at all: no GPU power, nothing else changes
+    {
+        g_nvmlPowerCalls = false; g_nvmlLimitCall = false;
+        FakeHWiNFO hwi;
+        hw::SensorThread<FakeHWiNFO> t(hwi);
+        t.Init(hw::VideoInfo{ true, 15.6f, L"NVIDIA GeForce RTX 5080" });
+        t.Want(true, true);
+        t.WantPower(kPowerGraph, true, true);
+        for (int i = 0; i < 3; ++i) pass(t, false);
+        Check(pw.gpu.read && std::isnan(pw.gpu.watts) && std::isnan(pw.gpu.limitW) && pw.gpu.history.empty() && (b.flags & LD_HAS_GPU) && Near(b.gpuTemp, 30.0f),
+              "an NVML without nvmlDeviceGetPowerUsage: GPU power unknown, the cell's GPU readings as before");
+        Check(pw.cpu.read && std::isnan(pw.cpu.watts) && pw.cpu.history.empty() && pw.cpu.top == 0, "...and HWiNFO without a CPU package power: unknown, no history, no top");
+        g_nvmlPowerCalls = true; g_nvmlLimitCall = false;
+        hw::SensorThread<FakeHWiNFO> t2(hwi);
+        t2.Init(hw::VideoInfo{ true, 15.6f, L"NVIDIA GeForce RTX 5080" });
+        t2.Want(true, true);
+        t2.WantPower(kPowerGraph, false, true);
+        for (int i = 0; i < 3; ++i) pass(t2, false);
+        Check(Near(pw.gpu.watts, 287.0f) && std::isnan(pw.gpu.limitW) && Near(pw.gpu.top, 400.0f),
+              "...without nvmlDeviceGetEnforcedPowerLimit: the power, and the auto scale for its top (287 W with 20 % room -> 400 W)");
+        g_nvml = false; g_nvmlLimitCall = true;
+        const int loads = g_nvmlLoads;
+        hw::SensorThread<FakeHWiNFO> t3(hwi);
+        t3.Init(hw::VideoInfo{ false, 0.125f, L"Intel Arc 140V GPU" });
+        t3.Want(true, true);
+        t3.WantPower(kPowerGraph, false, true);
+        for (int i = 0; i < 3; ++i) pass(t3, false);
+        Check(pw.gpu.read && std::isnan(pw.gpu.watts) && g_nvmlLoads == loads, "no NVML (a laptop's Intel GPU): GPU power unknown, nvml.dll not looked for again");
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -669,5 +834,6 @@ int main() {
     SensorThreadPasses();
     WantPasses();
     VramPasses();
+    PowerPasses();
     return Summary("system_sampler_test");
 }

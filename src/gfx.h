@@ -36,17 +36,18 @@ public:
 
     // text
     ComPtr<IDWriteTextFormat>     fmtTooltip, fmtClock, fmtClockSmall, fmtGlyph, fmtTiny;
-    // the "PC 상태" panel (dock_sensors.cpp): its title, small dim text (card titles, models, footer), the rows'
+    // the "PC 상태" panel (dock_panel.cpp): its title, small dim text (card titles, models, footer), the rows'
     // text, values set right (R), the drives' bold temperatures and the cards' big temperature. The leading
     // small and row formats end a text that does not fit with an ellipsis.
     ComPtr<IDWriteTextFormat>     fmtPanelTitle, fmtPanelSmall, fmtPanelSmallR, fmtPanelText, fmtPanelTextR,
                                   fmtPanelTextBoldR, fmtPanelTemp;
     // Dedicated clock formats: changing the clock must not resize sensor/panel text.
     ComPtr<IDWriteTextFormat>     fmtTime, fmtDate, fmtTimeLarge, fmtDateLarge;
+    ComPtr<IDWriteTextFormat>     fmtClockLg, fmtClockSmallLg, fmtTinyLg;   // the dock sensor cell, large (settings sensorSize)
     ComPtr<ID3D11BlendState>      blendOver;   // premultiplied "over"
     float fontScale = 0;
     void EnsureFonts(float scale);
-    struct FontSet { float scale; ComPtr<IDWriteTextFormat> f[16]; };
+    struct FontSet { float scale; ComPtr<IDWriteTextFormat> f[19]; };
     std::vector<FontSet> fontSets;
 
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrtDevice{ nullptr };
@@ -67,6 +68,20 @@ public:
 };
 
 extern Gfx g_gfx;
+
+// A premultiplied BGRA bitmap of w x h pixels, its rows top-down, w * 4 bytes apart (the app icons of apps.cpp, the
+// tray icons of dock_notify.cpp); hr: CreateBitmap's answer, when asked for. dc is g_gfx.dc, given by the caller so
+// that a test faking g_gfx (#define g_gfx ...) before it includes those files gets the call: this body is read
+// before the test's fakes.
+template <class Dc>
+ComPtr<ID2D1Bitmap1> BitmapFromPixels(const Dc& dc, const std::vector<uint32_t>& px, int w, int h, HRESULT* hr = nullptr) {
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1Bitmap1> b;
+    const HRESULT made = dc->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, bp, &b);
+    if (hr) *hr = made;
+    return b;
+}
 
 // Render target + SRV texture helper.
 struct RTTexture {

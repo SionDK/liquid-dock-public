@@ -24,12 +24,8 @@ double NowSeconds() {
     return double(t.QuadPart) / double(f.QuadPart) + g_clockShift;
 }
 
-static int checks = 0, failures = 0;
-static void Check(bool ok, const char* what) {
-    ++checks; if (!ok) ++failures;
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", what);
-    fflush(stdout);
-}
+#include "portable_check.h"
+static const bool kFlushEachCheck = (portable_check::FlushEach() = true);
 static std::string Utf8(const std::wstring& w) {
     char b[512] = {};
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, b, sizeof(b), nullptr, nullptr);
@@ -93,6 +89,5 @@ int main() {
     g_clockShift = 0;
 
     CoUninitialize();
-    printf("audio_devices_test: %s (%d checks, %d failure%s)\n", failures ? "FAILED" : "ALL PASSED", checks, failures, failures == 1 ? "" : "s");
-    return failures;
+    return Summary("audio_devices_test");
 }

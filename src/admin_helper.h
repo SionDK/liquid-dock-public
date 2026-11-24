@@ -25,8 +25,16 @@ void Tick(double now);     // keeps the helper running while the option is on
 void Enable(HWND owner);
 // Whether turning on the helper's features installs it (a UAC prompt): none in %ProgramFiles%\LiquidDock, or
 // not byte for byte the copy next to the dock (adminhelper::HelperNeedsInstall), or the same but its scheduled
-// task not registered (SensorClient::HelperTaskRegistered). Reads both files whole and may run schtasks.exe: on a
+// task not registered (HelperTaskRegistered). Reads both files whole and may run schtasks.exe: on a
 // click only (Enable, SensorClient::EnablePawnIO), not on a timer.
 bool NeedsInstall();
+
+// The elevated helper itself (CPU temperature, windows of programs run as administrator): admin_helper_process.cpp.
+bool InstallHelper(HWND owner);   // one UAC prompt: copies it to the admin-only folder, registers its task
+void StartHelper();               // worker thread: runs its scheduled task (no prompt; silent)
+
+// The helper's scheduled task is registered (schtasks /Query: a process, up to ~0.1 s - on a click only,
+// NeedsInstall)
+bool HelperTaskRegistered();
 
 }   // namespace adminhelper

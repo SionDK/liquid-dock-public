@@ -1,7 +1,7 @@
 #pragma once
-// Pixel work on tray icon pictures (tray_host_icons.cpp), free of Windows headers so it can be tested with
-// any C++20 compiler (tests/icon_pixels_test.cpp). Pixels are 32-bit BGRA as GetDIBits gives them:
-// alpha in the top byte, then red, green, blue (0xAARRGGBB), rows top-down.
+// Pixel work on tray icon pictures (tray_host_icons.cpp) and app icons (apps.cpp), free of Windows headers so it
+// can be tested with any C++20 compiler (tests/icon_pixels_test.cpp). Pixels are 32-bit BGRA as GetDIBits gives
+// them: alpha in the top byte, then red, green, blue (0xAARRGGBB), rows top-down.
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -36,6 +36,18 @@ inline void Premultiply(std::vector<uint32_t>& px) {
         uint32_t r = ((p >> 16) & 255) * a / 255, g = ((p >> 8) & 255) * a / 255, b = (p & 255) * a / 255;
         p = (a << 24) | (r << 16) | (g << 8) | b;
     }
+}
+
+// Whether any pixel has some alpha: a picture with none (an old 32-bit bitmap, an icon of colour and mask) leaves
+// its alpha byte empty rather than meaning it invisible.
+inline bool AnyAlpha(const std::vector<uint32_t>& px) {
+    for (uint32_t p : px) if (p >> 24) return true;
+    return false;
+}
+
+// Every pixel fully opaque, its colour as it was.
+inline void MakeOpaque(std::vector<uint32_t>& px) {
+    for (auto& p : px) p |= 0xff000000;
 }
 
 // Tray icons are drawn at 16-24 px: a program that hands over a big icon is kept at `maxSide` px at

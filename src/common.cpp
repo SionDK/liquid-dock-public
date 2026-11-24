@@ -1,5 +1,4 @@
 #include "common.h"
-#include <shlobj.h>
 #include <cstdio>
 #include <cstdarg>
 #include <fstream>
@@ -139,6 +138,8 @@ const Field kFields[] = {
     { "trayIcons", &Settings::trayIcons },
     { "fluentFlyout", &Settings::fluentFlyout },
     { "clockSize", &Settings::clockSize, 0, 1 },
+    { "clockFormat", &Settings::clockFormat, 0, 1 },
+    { "sensorSize", &Settings::sensorSize, 0, 1 },
     { "iconSpacing", &Settings::iconSpacing, 0, 2 },
     { "iconGap", &Settings::iconGap, 0, 60 },
     { "dockThickness", &Settings::dockThickness, 75, 150 },
@@ -162,6 +163,9 @@ const Field kFields[] = {
     { "showVramTemp", &Settings::showVramTemp },
     { "showRamTemp", &Settings::showRamTemp },
     { "showSsd", &Settings::showSsd },
+    { "powerView", &Settings::powerView, 0, 2 },
+    { "showCpuPower", &Settings::showCpuPower },
+    { "showGpuPower", &Settings::showGpuPower },
     { "adminWindows", &Settings::adminWindows, 0, 2 },
     { "hwinfoCpuLabel", &Settings::hwinfoCpuLabel },
     { "pinsVersion", &Settings::pinsVersion, 0, 1000000 },
